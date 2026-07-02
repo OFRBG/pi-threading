@@ -1,4 +1,4 @@
-# pi-threads
+# pi-threading
 
 Cross-thread communication extension for [pi coding agent](https://github.com/earendil-works/pi-coding-agent). Independent threads that coordinate work, share state, and converse — without losing context or forking their history.
 
@@ -12,10 +12,10 @@ Read the full design in [THREAD-MODEL.md](THREAD-MODEL.md).
 
 ```bash
 # From your private GitHub repo:
-pi install git:github.com/OFRBG/pi-threads@main
+pi install git:github.com/OFRBG/pi-threading@main
 
 # Or try it without installing:
-pi -e git:github.com/OFRBG/pi-threads@main --thread-id my-thread
+pi -e git:github.com/OFRBG/pi-threading@main --thread-id my-thread
 ```
 
 ## Usage

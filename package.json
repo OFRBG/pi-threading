@@ -1,5 +1,5 @@
 {
-  "name": "pi-threads",
+  "name": "pi-threading",
   "version": "0.1.0",
   "description": "Cross-thread communication extension for pi coding agent — independent threads that coordinate work, share state, and converse without losing context",
   "keywords": ["pi-package", "pi-extension", "threads", "multi-agent"],
