@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 THREAD_ID="${1:-demo}"
-WORK_DIR="${2:-$(mktemp -d)}"
+WORK_DIR="$SCRIPT_DIR/live-workspace"
 mkdir -p "$WORK_DIR"
 
 echo "Thread:      $THREAD_ID"
