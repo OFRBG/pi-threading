@@ -11,7 +11,11 @@
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "file:../../.volta/tools/image/packages/@earendil-works/pi-coding-agent/lib/node_modules/@earendil-works/pi-coding-agent"
+  },
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "live": "bash live.sh"
   }
 }
