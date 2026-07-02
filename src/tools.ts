@@ -17,8 +17,7 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
       const journal = fs.existsSync(journalPath)
         ? fs.readFileSync(journalPath, "utf8").trim()
         : "(no journal yet — this is the first turn)";
-      const lockDesc =
-        `${store.lockEventId ?? "none"}${store.lockPartner ? ` (with ${store.lockPartner})` : ""}`;
+      const lockDesc = `${store.lockEventId ?? "none"}${store.lockPartner ? ` (with ${store.lockPartner})` : ""}`;
       return {
         content: [
           {
@@ -72,9 +71,14 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
       to: Type.String({ description: "Target thread id (see thread_list)" }),
       type: Type.Union(
         [
-          Type.Literal("Brief"), Type.Literal("Note"), Type.Literal("Question"),
-          Type.Literal("Answer"), Type.Literal("Update"), Type.Literal("Result"),
-          Type.Literal("Blocker"), Type.Literal("Sync"),
+          Type.Literal("Brief"),
+          Type.Literal("Note"),
+          Type.Literal("Question"),
+          Type.Literal("Answer"),
+          Type.Literal("Update"),
+          Type.Literal("Result"),
+          Type.Literal("Blocker"),
+          Type.Literal("Sync"),
         ],
         {
           description:
@@ -118,15 +122,10 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
           details: { ok: false },
         };
       }
-      const { requestId, delivered } = inbox.sendCrossThread(
-        params.to,
-        type,
-        params.body,
-        {
-          requestId: params.requestId,
-          delivery: params.delivery as "steer" | "follow-up" | undefined,
-        },
-      );
+      const { requestId, delivered } = inbox.sendCrossThread(params.to, type, params.body, {
+        requestId: params.requestId,
+        delivery: params.delivery as "steer" | "follow-up" | undefined,
+      });
       if (type === "Question") {
         store.lockEventId = requestId;
         store.transition("listening", ctx);
@@ -155,13 +154,9 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
       message: Type.String({
         description: "Message to inject when the event fires",
       }),
-      delivery: Type.Union(
-        [Type.Literal("steer"), Type.Literal("follow-up")],
-        {
-          description:
-            "steer = at next Open (urgent), follow-up = when done (deferred)",
-        },
-      ),
+      delivery: Type.Union([Type.Literal("steer"), Type.Literal("follow-up")], {
+        description: "steer = at next Open (urgent), follow-up = when done (deferred)",
+      }),
     }),
     async execute(_id, params) {
       store.subscriptions.push({
@@ -228,21 +223,16 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
       }
       if (params.partner === store.threadId) {
         return {
-          content: [
-            { type: "text" as const, text: "Cannot sync with self." },
-          ],
+          content: [{ type: "text" as const, text: "Cannot sync with self." }],
           details: { ok: false },
         };
       }
       store.lockEventId = `sync.${params.partner}.${Date.now()}`;
       store.lockPartner = params.partner;
       store.transition("in-sync", ctx);
-      inbox.sendCrossThread(
-        params.partner,
-        "Sync",
-        `Sync requested by ${store.threadId}`,
-        { requestId: store.lockEventId },
-      );
+      inbox.sendCrossThread(params.partner, "Sync", `Sync requested by ${store.threadId}`, {
+        requestId: store.lockEventId,
+      });
       return {
         content: [
           {
@@ -307,9 +297,7 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
     async execute(_id, _params, _signal, _onUpdate, ctx) {
       store.transition("on-hold", ctx);
       return {
-        content: [
-          { type: "text" as const, text: "Thread suspended (On Hold)." },
-        ],
+        content: [{ type: "text" as const, text: "Thread suspended (On Hold)." }],
         details: { ok: true },
       };
     },
@@ -334,9 +322,7 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
       }
       store.transition("open", ctx);
       return {
-        content: [
-          { type: "text" as const, text: "Thread resumed (Open)." },
-        ],
+        content: [{ type: "text" as const, text: "Thread resumed (Open)." }],
         details: { ok: true },
       };
     },

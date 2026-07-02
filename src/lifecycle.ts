@@ -3,11 +3,7 @@ import type { ThreadStore } from "./core/types";
 import type { Inbox } from "./inbox";
 import { threadModelPrompt } from "./core/system-prompt";
 
-export function registerLifecycle(
-  pi: ExtensionAPI,
-  store: ThreadStore,
-  inbox: Inbox,
-) {
+export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox) {
   pi.on("session_start", (_event, ctx) => {
     store.init(ctx.cwd, ctx);
 
@@ -24,9 +20,7 @@ export function registerLifecycle(
 
   pi.on("turn_start", (_event, ctx) => store.transition("thinking", ctx));
 
-  pi.on("tool_execution_start", (_event, ctx) =>
-    store.transition("working", ctx),
-  );
+  pi.on("tool_execution_start", (_event, ctx) => store.transition("working", ctx));
 
   pi.on("turn_end", (_event, ctx) => {
     store.transition("open", ctx);

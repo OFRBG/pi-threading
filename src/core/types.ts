@@ -1,16 +1,28 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 export type ThreadState =
-  | "idle" | "thinking" | "working" | "open"
-  | "in-sync" | "listening" | "on-hold" | "stopped" | "done";
+  | "idle"
+  | "thinking"
+  | "working"
+  | "open"
+  | "in-sync"
+  | "listening"
+  | "on-hold"
+  | "stopped"
+  | "done";
 
 export type MessageType =
-  | "Brief" | "Note" | "Question" | "Answer"
-  | "Update" | "Result" | "Blocker" | "Sync";
+  "Brief" | "Note" | "Question" | "Answer" | "Update" | "Result" | "Blocker" | "Sync";
 
 export const DEFAULT_DELIVERY: Record<MessageType, "steer" | "follow-up"> = {
-  Brief: "steer", Note: "steer", Question: "steer", Answer: "steer",
-  Update: "follow-up", Result: "follow-up", Blocker: "steer", Sync: "steer",
+  Brief: "steer",
+  Note: "steer",
+  Question: "steer",
+  Answer: "steer",
+  Update: "follow-up",
+  Result: "follow-up",
+  Blocker: "steer",
+  Sync: "steer",
 };
 
 export const OBLIGATION_TYPES: ReadonlySet<MessageType> = new Set(["Brief", "Question", "Sync"]);

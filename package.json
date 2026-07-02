@@ -20,10 +20,18 @@
   },
   "scripts": {
     "test": "bun test",
-    "live": "bash live.sh"
+    "live": "bash live.sh",
+    "lint": "eslint src test",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.3",
-    "@types/node": "^26.1.0"
+    "@eslint/js": "^9.0.0",
+    "@types/node": "^26.1.0",
+    "eslint": "^9.0.0",
+    "eslint-config-prettier": "^10.0.0",
+    "prettier": "^3.5.0",
+    "typescript-eslint": "^8.0.0"
   }
 }

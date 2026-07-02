@@ -6,17 +6,17 @@ A communication model for independent threads that need to coordinate work, shar
 
 ## Thread States
 
-| State | Meaning |
-|---|---|
-| **Idle** | No active work |
-| **Thinking** | Composing a response |
-| **Working** | Executing — a tool call, a write, a calculation |
-| **Open** | Yield point between turns — the only place messages land cooperatively |
-| **Listening** | Blocked — waiting on a reply or an event |
-| **In Sync** | Rendezvous — both threads present, exchanging turns, mutually blocked |
-| **On Hold** | Suspended gracefully, resumable |
-| **Stopped** | Terminated — not resumable without inspection |
-| **Done** | Work complete, result sent |
+| State         | Meaning                                                                |
+| ------------- | ---------------------------------------------------------------------- |
+| **Idle**      | No active work                                                         |
+| **Thinking**  | Composing a response                                                   |
+| **Working**   | Executing — a tool call, a write, a calculation                        |
+| **Open**      | Yield point between turns — the only place messages land cooperatively |
+| **Listening** | Blocked — waiting on a reply or an event                               |
+| **In Sync**   | Rendezvous — both threads present, exchanging turns, mutually blocked  |
+| **On Hold**   | Suspended gracefully, resumable                                        |
+| **Stopped**   | Terminated — not resumable without inspection                          |
+| **Done**      | Work complete, result sent                                             |
 
 **Open** is the critical state. It is the only moment a thread can receive a message without interrupting mid-thought or mid-execution. All cooperative message delivery routes through Open.
 
@@ -69,22 +69,22 @@ OUT → event stream   (live, real-time)
 
 ### IN operations
 
-| Operation | Delivery | Meaning |
-|---|---|---|
-| **follow-up** | When thread reaches Done or Idle | Deferred — "when you're free" |
-| **steer** | At next Open | Urgent — "at your next pause" |
-| **stop** | Immediate | Unconditional abort — harness operation, not a message |
-| **subscribe** | — | Register a message to be delivered when an eventId fires |
+| Operation     | Delivery                         | Meaning                                                  |
+| ------------- | -------------------------------- | -------------------------------------------------------- |
+| **follow-up** | When thread reaches Done or Idle | Deferred — "when you're free"                            |
+| **steer**     | At next Open                     | Urgent — "at your next pause"                            |
+| **stop**      | Immediate                        | Unconditional abort — harness operation, not a message   |
+| **subscribe** | —                                | Register a message to be delivered when an eventId fires |
 
 `subscribe(eventId, message, delivery)` — when the named event fires, harness injects `message` into this thread's queue at the specified delivery priority (`steer` or `follow-up`).
 
 ### OUT operations
 
-| Output | Nature |
-|---|---|
+| Output           | Nature                                                                                               |
+| ---------------- | ---------------------------------------------------------------------------------------------------- |
 | **Event stream** | Live JSONL from pi RPC — `turn_start`, `turn_end`, `tool_execution_*`, `message_update`, `agent_end` |
-| **Journal** | Self-written, updated via fork after each `turn_end` |
-| **Lock events** | eventId fires when thread exits In Sync and returns to Open |
+| **Journal**      | Self-written, updated via fork after each `turn_end`                                                 |
+| **Lock events**  | eventId fires when thread exits In Sync and returns to Open                                          |
 
 ---
 
@@ -92,16 +92,16 @@ OUT → event stream   (live, real-time)
 
 Two axes: **what obligation the message creates**, and **which delivery mechanic applies**.
 
-| Message | Obligation | Default delivery |
-|---|---|---|
-| **Brief** | Receiver owns the work, must close with a Result | steer |
-| **Note** | None — guidance on current work, no reply expected | steer |
-| **Question** | Receiver must answer, sender enters Listening | steer |
-| **Answer** | None — closes a Question | steer |
-| **Update** | None — informational broadcast | follow-up |
-| **Result** | None — closes a Brief, may re-trigger sender | follow-up |
-| **Blocker** | Parent thread must decide | steer |
-| **Sync** | Both threads enter rendezvous — both enter Listening until close | steer |
+| Message      | Obligation                                                       | Default delivery |
+| ------------ | ---------------------------------------------------------------- | ---------------- |
+| **Brief**    | Receiver owns the work, must close with a Result                 | steer            |
+| **Note**     | None — guidance on current work, no reply expected               | steer            |
+| **Question** | Receiver must answer, sender enters Listening                    | steer            |
+| **Answer**   | None — closes a Question                                         | steer            |
+| **Update**   | None — informational broadcast                                   | follow-up        |
+| **Result**   | None — closes a Brief, may re-trigger sender                     | follow-up        |
+| **Blocker**  | Parent thread must decide                                        | steer            |
+| **Sync**     | Both threads enter rendezvous — both enter Listening until close | steer            |
 
 Delivery is a hint, not a constraint. A sender can override — "when you're free, here's an update" or "urgent: answer this before your next tool call."
 
@@ -111,20 +111,20 @@ Delivery is a hint, not a constraint. A sender can override — "when you're fre
 
 Cooperative by default. The harness handles unconditional stops externally.
 
-| Level | Delivery | Resumable |
-|---|---|---|
-| **steer** | At next Open — thread finishes current tool call first | Yes |
-| **Suspend** | At next Open — thread finishes current turn cleanly | Yes |
-| **Abort** | Immediate | No |
+| Level       | Delivery                                               | Resumable |
+| ----------- | ------------------------------------------------------ | --------- |
+| **steer**   | At next Open — thread finishes current tool call first | Yes       |
+| **Suspend** | At next Open — thread finishes current turn cleanly    | Yes       |
+| **Abort**   | Immediate                                              | No        |
 
 **Cost of interruption:**
 
-| Interrupted at | Cost |
-|---|---|
-| Open | None |
-| Working | Low — tool completes, then message lands |
-| Thinking | Medium — in-progress response discarded |
-| Stopped | High — requires inspection before resumption |
+| Interrupted at | Cost                                         |
+| -------------- | -------------------------------------------- |
+| Open           | None                                         |
+| Working        | Low — tool completes, then message lands     |
+| Thinking       | Medium — in-progress response discarded      |
+| Stopped        | High — requires inspection before resumption |
 
 No hard interrupt mid-Thinking or mid-Working. The model is cooperative: messages queue for the next Open, stops are harness-level operations.
 
@@ -135,10 +135,12 @@ No hard interrupt mid-Thinking or mid-Working. The model is cooperative: message
 **In Sync** is mutually exclusive. A thread can be in rendezvous with at most one other thread at a time.
 
 **Acquiring:**
+
 - Sync request arrives, thread is unlocked → `{ ok: true }`, both threads enter In Sync [LOCKED]
 - Sync request arrives, thread is locked → `{ locked: true, eventId: "evt-abc123" }`
 
 **Releasing:**
+
 - Thread exits In Sync → lock released, `evt-abc123` fires to all subscribers
 
 The locked thread does not decide what the caller does next. It returns an eventId and the caller chooses — subscribe and wait, subscribe and do other work, or ignore and continue without the sync.
@@ -191,14 +193,14 @@ The journal is the thread's interface to the outside world. Humans, supervisor t
 
 Patterns are composed from the primitives above.
 
-| Pattern | Mechanics |
-|---|---|
-| **Delegation** | Sender sends Brief (follow-up). Receiver works, sends Result when done. Result re-triggers sender. |
-| **Supervision** | Supervisor sends Note (steer). No reply expected. Receiver adjusts at next Open. |
-| **Query** | Sender sends Question (steer), enters Listening. Receiver sends Answer (steer). Sender resumes. |
+| Pattern          | Mechanics                                                                                                                                      |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Delegation**   | Sender sends Brief (follow-up). Receiver works, sends Result when done. Result re-triggers sender.                                             |
+| **Supervision**  | Supervisor sends Note (steer). No reply expected. Receiver adjusts at next Open.                                                               |
+| **Query**        | Sender sends Question (steer), enters Listening. Receiver sends Answer (steer). Sender resumes.                                                |
 | **Conversation** | Sender sends Sync (steer). Both enter In Sync [LOCKED]. Alternating turns until close signal. Both resume with conversation in linear history. |
-| **Broadcast** | Sender sends Update (follow-up) to multiple receivers. No reply, no obligation. |
-| **Escalation** | Thread sends Blocker (steer) to parent. Parent enters Listening (or deprioritises other work). Parent sends Answer when decided. |
+| **Broadcast**    | Sender sends Update (follow-up) to multiple receivers. No reply, no obligation.                                                                |
+| **Escalation**   | Thread sends Blocker (steer) to parent. Parent enters Listening (or deprioritises other work). Parent sends Answer when decided.               |
 
 ---
 
@@ -217,11 +219,11 @@ The combination of JSONL session (full fidelity), event stream (live), and journ
 
 ## Implementation Notes
 
-Implemented as a pi coding-agent extension. pi's `ExtensionAPI` provides no native cross-process primitive (no session registry, no send-by-ID, no built-in watcher) — every delivery call (`pi.sendMessage`/`pi.sendUserMessage`) only injects into the *calling* process's own conversation. The extension builds the harness itself, entirely natively, using primitives pi does expose: `registerFlag`/`getFlag` for thread identity, `session_start`/`session_shutdown` lifecycle hooks, and Node's own `fs.watch`/atomic rename — the same idiom as pi's bundled `examples/extensions/file-trigger.ts` (`fs.watch` → read → `sendMessage(..., {triggerTurn: true})`), extended from one global trigger file to a per-thread inbox.
+Implemented as a pi coding-agent extension. pi's `ExtensionAPI` provides no native cross-process primitive (no session registry, no send-by-ID, no built-in watcher) — every delivery call (`pi.sendMessage`/`pi.sendUserMessage`) only injects into the _calling_ process's own conversation. The extension builds the harness itself, entirely natively, using primitives pi does expose: `registerFlag`/`getFlag` for thread identity, `session_start`/`session_shutdown` lifecycle hooks, and Node's own `fs.watch`/atomic rename — the same idiom as pi's bundled `examples/extensions/file-trigger.ts` (`fs.watch` → read → `sendMessage(..., {triggerTurn: true})`), extended from one global trigger file to a per-thread inbox.
 
-**Storage**: `.thread/threads/<thread-id>/{state.json, journal.md, inbox/}`. Each thread only ever writes its own `state.json`; other threads only *create* files in its `inbox/` — so no cross-process file locking is needed anywhere.
+**Storage**: `.thread/threads/<thread-id>/{state.json, journal.md, inbox/}`. Each thread only ever writes its own `state.json`; other threads only _create_ files in its `inbox/` — so no cross-process file locking is needed anywhere.
 
-**Delivery**: a sender writes a message into the target's `inbox/` via write-temp-then-rename (atomic on the same filesystem). The target drains its inbox synchronously at `session_start` (durable — this is what makes delivery work even if the target wasn't running when the message arrived) and again on every `fs.watch` fire while running. Messages are renamed into `inbox/processed/` *before* delivery is attempted, favoring "never deliver twice" over "never lose one" — a duplicate Brief/Question appearing twice in a conversation is worse than one that's dropped but still inspectable in `processed/`.
+**Delivery**: a sender writes a message into the target's `inbox/` via write-temp-then-rename (atomic on the same filesystem). The target drains its inbox synchronously at `session_start` (durable — this is what makes delivery work even if the target wasn't running when the message arrived) and again on every `fs.watch` fire while running. Messages are renamed into `inbox/processed/` _before_ delivery is attempted, favoring "never deliver twice" over "never lose one" — a duplicate Brief/Question appearing twice in a conversation is worse than one that's dropped but still inspectable in `processed/`.
 
 **Liveness**: each running thread heartbeats its own `state.json` every 20s; any reader treats a thread as effectively stopped once `lastSeen` is older than 60s, regardless of the stored `status` field — this is how a hard-killed process (`session_shutdown` never fires on `kill -9`) gets detected.
 

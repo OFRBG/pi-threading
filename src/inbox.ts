@@ -39,8 +39,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     body: string,
     opts: { requestId?: string; delivery?: "steer" | "follow-up" } = {},
   ): { requestId: string; delivered: "queued" | "live" } {
-    const requestId =
-      opts.requestId ?? `${type.toLowerCase()}.${store.threadId}.${Date.now()}`;
+    const requestId = opts.requestId ?? `${type.toLowerCase()}.${store.threadId}.${Date.now()}`;
     const delivery = opts.delivery ?? DEFAULT_DELIVERY[type];
     const msg: InboxMessage = {
       from: store.threadId,
@@ -124,7 +123,10 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     const processedDir = path.join(inboxDir, "processed");
     let files: string[];
     try {
-      files = fs.readdirSync(inboxDir).filter(f => f.endsWith(".json")).sort();
+      files = fs
+        .readdirSync(inboxDir)
+        .filter(f => f.endsWith(".json"))
+        .sort();
     } catch {
       return;
     }

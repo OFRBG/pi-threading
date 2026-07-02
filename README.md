@@ -39,41 +39,41 @@ Threads share state via `.thread/threads/<id>/` in the project directory. Each t
 
 ### Tools available to the LLM
 
-| Tool | Purpose |
-|---|---|
-| `thread_status` | Read this thread's state and journal |
-| `thread_list` | List all known threads in the workspace |
-| `thread_send` | Send a typed message to another thread |
-| `thread_subscribe` | Subscribe a message to a named event |
-| `thread_emit` | Fire a named event, notifying subscribers |
+| Tool                  | Purpose                                        |
+| --------------------- | ---------------------------------------------- |
+| `thread_status`       | Read this thread's state and journal           |
+| `thread_list`         | List all known threads in the workspace        |
+| `thread_send`         | Send a typed message to another thread         |
+| `thread_subscribe`    | Subscribe a message to a named event           |
+| `thread_emit`         | Fire a named event, notifying subscribers      |
 | `thread_sync_request` | Enter rendezvous (In Sync) with another thread |
-| `thread_sync_close` | End the current sync session |
-| `thread_suspend` | Mark thread On Hold |
-| `thread_resume` | Resume from On Hold |
+| `thread_sync_close`   | End the current sync session                   |
+| `thread_suspend`      | Mark thread On Hold                            |
+| `thread_resume`       | Resume from On Hold                            |
 
 ### Slash commands
 
-| Command | Purpose |
-|---|---|
-| `/thread-status` | Show state and latest journal entry |
-| `/thread-list` | List all known threads |
-| `/thread-send <to> <type> <body>` | Send a message to another thread |
-| `/thread-emit <eventId>` | Fire a named event |
-| `/thread-suspend` | Mark On Hold |
-| `/thread-resume` | Resume from On Hold |
+| Command                           | Purpose                             |
+| --------------------------------- | ----------------------------------- |
+| `/thread-status`                  | Show state and latest journal entry |
+| `/thread-list`                    | List all known threads              |
+| `/thread-send <to> <type> <body>` | Send a message to another thread    |
+| `/thread-emit <eventId>`          | Fire a named event                  |
+| `/thread-suspend`                 | Mark On Hold                        |
+| `/thread-resume`                  | Resume from On Hold                 |
 
 ### Message types
 
-| Type | Obligation | Reply |
-|---|---|---|
-| **Brief** | Receiver owns the work | Must close with Result |
-| **Note** | None — guidance | No reply expected |
-| **Question** | Receiver must answer | Sender enters Listening |
-| **Answer** | None | Closes a Question |
-| **Update** | None — broadcast | None |
-| **Result** | None | Closes a Brief |
-| **Blocker** | Parent must decide | Parent sends Answer |
-| **Sync** | Both enter rendezvous | Alternating turns until close |
+| Type         | Obligation             | Reply                         |
+| ------------ | ---------------------- | ----------------------------- |
+| **Brief**    | Receiver owns the work | Must close with Result        |
+| **Note**     | None — guidance        | No reply expected             |
+| **Question** | Receiver must answer   | Sender enters Listening       |
+| **Answer**   | None                   | Closes a Question             |
+| **Update**   | None — broadcast       | None                          |
+| **Result**   | None                   | Closes a Brief                |
+| **Blocker**  | Parent must decide     | Parent sends Answer           |
+| **Sync**     | Both enter rendezvous  | Alternating turns until close |
 
 ## Flags
 

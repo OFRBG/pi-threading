@@ -61,10 +61,7 @@ export function createThreadStore(pi: ExtensionAPI): ThreadStore {
         lastSeen: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
-      fs.writeFileSync(
-        path.join(store.threadDir, "state.json"),
-        JSON.stringify(payload, null, 2),
-      );
+      fs.writeFileSync(path.join(store.threadDir, "state.json"), JSON.stringify(payload, null, 2));
     },
 
     init(cwd: string, ctx: ExtensionContext) {
@@ -89,10 +86,7 @@ export function createThreadStore(pi: ExtensionAPI): ThreadStore {
           if (fs.existsSync(oldJournal) && !fs.existsSync(path.join(migratedDir, "journal.md"))) {
             fs.copyFileSync(oldJournal, path.join(migratedDir, "journal.md"));
           }
-          fs.writeFileSync(
-            path.join(store.threadsRootDir, ".migrated"),
-            new Date().toISOString(),
-          );
+          fs.writeFileSync(path.join(store.threadsRootDir, ".migrated"), new Date().toISOString());
         } catch (err) {
           console.error("[thread] Failed to migrate legacy state.json:", err);
         }
@@ -192,18 +186,25 @@ export function createThreadStore(pi: ExtensionAPI): ThreadStore {
       const proc = spawn(
         "pi",
         [
-          "--fork", sessionFile,
-          "--session-dir", tmpSes,
-          "--model", "deepseek/deepseek-chat",
-          "--thinking", "off",
-          "--print", JOURNAL_PROMPT,
+          "--fork",
+          sessionFile,
+          "--session-dir",
+          tmpSes,
+          "--model",
+          "deepseek/deepseek-chat",
+          "--thinking",
+          "off",
+          "--print",
+          JOURNAL_PROMPT,
         ],
         { stdio: ["ignore", "pipe", "ignore"] },
       );
       proc.on("error", () => {
         fs.rmSync(tmpSes, { recursive: true, force: true });
       });
-      proc.stdout!.on("data", (d: Buffer) => { out += d.toString(); });
+      proc.stdout!.on("data", (d: Buffer) => {
+        out += d.toString();
+      });
       proc.on("close", () => {
         fs.rmSync(tmpSes, { recursive: true, force: true });
         const entry = out.trim();
@@ -223,10 +224,7 @@ export function createThreadStore(pi: ExtensionAPI): ThreadStore {
 
     startWatcher(drainInbox, ctx) {
       try {
-        watcher = fs.watch(
-          path.join(store.threadDir, "inbox"),
-          () => drainInbox(ctx),
-        );
+        watcher = fs.watch(path.join(store.threadDir, "inbox"), () => drainInbox(ctx));
       } catch (err) {
         console.error("[thread] Failed to watch inbox:", err);
       }

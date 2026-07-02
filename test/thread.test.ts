@@ -18,7 +18,15 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, readFileSync, existsSync, readdirSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  readFileSync,
+  existsSync,
+  readdirSync,
+  mkdirSync,
+  writeFileSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -43,15 +51,23 @@ function runPi(
     ? ["--session-dir", join(cwd, ".sessions"), "--session-id", "test-session"]
     : ["--no-session"];
   const threadArgs = opts.threadId ? ["--thread-id", opts.threadId] : [];
-  const result = spawnSync(PI_NODE, [PI_SCRIPT,
-    "--extension", EXT,
-    "--model", "deepseek/deepseek-chat",
-    "--thinking", "off",
-    ...sessionArgs,
-    ...threadArgs,
-    "--print",
-    prompt,
-  ], { cwd, timeout: TIMEOUT, encoding: "utf8" });
+  const result = spawnSync(
+    PI_NODE,
+    [
+      PI_SCRIPT,
+      "--extension",
+      EXT,
+      "--model",
+      "deepseek/deepseek-chat",
+      "--thinking",
+      "off",
+      ...sessionArgs,
+      ...threadArgs,
+      "--print",
+      prompt,
+    ],
+    { cwd, timeout: TIMEOUT, encoding: "utf8" },
+  );
   return {
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
@@ -87,88 +103,113 @@ afterEach(() => {
 });
 
 describe("state tracking", () => {
-  test("state file ends at done after a simple run", () => {
-    const r = runPi("Say the word 'hello' and nothing else.", tmpDir, { threadId: "t1" });
-    expect(r.ok).toBe(true);
+  test(
+    "state file ends at done after a simple run",
+    () => {
+      const r = runPi("Say the word 'hello' and nothing else.", tmpDir, { threadId: "t1" });
+      expect(r.ok).toBe(true);
 
-    const s = readState(tmpDir, "t1");
-    expect(s).not.toBeNull();
-    expect(s.id).toBe("t1");
-    expect(s.state).toBe("done");
-    expect(s.updatedAt).toMatch(/^\d{4}-/);
-  }, TIMEOUT);
+      const s = readState(tmpDir, "t1");
+      expect(s).not.toBeNull();
+      expect(s.id).toBe("t1");
+      expect(s.state).toBe("done");
+      expect(s.updatedAt).toMatch(/^\d{4}-/);
+    },
+    TIMEOUT,
+  );
 
-  test("lock is null after a run with no sync", () => {
-    runPi("Say 'hi'.", tmpDir, { threadId: "t1" });
-    const s = readState(tmpDir, "t1");
-    expect(s?.lockEventId).toBeNull();
-  }, TIMEOUT);
+  test(
+    "lock is null after a run with no sync",
+    () => {
+      runPi("Say 'hi'.", tmpDir, { threadId: "t1" });
+      const s = readState(tmpDir, "t1");
+      expect(s?.lockEventId).toBeNull();
+    },
+    TIMEOUT,
+  );
 });
 
 describe("journal", () => {
-  test("journal is written after a turn that uses tools", () => {
-    // Must use a real session: --no-session makes getSessionFile() return undefined,
-    // which blocks forkJournal. The forked child keeps the parent alive until done,
-    // so spawnSync already waits for the journal to be written — no sleep needed.
-    runPi(
-      "List the files in the current directory using the bash tool. Then say done.",
-      tmpDir,
-      { session: true, threadId: "t1" },
-    );
+  test(
+    "journal is written after a turn that uses tools",
+    () => {
+      // Must use a real session: --no-session makes getSessionFile() return undefined,
+      // which blocks forkJournal. The forked child keeps the parent alive until done,
+      // so spawnSync already waits for the journal to be written — no sleep needed.
+      runPi("List the files in the current directory using the bash tool. Then say done.", tmpDir, {
+        session: true,
+        threadId: "t1",
+      });
 
-    const journal = readJournal(tmpDir, "t1");
-    expect(journal.length).toBeGreaterThan(10);
-    expect(journal).toMatch(/Working on:/i);
-  }, TIMEOUT);
+      const journal = readJournal(tmpDir, "t1");
+      expect(journal.length).toBeGreaterThan(10);
+      expect(journal).toMatch(/Working on:/i);
+    },
+    TIMEOUT,
+  );
 });
 
 describe("event subscription and emit", () => {
-  test("subscribe then emit delivers the message and clears the subscription", () => {
-    const prompt = `You have access to thread_subscribe and thread_emit tools.
+  test(
+    "subscribe then emit delivers the message and clears the subscription",
+    () => {
+      const prompt = `You have access to thread_subscribe and thread_emit tools.
 Do the following steps in order:
 1. Call thread_subscribe with eventId="ready", message="Task is ready", delivery="steer"
 2. Call thread_emit with eventId="ready"
 3. Report how many subscribers were notified (from the tool result)
 Say only the subscriber count as a number.`;
 
-    const r = runPi(prompt, tmpDir, { threadId: "t1" });
-    expect(r.ok).toBe(true);
+      const r = runPi(prompt, tmpDir, { threadId: "t1" });
+      expect(r.ok).toBe(true);
 
-    // State file is the ground-truth check; stdout check is just a sanity signal.
-    expect(r.stdout.trim()).toMatch(/^1$/m);
+      // State file is the ground-truth check; stdout check is just a sanity signal.
+      expect(r.stdout.trim()).toMatch(/^1$/m);
 
-    const s = readState(tmpDir, "t1");
-    expect(s?.subscriptions?.length ?? 0).toBe(0);
-  }, TIMEOUT);
+      const s = readState(tmpDir, "t1");
+      expect(s?.subscriptions?.length ?? 0).toBe(0);
+    },
+    TIMEOUT,
+  );
 
-  test("subscribing to an event that never fires persists in state", () => {
-    const prompt = `Call thread_subscribe with eventId="never", message="hello", delivery="follow-up". Then say done.`;
-    runPi(prompt, tmpDir, { threadId: "t1" });
+  test(
+    "subscribing to an event that never fires persists in state",
+    () => {
+      const prompt = `Call thread_subscribe with eventId="never", message="hello", delivery="follow-up". Then say done.`;
+      runPi(prompt, tmpDir, { threadId: "t1" });
 
-    const s = readState(tmpDir, "t1");
-    expect(s?.subscriptions?.length).toBe(1);
-    expect(s?.subscriptions[0].eventId).toBe("never");
-  }, TIMEOUT);
+      const s = readState(tmpDir, "t1");
+      expect(s?.subscriptions?.length).toBe(1);
+      expect(s?.subscriptions[0].eventId).toBe("never");
+    },
+    TIMEOUT,
+  );
 });
 
 describe("lock (In Sync) — local behavior", () => {
-  test("first sync_request acquires the lock, second returns locked", () => {
-    const prompt = `You have access to thread_sync_request.
+  test(
+    "first sync_request acquires the lock, second returns locked",
+    () => {
+      const prompt = `You have access to thread_sync_request.
 Call thread_sync_request with partner="alice", then call thread_sync_request with partner="bob".
 For the second call, say only "second=ok" or "second=locked" based on the tool result.`;
 
-    const r = runPi(prompt, tmpDir, { threadId: "t1" });
-    expect(r.ok).toBe(true);
+      const r = runPi(prompt, tmpDir, { threadId: "t1" });
+      expect(r.ok).toBe(true);
 
-    const s = readState(tmpDir, "t1");
-    expect(s?.lockEventId).toMatch(/^sync\.alice\./);
-    expect(s?.lockPartner).toBe("alice");
+      const s = readState(tmpDir, "t1");
+      expect(s?.lockEventId).toMatch(/^sync\.alice\./);
+      expect(s?.lockPartner).toBe("alice");
 
-    expect(r.stdout).toMatch(/second=locked/i);
-  }, TIMEOUT);
+      expect(r.stdout).toMatch(/second=locked/i);
+    },
+    TIMEOUT,
+  );
 
-  test("sync_close releases the lock and notifies local waiters", () => {
-    const prompt = `You have access to thread_sync_request, thread_subscribe, and thread_sync_close tools.
+  test(
+    "sync_close releases the lock and notifies local waiters",
+    () => {
+      const prompt = `You have access to thread_sync_request, thread_subscribe, and thread_sync_close tools.
 Do the following in order:
 1. Call thread_sync_request with partner="alice" to acquire the lock — note the eventId returned
 2. Call thread_subscribe with eventId=<that eventId>, message="lock released", delivery="steer"
@@ -176,144 +217,208 @@ Do the following in order:
 4. Report how many waiters were notified (from the tool result).
 Say only the waiter count as a number.`;
 
-    const r = runPi(prompt, tmpDir, { threadId: "t1" });
-    expect(r.ok).toBe(true);
-    expect(r.stdout.trim()).toMatch(/^1$/m);
+      const r = runPi(prompt, tmpDir, { threadId: "t1" });
+      expect(r.ok).toBe(true);
+      expect(r.stdout.trim()).toMatch(/^1$/m);
 
-    const s = readState(tmpDir, "t1");
-    expect(s?.lockEventId).toBeNull();
-    expect(s?.subscriptions?.length ?? 0).toBe(0);
-  }, TIMEOUT);
+      const s = readState(tmpDir, "t1");
+      expect(s?.lockEventId).toBeNull();
+      expect(s?.subscriptions?.length ?? 0).toBe(0);
+    },
+    TIMEOUT,
+  );
 });
 
 describe("cross-thread messaging", () => {
-  test("Note sent while target isn't running is drained on its next session_start", () => {
-    // thread-b sends first — thread-a doesn't exist yet.
-    const sendPrompt = `Call thread_send with to="thread-a", type="Note", body="hello from b". Then say done.`;
-    const sendResult = runPi(sendPrompt, tmpDir, { threadId: "thread-b" });
-    expect(sendResult.ok).toBe(true);
-    expect(inboxFiles(tmpDir, "thread-a").length).toBe(1);
+  test(
+    "Note sent while target isn't running is drained on its next session_start",
+    () => {
+      // thread-b sends first — thread-a doesn't exist yet.
+      const sendPrompt = `Call thread_send with to="thread-a", type="Note", body="hello from b". Then say done.`;
+      const sendResult = runPi(sendPrompt, tmpDir, { threadId: "thread-b" });
+      expect(sendResult.ok).toBe(true);
+      expect(inboxFiles(tmpDir, "thread-a").length).toBe(1);
 
-    // thread-a starts for the first time — session_start should drain it.
-    const recvResult = runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
-    expect(recvResult.ok).toBe(true);
+      // thread-a starts for the first time — session_start should drain it.
+      const recvResult = runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
+      expect(recvResult.ok).toBe(true);
 
-    expect(inboxFiles(tmpDir, "thread-a").length).toBe(0);
-    const processed = inboxFiles(tmpDir, "thread-a", "processed");
-    expect(processed.length).toBe(1);
-    const delivered = JSON.parse(readFileSync(join(tmpDir, ".thread", "threads", "thread-a", "inbox", "processed", processed[0]), "utf8"));
-    expect(delivered.type).toBe("Note");
-    expect(delivered.from).toBe("thread-b");
-    expect(delivered.body).toBe("hello from b");
-  }, TIMEOUT * 2);
+      expect(inboxFiles(tmpDir, "thread-a").length).toBe(0);
+      const processed = inboxFiles(tmpDir, "thread-a", "processed");
+      expect(processed.length).toBe(1);
+      const delivered = JSON.parse(
+        readFileSync(
+          join(tmpDir, ".thread", "threads", "thread-a", "inbox", "processed", processed[0]),
+          "utf8",
+        ),
+      );
+      expect(delivered.type).toBe("Note");
+      expect(delivered.from).toBe("thread-b");
+      expect(delivered.body).toBe("hello from b");
+    },
+    TIMEOUT * 2,
+  );
 
-  test("a message written directly into an inbox is drained on the target's first session_start", () => {
-    const inboxDir = join(tmpDir, ".thread", "threads", "thread-a", "inbox");
-    mkdirSync(inboxDir, { recursive: true });
-    writeFileSync(join(inboxDir, "1-manual.json"), JSON.stringify({
-      from: "outside", to: "thread-a", type: "Update", body: "seeded before start",
-      requestId: "update.outside.1", delivery: "follow-up", sentAt: new Date().toISOString(),
-    }));
+  test(
+    "a message written directly into an inbox is drained on the target's first session_start",
+    () => {
+      const inboxDir = join(tmpDir, ".thread", "threads", "thread-a", "inbox");
+      mkdirSync(inboxDir, { recursive: true });
+      writeFileSync(
+        join(inboxDir, "1-manual.json"),
+        JSON.stringify({
+          from: "outside",
+          to: "thread-a",
+          type: "Update",
+          body: "seeded before start",
+          requestId: "update.outside.1",
+          delivery: "follow-up",
+          sentAt: new Date().toISOString(),
+        }),
+      );
 
-    const r = runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
-    expect(r.ok).toBe(true);
+      const r = runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
+      expect(r.ok).toBe(true);
 
-    expect(inboxFiles(tmpDir, "thread-a").length).toBe(0);
-    expect(inboxFiles(tmpDir, "thread-a", "processed").length).toBe(1);
-  }, TIMEOUT);
+      expect(inboxFiles(tmpDir, "thread-a").length).toBe(0);
+      expect(inboxFiles(tmpDir, "thread-a", "processed").length).toBe(1);
+    },
+    TIMEOUT,
+  );
 
-  test("Brief creates an obligation that a matching Result clears", () => {
-    const briefPrompt = `Call thread_send with to="thread-b", type="Brief", body="please do the thing". Then say done.`;
-    runPi(briefPrompt, tmpDir, { threadId: "thread-a" });
+  test(
+    "Brief creates an obligation that a matching Result clears",
+    () => {
+      const briefPrompt = `Call thread_send with to="thread-b", type="Brief", body="please do the thing". Then say done.`;
+      runPi(briefPrompt, tmpDir, { threadId: "thread-a" });
 
-    let s = readState(tmpDir, "thread-a");
-    expect(s?.obligations?.length).toBe(1);
-    expect(s.obligations[0].type).toBe("Brief");
-    const requestId = s.obligations[0].requestId;
-    expect(requestId).toMatch(/^brief\.thread-a\./);
+      let s = readState(tmpDir, "thread-a");
+      expect(s?.obligations?.length).toBe(1);
+      expect(s.obligations[0].type).toBe("Brief");
+      const requestId = s.obligations[0].requestId;
+      expect(requestId).toMatch(/^brief\.thread-a\./);
 
-    const resultPrompt = `Call thread_send with to="thread-a", type="Result", body="done", requestId="${requestId}". Then say done.`;
-    runPi(resultPrompt, tmpDir, { threadId: "thread-b" });
+      const resultPrompt = `Call thread_send with to="thread-a", type="Result", body="done", requestId="${requestId}". Then say done.`;
+      runPi(resultPrompt, tmpDir, { threadId: "thread-b" });
 
-    // thread-a needs to run again to drain thread-b's Result out of its inbox.
-    runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
+      // thread-a needs to run again to drain thread-b's Result out of its inbox.
+      runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
 
-    s = readState(tmpDir, "thread-a");
-    expect(s?.obligations?.length ?? 0).toBe(0);
-  }, TIMEOUT * 3);
+      s = readState(tmpDir, "thread-a");
+      expect(s?.obligations?.length ?? 0).toBe(0);
+    },
+    TIMEOUT * 3,
+  );
 
-  test("Question puts the sender's lockEventId on hold until a matching Answer clears it", () => {
-    const questionPrompt = `Call thread_send with to="thread-b", type="Question", body="what's the status?". Then say done.`;
-    runPi(questionPrompt, tmpDir, { threadId: "thread-a" });
+  test(
+    "Question puts the sender's lockEventId on hold until a matching Answer clears it",
+    () => {
+      const questionPrompt = `Call thread_send with to="thread-b", type="Question", body="what's the status?". Then say done.`;
+      runPi(questionPrompt, tmpDir, { threadId: "thread-a" });
 
-    let s = readState(tmpDir, "thread-a");
-    expect(s?.obligations?.length).toBe(1);
-    expect(s.obligations[0].type).toBe("Question");
-    const requestId = s.obligations[0].requestId;
+      let s = readState(tmpDir, "thread-a");
+      expect(s?.obligations?.length).toBe(1);
+      expect(s.obligations[0].type).toBe("Question");
+      const requestId = s.obligations[0].requestId;
 
-    const answerPrompt = `Call thread_send with to="thread-a", type="Answer", body="all good", requestId="${requestId}". Then say done.`;
-    runPi(answerPrompt, tmpDir, { threadId: "thread-b" });
+      const answerPrompt = `Call thread_send with to="thread-a", type="Answer", body="all good", requestId="${requestId}". Then say done.`;
+      runPi(answerPrompt, tmpDir, { threadId: "thread-b" });
 
-    runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
+      runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
 
-    s = readState(tmpDir, "thread-a");
-    expect(s?.obligations?.length ?? 0).toBe(0);
-    expect(s?.lockEventId).toBeNull();
-  }, TIMEOUT * 3);
+      s = readState(tmpDir, "thread-a");
+      expect(s?.obligations?.length ?? 0).toBe(0);
+      expect(s?.lockEventId).toBeNull();
+    },
+    TIMEOUT * 3,
+  );
 
-  test("Sync rendezvous: request lands as a lock on the partner, close unwinds both", () => {
-    const requestPrompt = `Call thread_sync_request with partner="thread-b". Then say done.`;
-    runPi(requestPrompt, tmpDir, { threadId: "thread-a" });
+  test(
+    "Sync rendezvous: request lands as a lock on the partner, close unwinds both",
+    () => {
+      const requestPrompt = `Call thread_sync_request with partner="thread-b". Then say done.`;
+      runPi(requestPrompt, tmpDir, { threadId: "thread-a" });
 
-    const a1 = readState(tmpDir, "thread-a");
-    expect(a1?.lockEventId).toMatch(/^sync\.thread-b\./);
-    const requestId = a1.lockEventId;
+      const a1 = readState(tmpDir, "thread-a");
+      expect(a1?.lockEventId).toMatch(/^sync\.thread-b\./);
+      const requestId = a1.lockEventId;
 
-    // thread-b starts, drains the Sync message, and should end up locked with thread-a.
-    runPi("Say 'ok'.", tmpDir, { threadId: "thread-b" });
-    const b1 = readState(tmpDir, "thread-b");
-    expect(b1?.lockEventId).toBe(requestId);
-    expect(b1?.lockPartner).toBe("thread-a");
+      // thread-b starts, drains the Sync message, and should end up locked with thread-a.
+      runPi("Say 'ok'.", tmpDir, { threadId: "thread-b" });
+      const b1 = readState(tmpDir, "thread-b");
+      expect(b1?.lockEventId).toBe(requestId);
+      expect(b1?.lockPartner).toBe("thread-a");
 
-    // thread-b closes the sync — this notifies thread-a via an Answer.
-    runPi("Call thread_sync_close. Then say done.", tmpDir, { threadId: "thread-b" });
-    const b2 = readState(tmpDir, "thread-b");
-    expect(b2?.lockEventId).toBeNull();
+      // thread-b closes the sync — this notifies thread-a via an Answer.
+      runPi("Call thread_sync_close. Then say done.", tmpDir, { threadId: "thread-b" });
+      const b2 = readState(tmpDir, "thread-b");
+      expect(b2?.lockEventId).toBeNull();
 
-    // thread-a needs to run again to drain the close notice.
-    runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
-    const a2 = readState(tmpDir, "thread-a");
-    expect(a2?.lockEventId).toBeNull();
-  }, TIMEOUT * 4);
+      // thread-a needs to run again to drain the close notice.
+      runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
+      const a2 = readState(tmpDir, "thread-a");
+      expect(a2?.lockEventId).toBeNull();
+    },
+    TIMEOUT * 4,
+  );
 
-  test("thread_list surfaces every thread that has ever run in this workspace", () => {
-    runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
-    runPi("Say 'ok'.", tmpDir, { threadId: "thread-b" });
+  test(
+    "thread_list surfaces every thread that has ever run in this workspace",
+    () => {
+      runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
+      runPi("Say 'ok'.", tmpDir, { threadId: "thread-b" });
 
-    // Ground truth: both per-thread directories exist with correct ids — this
-    // is exactly the data thread_list enumerates.
-    const a = readState(tmpDir, "thread-a");
-    const b = readState(tmpDir, "thread-b");
-    expect(a?.id).toBe("thread-a");
-    expect(b?.id).toBe("thread-b");
+      // Ground truth: both per-thread directories exist with correct ids — this
+      // is exactly the data thread_list enumerates.
+      const a = readState(tmpDir, "thread-a");
+      const b = readState(tmpDir, "thread-b");
+      expect(a?.id).toBe("thread-a");
+      expect(b?.id).toBe("thread-b");
 
-    const r = runPi(`Call thread_list and report the ids you see, comma-separated.`, tmpDir, { threadId: "thread-c" });
-    expect(r.stdout).toMatch(/thread-a/);
-    expect(r.stdout).toMatch(/thread-b/);
-  }, TIMEOUT * 3);
+      const r = runPi(`Call thread_list and report the ids you see, comma-separated.`, tmpDir, {
+        threadId: "thread-c",
+      });
+      expect(r.stdout).toMatch(/thread-a/);
+      expect(r.stdout).toMatch(/thread-b/);
+    },
+    TIMEOUT * 3,
+  );
 
-  test("a thread with a stale lastSeen is reported as stopped", () => {
-    const dir = join(tmpDir, ".thread", "threads", "ghost");
-    mkdirSync(join(dir, "inbox", "processed"), { recursive: true });
-    const staleTime = new Date(Date.now() - 5 * 60_000).toISOString(); // 5 min ago, past the 60s threshold
-    writeFileSync(join(dir, "state.json"), JSON.stringify({
-      id: "ghost", pid: 999999, cwd: tmpDir, parent: null, sessionFile: null,
-      state: "open", status: "running", lockEventId: null, lockPartner: null,
-      subscriptions: [], obligations: [],
-      startedAt: staleTime, lastSeen: staleTime, updatedAt: staleTime,
-    }, null, 2));
+  test(
+    "a thread with a stale lastSeen is reported as stopped",
+    () => {
+      const dir = join(tmpDir, ".thread", "threads", "ghost");
+      mkdirSync(join(dir, "inbox", "processed"), { recursive: true });
+      const staleTime = new Date(Date.now() - 5 * 60_000).toISOString(); // 5 min ago, past the 60s threshold
+      writeFileSync(
+        join(dir, "state.json"),
+        JSON.stringify(
+          {
+            id: "ghost",
+            pid: 999999,
+            cwd: tmpDir,
+            parent: null,
+            sessionFile: null,
+            state: "open",
+            status: "running",
+            lockEventId: null,
+            lockPartner: null,
+            subscriptions: [],
+            obligations: [],
+            startedAt: staleTime,
+            lastSeen: staleTime,
+            updatedAt: staleTime,
+          },
+          null,
+          2,
+        ),
+      );
 
-    const r = runPi(`Call thread_list and report the status you see for "ghost".`, tmpDir, { threadId: "observer" });
-    expect(r.stdout).toMatch(/stopped/i);
-  }, TIMEOUT);
+      const r = runPi(`Call thread_list and report the status you see for "ghost".`, tmpDir, {
+        threadId: "observer",
+      });
+      expect(r.stdout).toMatch(/stopped/i);
+    },
+    TIMEOUT,
+  );
 });
