@@ -2,8 +2,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ThreadStore, MessageType, InboxMessage } from "./types";
-import { DEFAULT_DELIVERY, OBLIGATION_TYPES, STALE_MS } from "./types";
+import type { ThreadStore, MessageType, InboxMessage } from "./core/types";
+import { DEFAULT_DELIVERY, OBLIGATION_TYPES, STALE_MS } from "./core/types";
 
 export interface Inbox {
   sendCrossThread(

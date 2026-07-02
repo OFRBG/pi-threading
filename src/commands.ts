@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ThreadStore, MessageType } from "./types";
+import type { ThreadStore, MessageType } from "./core/types";
 import type { Inbox } from "./inbox";
 
 export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox) {

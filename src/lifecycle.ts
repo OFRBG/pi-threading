@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { ThreadStore } from "./types";
+import type { ThreadStore } from "./core/types";
 import type { Inbox } from "./inbox";
-import { threadModelPrompt } from "./system-prompt";
+import { threadModelPrompt } from "./core/system-prompt";
 
 export function registerLifecycle(
   pi: ExtensionAPI,

@@ -20,5 +20,5 @@ while [[ $# -gt 0 ]]; do
 done
 
 cd "$WORK_DIR" && exec pi \
-  --extension "$SCRIPT_DIR/index.ts" \
+  --extension "$SCRIPT_DIR/src/index.ts" \
   "${args[@]}"

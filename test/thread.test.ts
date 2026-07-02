@@ -23,7 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
-const EXT = join(import.meta.dir, "..", "index.ts");
+const EXT = join(import.meta.dir, "..", "src", "index.ts");
 const TIMEOUT = 120_000;
 
 // Volta refuses to resolve `pi` outside a project that declares it, and its
