@@ -14,6 +14,15 @@ export default function (pi: ExtensionAPI) {
     type: "string",
     description: "Parent thread id, for Blocker escalation",
   });
+  pi.registerFlag("thread-role", {
+    type: "string",
+    description:
+      "Role label for this thread (e.g. dev, qa) — targetable via thread_send role:<role>",
+  });
+  pi.registerFlag("thread-journal", {
+    type: "string",
+    description: 'Journal cadence: "turn" (default, one model call per turn), "done", or "off"',
+  });
 
   const store = createThreadStore(pi);
   const inbox = createInbox(store, pi);

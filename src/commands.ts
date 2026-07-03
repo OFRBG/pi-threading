@@ -15,7 +15,7 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
         : "(no journal yet)";
       const lockDesc = `${store.lockEventId ?? "none"}${store.lockPartner ? ` (with ${store.lockPartner})` : ""}`;
       ctx.ui.notify(
-        `Id: ${store.threadId} | State: ${store.state} | Status: ${store.status} | Lock: ${lockDesc} | Subs: ${store.subscriptions.length} | Obligations: ${store.obligations.length}\n\n${lines}`,
+        `Id: ${store.threadId} | State: ${store.state} | Status: ${store.status} | Lock: ${lockDesc} | Subs: ${store.subscriptions.length} | Obligations: ${store.obligations.length} | Barriers: ${store.barriers.length}\n\n${lines}`,
         "info",
       );
     },
@@ -44,7 +44,7 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
       }
       const lines = threads.map(
         t =>
-          `${t.id.padEnd(16)} [${t.state}]  ${t.status}  parent=${t.parent ?? "-"}  lastSeen=${t.lastSeen}`,
+          `${t.id.padEnd(16)} [${t.state}]  ${t.status}  role=${t.role ?? "-"}  parent=${t.parent ?? "-"}  lastSeen=${t.lastSeen}`,
       );
       ctx.ui.notify(lines.join("\n"), "info");
     },
@@ -74,16 +74,31 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
         ctx.ui.notify("Cannot send to self.", "warning");
         return;
       }
-      const { requestId, delivered } = inbox.sendCrossThread(to, type as MessageType, body);
-      ctx.ui.notify(`${type} sent to ${to}. requestId=${requestId} (${delivered}).`, "info");
+      try {
+        const targets = inbox.resolveTargets(to).filter(t => t !== store.threadId);
+        if (!targets.length) {
+          ctx.ui.notify(`No matching targets for "${to}".`, "warning");
+          return;
+        }
+        for (const t of targets) {
+          const { requestId, delivered } = inbox.sendCrossThread(t, type as MessageType, body);
+          ctx.ui.notify(`${type} sent to ${t}. requestId=${requestId} (${delivered}).`, "info");
+        }
+      } catch (e) {
+        ctx.ui.notify(e instanceof Error ? e.message : String(e), "error");
+      }
     },
   });
 
   pi.registerCommand("/thread-suspend", {
     description: "Mark this thread On Hold: /thread-suspend [reason]",
-    async handler(_args, ctx) {
+    async handler(args, ctx) {
+      store.holdReason = args.trim() || null;
       store.transition("on-hold", ctx);
-      ctx.ui.notify("Thread suspended (On Hold).", "info");
+      ctx.ui.notify(
+        `Thread suspended (On Hold)${store.holdReason ? `: ${store.holdReason}` : ""}. Inbox queues until resume.`,
+        "info",
+      );
     },
   });
 
@@ -94,8 +109,10 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
         ctx.ui.notify(`Not on hold (state is ${store.state}).`, "warning");
         return;
       }
+      store.holdReason = null;
       store.transition("open", ctx);
-      ctx.ui.notify("Thread resumed (Open).", "info");
+      inbox.drainInbox(ctx);
+      ctx.ui.notify("Thread resumed (Open). Queued inbox drained.", "info");
     },
   });
 }

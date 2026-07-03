@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
 import type { ThreadStore, ThreadState, ThreadSummary, StateFile } from "./core/types";
-import { HEARTBEAT_MS, STALE_MS } from "./core/types";
+import { HEARTBEAT_MS, STALE_MS, PROCESSED_TTL_MS } from "./core/types";
 
 const JOURNAL_PROMPT = `You are this thread's journal keeper. Based on the conversation above, write a brief status update in exactly this format:
 
@@ -17,6 +17,56 @@ Blockers: <blockers or "none">
 
 No preamble. No extra text. Just the five lines.`;
 
+/** Keep processed/ from growing forever — messages are audit trail, not archive. */
+function pruneProcessed(dir: string) {
+  let files: string[];
+  try {
+    files = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - PROCESSED_TTL_MS;
+  for (const f of files) {
+    // Filenames start with the epoch-millis send time; fall back to mtime.
+    const ts = Number(f.split("-")[0]);
+    try {
+      const age = Number.isFinite(ts) && ts > 0 ? ts : fs.statSync(path.join(dir, f)).mtimeMs;
+      if (age < cutoff) fs.rmSync(path.join(dir, f), { force: true });
+    } catch {
+      // ignore — GC is best-effort
+    }
+  }
+}
+
+/** "Working on"/"Done" carry the actual news; "Doing"/"Next"/"Blockers" are
+ *  restated every idle turn even when nothing happened, so they're excluded
+ *  from the comparison — otherwise a re-forked entry with fresh phrasing of
+ *  the same wait would never match and noise would keep accumulating. */
+export function journalFingerprint(entry: string): string {
+  return entry
+    .split("\n")
+    .filter(l => /^(Working on|Done):/i.test(l.trim()))
+    .join("\n")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function isDuplicateOfLastEntry(journalPath: string, entry: string): boolean {
+  if (!fs.existsSync(journalPath)) return false;
+  let content: string;
+  try {
+    content = fs.readFileSync(journalPath, "utf8").trim();
+  } catch {
+    return false;
+  }
+  if (!content) return false;
+  const entries = content.split(/\n(?=<!--)/).filter(Boolean);
+  const last = entries[entries.length - 1];
+  if (!last) return false;
+  return journalFingerprint(last) === journalFingerprint(entry);
+}
+
 export function createThreadStore(pi: ExtensionAPI): ThreadStore {
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   let watcher: fs.FSWatcher | null = null;
@@ -27,13 +77,21 @@ export function createThreadStore(pi: ExtensionAPI): ThreadStore {
     threadDir: "",
     threadsRootDir: "",
     parent: null,
+    role: null,
+    sessionFile: null,
     startedAt: "",
     state: "idle",
     status: "running",
     lockEventId: null,
     lockPartner: null,
+    lockType: null,
+    holdReason: null,
     subscriptions: [],
     obligations: [],
+    barriers: [],
+    sentToPartnerThisTurn: false,
+    nudgedSinceLastSend: false,
+    lastJournalSignature: null,
 
     // --- operations ---
 
@@ -50,13 +108,17 @@ export function createThreadStore(pi: ExtensionAPI): ThreadStore {
         pid: process.pid,
         cwd: process.cwd(),
         parent: store.parent,
-        sessionFile: null,
+        role: store.role,
+        sessionFile: store.sessionFile,
         state: store.state,
         status: store.status,
         lockEventId: store.lockEventId,
         lockPartner: store.lockPartner,
+        lockType: store.lockType,
+        holdReason: store.holdReason,
         subscriptions: store.subscriptions,
         obligations: store.obligations,
+        barriers: store.barriers,
         startedAt: store.startedAt,
         lastSeen: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -115,27 +177,48 @@ export function createThreadStore(pi: ExtensionAPI): ThreadStore {
 
       const flagParent = pi.getFlag("thread-parent");
       store.parent = typeof flagParent === "string" && flagParent ? flagParent : null;
+      const flagRole = pi.getFlag("thread-role");
+      store.role = typeof flagRole === "string" && flagRole ? flagRole : null;
 
       store.threadDir = path.join(store.threadsRootDir, store.threadId);
       fs.mkdirSync(path.join(store.threadDir, "inbox", "processed"), { recursive: true });
+      pruneProcessed(path.join(store.threadDir, "inbox", "processed"));
 
       // Restore previous state if present.
       const stateFile = path.join(store.threadDir, "state.json");
       if (fs.existsSync(stateFile)) {
         try {
           const s: StateFile = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-          store.state = s.state === "done" ? "idle" : s.state;
-          store.lockEventId = null; // locks don't survive restarts
-          store.lockPartner = null;
-          const stale = s.lockEventId;
+          // Reply locks (Question/Blocker) are durable waits — the Answer may
+          // arrive while we're down, so they survive restarts. Sync locks are
+          // live conversations and don't (legacy files without lockType too).
+          const keepLock = Boolean(s.lockEventId) && s.lockType === "reply";
+          store.lockEventId = keepLock ? s.lockEventId : null;
+          store.lockPartner = keepLock ? (s.lockPartner ?? null) : null;
+          store.lockType = keepLock ? "reply" : null;
+          const stale = keepLock ? null : s.lockEventId;
           store.subscriptions = (s.subscriptions ?? []).filter(sub => sub.eventId !== stale);
           store.obligations = (s.obligations ?? []).filter(ob => ob.requestId !== stale);
+          store.barriers = s.barriers ?? [];
+          store.state =
+            s.state === "done" || s.state === "stopped"
+              ? "idle"
+              : s.state === "in-sync" || (s.state === "listening" && !keepLock)
+                ? "open"
+                : s.state;
+          store.holdReason = store.state === "on-hold" ? (s.holdReason ?? null) : null;
           store.parent = store.parent ?? s.parent ?? null;
+          store.role = store.role ?? s.role ?? null;
         } catch (err) {
           console.error("[thread] Failed to restore state.json:", err);
         }
       }
 
+      try {
+        store.sessionFile = ctx.sessionManager.getSessionFile() ?? null;
+      } catch {
+        store.sessionFile = null;
+      }
       store.startedAt = new Date().toISOString();
       store.status = "running";
       store.writeFile();
@@ -145,8 +228,11 @@ export function createThreadStore(pi: ExtensionAPI): ThreadStore {
     shutdown(reason: string) {
       if (heartbeat) clearInterval(heartbeat);
       if (watcher) watcher.close();
-      if (reason === "quit" && store.state !== "done") {
-        store.state = "stopped";
+      if (reason === "quit") {
+        // Deliberate waiting states survive a clean exit (the reply arrives in
+        // the durable inbox); only interrupted work reads as "stopped".
+        const preserved = new Set(["done", "listening", "on-hold"]);
+        if (!preserved.has(store.state)) store.state = "stopped";
         store.status = "stopped";
         store.writeFile();
       }
@@ -170,6 +256,7 @@ export function createThreadStore(pi: ExtensionAPI): ThreadStore {
             state: s.state,
             status: stale ? "stopped" : s.status,
             parent: s.parent,
+            role: s.role ?? null,
             lastSeen: s.lastSeen,
           });
         } catch {
@@ -208,14 +295,17 @@ export function createThreadStore(pi: ExtensionAPI): ThreadStore {
       proc.on("close", () => {
         fs.rmSync(tmpSes, { recursive: true, force: true });
         const entry = out.trim();
-        if (!entry) return;
+        if (!entry || isDuplicateOfLastEntry(journalPath, entry)) return;
         const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
         fs.appendFileSync(journalPath, `\n<!-- ${ts} -->\n${entry}\n`);
       });
     },
 
-    startHeartbeat() {
-      heartbeat = setInterval(() => store.writeFile(), HEARTBEAT_MS);
+    startHeartbeat(onTick?: () => void) {
+      heartbeat = setInterval(() => {
+        store.writeFile();
+        onTick?.();
+      }, HEARTBEAT_MS);
     },
 
     stopHeartbeat() {

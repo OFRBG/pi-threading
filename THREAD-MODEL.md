@@ -183,7 +183,7 @@ Next: once tests pass, move to middleware layer
 Blockers: none
 ```
 
-Updated once per turn. On `agent_end`, a final fork writes a closing summary.
+Updated once per turn — but not every turn actually forks: a turn with no tool call that also left state, lock, obligations, and barriers unchanged is a pure "still waiting" restatement, and is skipped (both to cut cost and to stop the journal filling up with near-identical "awaiting reply" entries). As a second safety net, a freshly generated entry whose `Working on`/`Done` lines exactly match the previous entry's is discarded even if it was forked. On `agent_end`, a final fork writes a closing summary.
 
 The journal is the thread's interface to the outside world. Humans, supervisor threads, and the war room all read this rather than parsing raw session files or subscribing to the full event stream.
 
@@ -228,3 +228,31 @@ Implemented as a pi coding-agent extension. pi's `ExtensionAPI` provides no nati
 **Liveness**: each running thread heartbeats its own `state.json` every 20s; any reader treats a thread as effectively stopped once `lastSeen` is older than 60s, regardless of the stored `status` field — this is how a hard-killed process (`session_shutdown` never fires on `kill -9`) gets detected.
 
 **Scope boundary**: this only works because every thread shares one filesystem (one `.thread` directory) — true for multiple `pi` processes on the same machine, which is the only scenario built. Cross-machine threads without a shared filesystem would need a thin external relay (a socket, HTTP endpoint, or object store) sitting between machines, each side still feeding its local `.thread` inbox via the same drain logic.
+
+**Envelope**: a delivered message renders as `[<Type> from <sender> #<requestId>]` followed by the body, plus an explicit reply hint when a reply is owed (Question/Blocker → Answer, Brief → Result, Sync → Note/close). The requestId must travel with the message — the receiving model has no other way to learn the correlation id it must echo back.
+
+**Lock durability**: reply locks (Question/Blocker, `lockType: "reply"`) survive restarts — the Answer may arrive in the durable inbox while the thread is down, so the thread restores to Listening with its obligations intact. Sync locks (`lockType: "sync"`) are live conversations and are cleared on restart. A clean quit preserves the deliberate waiting states (Done, Listening, On Hold) in `state.json`; interrupted work (Thinking/Working/Open/Idle) is marked Stopped.
+
+**Sync rejection**: a thread that receives a Sync while already locked auto-replies with an **Answer** keyed to the sync's requestId — which releases the requester's lock through the normal Answer path instead of leaving it locked forever (this also unwinds the mutual-sync race, where two threads request each other simultaneously).
+
+**On Hold**: suspending queues the inbox — nothing is delivered until `thread_resume` (or a direct user prompt, which is an implicit resume). The hold reason is persisted and visible to monitors.
+
+**Broadcast**: `thread_send` accepts `to` as a single id, a comma list, `*` (all known threads except self), or `role:<role>` (threads started with `--thread-role`). Locking types (Question/Blocker/Sync) require exactly one target; fan-out work uses per-target requestIds.
+
+**Barriers**: `thread_await(requestIds, mode, deadlineSeconds?)` arms a persistent barrier; each arriving Answer/Result removes its id, and the thread gets a single steer wake-up (envelope + any resolved-barrier note folded into one message) when all (or any) have resolved. This is the "wait for several agents" primitive: fan out Briefs, await the set, end the turn. `thread_send(type="Brief", wait=true)` arms the same kind of barrier inline — the only message type it works for, since Question/Blocker/Sync already wait via the lock and Note/Update have no reply protocol for the receiver to correlate a reply against.
+
+**Deadlines**: Brief/Question/Sync/Blocker (via `deadlineSeconds` on `thread_send`) and barriers (via `deadlineSeconds` on `thread_await`, or inherited from the same call on `thread_send(wait=true)`) both get a one-time overdue nudge from the heartbeat's `checkDeadlines()` — the accountability loop a human team runs by habit, now covering "nobody answered" and "nobody I'm waiting on answered" alike.
+
+**Human as peer**: `bin/thread-cli.mjs` writes the same message format into any thread's inbox (`send`, including `*` broadcast) and reads the same state files (`list`, `watch`, `tail`, `inbox`) — a human can monitor and steer the team without running pi.
+
+---
+
+## Known Limitations & Edge Cases
+
+Verified by reading the implementation, not exhaustively tested. Listed so they're a documented tradeoff rather than a silent surprise.
+
+- **`deadlineSeconds` applies to any obligation-creating type** (Brief/Question/Sync/Blocker), not just the three the tool description and README call out — Sync obligations can carry a deadline too, which is correct behavior but under-documented.
+- **Simultaneous mutual sync can cancel out instead of connecting.** If A and B both call `thread_sync_request` targeting each other in the same narrow window, and each is still locked with its own pending request when the other's `Sync` arrives, both sides auto-reject each other — both end up back at Open, unsynced, rather than deadlocked or connected. Fails safe, but a caller expecting a rendezvous needs to notice it didn't happen and retry.
+- **No automated test coverage yet for**: `thread_journal`, the CLI `delete` command, and On-Hold-then-resume inbox draining. These shipped and were smoke-tested manually but aren't in `test/thread.test.ts`.
+
+**Fixed since the above was first written**: barrier resolution now folds into the single envelope message instead of double-injecting (`resolveBarriers()` returns notice text, `deliver()` sends one message); `wait=true` is now an explicit, documented no-op for Note/Update instead of silently arming an unresolvable barrier; barriers now support `deadlineSeconds` (on `thread_await` or inherited from `thread_send(wait=true)`) with the same one-time overdue nudge obligations get, and `thread_status` itemizes pending barriers (id/mode/pending ids/deadline) instead of showing a bare count. Covered by `test/thread.test.ts`'s `unit: inbox delivery` block (stubs `pi`/`ctx` directly against `createThreadStore`/`createInbox`, no subprocess) plus one new E2E case for the Note no-op.
