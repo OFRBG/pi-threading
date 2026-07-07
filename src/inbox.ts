@@ -1,11 +1,19 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { ThreadStore, MessageType, InboxMessage } from "./core/types";
-import { DEFAULT_DELIVERY, OBLIGATION_TYPES, STALE_MS } from "./core/types";
+import type { ThreadStore, MessageType, InboxMessage, Delivery } from "./core/types";
+import { DEFAULT_DELIVERY, isObligationType, STALE_MS } from "./core/types";
 import { mintId } from "./core/ids";
+import { nowIso } from "./core/time";
+import { acquireLock, releaseLock } from "./core/thread-ops";
 
 export interface SendResult {
   requestId: string;
   delivered: "queued" | "live";
+}
+
+export interface SendOptions {
+  requestId?: string;
+  delivery?: Delivery;
+  deadline?: string;
 }
 
 export interface Inbox {
@@ -13,10 +21,19 @@ export interface Inbox {
     to: string,
     type: MessageType,
     body: string,
-    opts?: { requestId?: string; delivery?: "steer" | "follow-up"; deadline?: string },
+    opts?: SendOptions,
   ): Promise<SendResult>;
+  /** sendCrossThread over a resolved target list, collecting per-target results. */
+  sendToMany(
+    targets: string[],
+    type: MessageType,
+    body: string,
+    opts?: SendOptions,
+  ): Promise<(SendResult & { to: string })[]>;
   /** Expand a `to` spec — "*", "role:<role>", or comma-separated ids — into thread ids. */
   resolveTargets(to: string): Promise<string[]>;
+  /** Which of these ids have never run in this workspace (likely typos). */
+  findMissingTargets(targets: string[]): Promise<string[]>;
   deliver(msg: InboxMessage, ctx: ExtensionContext): Promise<void>;
   drainInbox(ctx: ExtensionContext): Promise<void>;
   isTargetLive(to: string): Promise<boolean>;
@@ -54,7 +71,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     to: string,
     type: MessageType,
     body: string,
-    opts: { requestId?: string; delivery?: "steer" | "follow-up"; deadline?: string } = {},
+    opts: SendOptions = {},
   ): Promise<SendResult> {
     if (!store.threadId || !store.threadsRootDir) {
       // Without an identity the message would land at a cwd-relative path
@@ -70,7 +87,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       body,
       requestId,
       delivery,
-      sentAt: new Date().toISOString(),
+      sentAt: nowIso(),
     };
 
     const delivered = (await isTargetLive(to)) ? "live" : "queued";
@@ -89,10 +106,10 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       if (store.owed.length !== before) await store.writeFile();
     }
 
-    if (OBLIGATION_TYPES.has(type)) {
+    if (isObligationType(type)) {
       store.obligations.push({
         requestId,
-        type: type as "Brief" | "Question" | "Sync" | "Blocker",
+        type,
         to,
         summary: body.slice(0, 80),
         sentAt: msg.sentAt,
@@ -101,6 +118,27 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       await store.writeFile();
     }
     return { requestId, delivered };
+  }
+
+  async function sendToMany(
+    targets: string[],
+    type: MessageType,
+    body: string,
+    opts: SendOptions = {},
+  ): Promise<(SendResult & { to: string })[]> {
+    const sent: (SendResult & { to: string })[] = [];
+    for (const to of targets) {
+      sent.push({ to, ...(await sendCrossThread(to, type, body, opts)) });
+    }
+    return sent;
+  }
+
+  async function findMissingTargets(targets: string[]): Promise<string[]> {
+    const missing: string[] = [];
+    for (const t of targets) {
+      if (!(await store.threadExists(t))) missing.push(t);
+    }
+    return missing;
   }
 
   async function fireSubscribers(eventId: string): Promise<number> {
@@ -164,10 +202,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       // "listening" (Question/Blocker), "in-sync" (partner closed or rejected
       // the sync), or "open"/"done" (reply landed between turns).
       if (store.lockEventId === msg.requestId) {
-        store.lockEventId = null;
-        store.lockPartner = null;
-        store.lockType = null;
-        await store.transition("open", ctx);
+        await releaseLock(store, ctx);
       }
       await fireSubscribers(msg.requestId);
       barrierNotes = resolveBarriers(msg.requestId);
@@ -204,10 +239,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
         await store.writeFile();
         return;
       }
-      store.lockEventId = msg.requestId;
-      store.lockPartner = msg.from;
-      store.lockType = "sync";
-      await store.transition("in-sync", ctx);
+      await acquireLock(store, msg.requestId, msg.from, "sync", ctx);
     }
 
     const extra = barrierNotes.length ? "\n\n" + barrierNotes.join("\n") : "";
@@ -268,7 +300,9 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
 
   return {
     sendCrossThread,
+    sendToMany,
     resolveTargets,
+    findMissingTargets,
     deliver,
     drainInbox,
     isTargetLive,

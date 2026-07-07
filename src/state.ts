@@ -1,48 +1,12 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as crypto from "node:crypto";
-import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import { spawn } from "node:child_process";
 import type { ThreadStore, ThreadState, ThreadSummary, StateFile } from "./core/types";
 import { HEARTBEAT_MS } from "./core/types";
+import { nowIso } from "./core/time";
+import { forkJournalEntry } from "./journal";
 import type { StorageAdapter } from "./adapter/types";
 import { createLocalFsAdapter } from "./adapter/local-fs";
-
-const JOURNAL_PROMPT = `You are this thread's journal keeper. Based on the conversation above, write a brief status update in exactly this format:
-
-Working on: <the main task in one line>
-Done: <what was completed this turn>
-Doing: <what is in progress or will continue>
-Next: <planned next step>
-Blockers: <blockers or "none">
-
-No preamble. No extra text. Just the five lines.`;
-
-/** "Working on"/"Done" carry the actual news; "Doing"/"Next"/"Blockers" are
- *  restated every idle turn even when nothing happened, so they're excluded
- *  from the comparison — otherwise a re-forked entry with fresh phrasing of
- *  the same wait would never match and noise would keep accumulating. */
-export function journalFingerprint(entry: string): string {
-  return entry
-    .split("\n")
-    .filter(l => /^(Working on|Done):/i.test(l.trim()))
-    .join("\n")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-/** Pure comparison against the last entry in an existing journal's content
- *  (or `undefined` when no journal exists yet). */
-export function isDuplicateOfLastEntry(journalContent: string | undefined, entry: string): boolean {
-  const content = journalContent?.trim();
-  if (!content) return false;
-  const entries = content.split(/\n(?=<!--)/).filter(Boolean);
-  const last = entries[entries.length - 1];
-  if (!last) return false;
-  return journalFingerprint(last) === journalFingerprint(entry);
-}
 
 export function createThreadStore(
   pi: ExtensionAPI,
@@ -107,8 +71,8 @@ export function createThreadStore(
         barriers: store.barriers,
         schedules: store.schedules,
         startedAt: store.startedAt,
-        lastSeen: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
+        lastSeen: nowIso(),
+        updatedAt: nowIso(),
       };
       await store.adapter.saveState(store.threadId, payload);
     },
@@ -183,7 +147,7 @@ export function createThreadStore(
       } catch {
         store.sessionFile = null;
       }
-      store.startedAt = new Date().toISOString();
+      store.startedAt = nowIso();
       store.status = "running";
       await store.writeFile();
       ctx.ui.setStatus("thread", `[${store.threadId}:${store.state}]`);
@@ -215,41 +179,7 @@ export function createThreadStore(
     },
 
     forkJournal(sessionFile: string) {
-      const tmpSes = fs.mkdtempSync(path.join(os.tmpdir(), "pi-journal-"));
-      let out = "";
-      const proc = spawn(
-        "pi",
-        [
-          "--fork",
-          sessionFile,
-          "--session-dir",
-          tmpSes,
-          "--model",
-          "deepseek/deepseek-chat",
-          "--thinking",
-          "off",
-          "--print",
-          JOURNAL_PROMPT,
-        ],
-        { stdio: ["ignore", "pipe", "ignore"] },
-      );
-      proc.on("error", () => {
-        fs.rmSync(tmpSes, { recursive: true, force: true });
-      });
-      proc.stdout!.on("data", (d: Buffer) => {
-        out += d.toString();
-      });
-      proc.on("close", () => {
-        void (async () => {
-          fs.rmSync(tmpSes, { recursive: true, force: true });
-          const entry = out.trim();
-          if (!entry) return;
-          const existing = await store.adapter.readJournal(store.threadId);
-          if (isDuplicateOfLastEntry(existing, entry)) return;
-          const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
-          await store.adapter.appendJournal(store.threadId, `\n<!-- ${ts} -->\n${entry}\n`);
-        })();
-      });
+      forkJournalEntry(store, sessionFile);
     },
 
     startHeartbeat(onTick?: () => void | Promise<void>) {

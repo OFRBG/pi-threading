@@ -28,11 +28,17 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { createThreadStore, journalFingerprint, isDuplicateOfLastEntry } from "../src/state";
+import { createThreadStore } from "../src/state";
 import { createInbox } from "../src/inbox";
 import { registerTools } from "../src/tools";
 import { registerCommands } from "../src/commands";
-import { journalSignature, shouldJournal, JOURNAL_MIN_INTERVAL_MS } from "../src/lifecycle";
+import {
+  journalFingerprint,
+  isDuplicateOfLastEntry,
+  journalSignature,
+  shouldJournal,
+  JOURNAL_MIN_INTERVAL_MS,
+} from "../src/journal";
 import { buildWakeLaunch } from "../src/restate/wake-launch";
 import { createLocalFsAdapter } from "../src/adapter/local-fs";
 import type { StorageAdapter } from "../src/adapter/types";

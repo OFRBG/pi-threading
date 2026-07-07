@@ -2,7 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { StateFile, InboxMessage, ThreadSummary, ScheduledWake } from "../core/types";
-import { STALE_MS, PROCESSED_TTL_MS } from "../core/types";
+import { PROCESSED_TTL_MS, toSummary } from "../core/types";
 import type { StorageAdapter } from "./types";
 
 /** Keep processed/ from growing forever — messages are audit trail, not archive. */
@@ -115,15 +115,7 @@ export function createLocalFsAdapter(): StorageAdapter {
         if (!fs.existsSync(f)) continue;
         try {
           const s: StateFile = JSON.parse(fs.readFileSync(f, "utf8"));
-          const stale = Date.now() - new Date(s.lastSeen).getTime() > STALE_MS;
-          out.push({
-            id: s.id,
-            state: s.state,
-            status: stale ? "stopped" : s.status,
-            parent: s.parent,
-            role: s.role ?? null,
-            lastSeen: s.lastSeen,
-          });
+          out.push(toSummary(s));
         } catch {
           // corrupt/partial — skip.
         }

@@ -15,7 +15,18 @@ export type ThreadState =
 export type MessageType =
   "Brief" | "Note" | "Question" | "Answer" | "Update" | "Result" | "Blocker" | "Sync";
 
-export const DEFAULT_DELIVERY: Record<MessageType, "steer" | "follow-up"> = {
+/** When a message lands: at the target's next Open (steer) or once it's
+ *  Done/Idle (follow-up). */
+export type Delivery = "steer" | "follow-up";
+
+/** The types whose send leaves a durable obligation until Answer/Result. */
+export type ObligationType = "Brief" | "Question" | "Sync" | "Blocker";
+
+/** The received counterparts that leave a durable owed reply (Sync excluded —
+ *  its reply is produced by thread_sync_close via the lock). */
+export type OwedType = Exclude<ObligationType, "Sync">;
+
+export const DEFAULT_DELIVERY: Record<MessageType, Delivery> = {
   Brief: "steer",
   Note: "steer",
   Question: "steer",
@@ -26,12 +37,16 @@ export const DEFAULT_DELIVERY: Record<MessageType, "steer" | "follow-up"> = {
   Sync: "steer",
 };
 
-export const OBLIGATION_TYPES: ReadonlySet<MessageType> = new Set([
+export const OBLIGATION_TYPES: ReadonlySet<ObligationType> = new Set([
   "Brief",
   "Question",
   "Sync",
   "Blocker",
 ]);
+
+export function isObligationType(type: MessageType): type is ObligationType {
+  return (OBLIGATION_TYPES as ReadonlySet<MessageType>).has(type);
+}
 
 export const HEARTBEAT_MS = 20_000;
 export const STALE_MS = 60_000;
@@ -39,7 +54,7 @@ export const PROCESSED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface Obligation {
   requestId: string;
-  type: "Brief" | "Question" | "Sync" | "Blocker";
+  type: ObligationType;
   to: string;
   summary: string;
   sentAt: string;
@@ -53,7 +68,7 @@ export interface Obligation {
  *  it, so a revived thread would have no way to echo the right id back. */
 export interface OwedReply {
   requestId: string;
-  type: "Brief" | "Question" | "Blocker";
+  type: OwedType;
   from: string;
   summary: string;
   receivedAt: string;
@@ -72,7 +87,7 @@ export interface Barrier {
 export interface Subscription {
   eventId: string;
   message: string;
-  delivery: "steer" | "follow-up";
+  delivery: Delivery;
 }
 
 /** A future wake-up this thread armed for itself. Fires exactly once, same
@@ -113,7 +128,7 @@ export interface InboxMessage {
   type: MessageType;
   body: string;
   requestId: string;
-  delivery: "steer" | "follow-up";
+  delivery: Delivery;
   sentAt: string;
 }
 
@@ -124,6 +139,21 @@ export interface ThreadSummary {
   parent: string | null;
   role: string | null;
   lastSeen: string;
+}
+
+/** How every reader classifies another thread: a stale lastSeen overrides the
+ *  stored status, so hard-killed processes (no session_shutdown) read as
+ *  stopped. Shared by all storage backends' listThreads. */
+export function toSummary(s: StateFile): ThreadSummary {
+  const stale = Date.now() - new Date(s.lastSeen).getTime() > STALE_MS;
+  return {
+    id: s.id,
+    state: s.state,
+    status: stale ? "stopped" : s.status,
+    parent: s.parent,
+    role: s.role ?? null,
+    lastSeen: s.lastSeen,
+  };
 }
 
 export interface ThreadStore extends ThreadData {

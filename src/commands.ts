@@ -1,5 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ThreadStore, MessageType } from "./core/types";
+import { formatThreadLine } from "./core/format";
+import { resumeThread, suspendThread } from "./core/thread-ops";
 import type { Inbox } from "./inbox";
 
 export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox) {
@@ -38,11 +40,7 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
         ctx.ui.notify("(no other threads found)", "info");
         return;
       }
-      const lines = threads.map(
-        t =>
-          `${t.id.padEnd(16)} [${t.state}]  ${t.status}  role=${t.role ?? "-"}  parent=${t.parent ?? "-"}  lastSeen=${t.lastSeen}`,
-      );
-      ctx.ui.notify(lines.join("\n"), "info");
+      ctx.ui.notify(threads.map(formatThreadLine).join("\n"), "info");
     },
   });
 
@@ -76,16 +74,13 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
           ctx.ui.notify(`No matching targets for "${to}".`, "warning");
           return;
         }
-        for (const t of targets) {
-          const seen = await store.threadExists(t);
-          const { requestId, delivered } = await inbox.sendCrossThread(
-            t,
-            type as MessageType,
-            body,
-          );
+        const missing = new Set(await inbox.findMissingTargets(targets));
+        const sent = await inbox.sendToMany(targets, type as MessageType, body);
+        for (const s of sent) {
+          const unseen = missing.has(s.to);
           ctx.ui.notify(
-            `${type} sent to ${t}. requestId=${requestId} (${delivered}).${seen ? "" : ` Warning: "${t}" has never been seen in this workspace — delivers only if a thread with that id starts.`}`,
-            seen ? "info" : "warning",
+            `${type} sent to ${s.to}. requestId=${s.requestId} (${s.delivered}).${unseen ? ` Warning: "${s.to}" has never been seen in this workspace — delivers only if a thread with that id starts.` : ""}`,
+            unseen ? "warning" : "info",
           );
         }
       } catch (e) {
@@ -97,8 +92,7 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
   pi.registerCommand("/thread-suspend", {
     description: "Mark this thread On Hold: /thread-suspend [reason]",
     async handler(args, ctx) {
-      store.holdReason = args.trim() || null;
-      await store.transition("on-hold", ctx);
+      await suspendThread(store, args.trim() || null, ctx);
       ctx.ui.notify(
         `Thread suspended (On Hold)${store.holdReason ? `: ${store.holdReason}` : ""}. Inbox queues until resume.`,
         "info",
@@ -109,13 +103,10 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
   pi.registerCommand("/thread-resume", {
     description: "Resume this thread from On Hold back to Open",
     async handler(_args, ctx) {
-      if (store.state !== "on-hold") {
+      if (!(await resumeThread(store, () => inbox.drainInbox(ctx), ctx))) {
         ctx.ui.notify(`Not on hold (state is ${store.state}).`, "warning");
         return;
       }
-      store.holdReason = null;
-      await store.transition("open", ctx);
-      await inbox.drainInbox(ctx);
       ctx.ui.notify("Thread resumed (Open). Queued inbox drained.", "info");
     },
   });

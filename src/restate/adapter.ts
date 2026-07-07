@@ -1,6 +1,6 @@
 import { connect, rpc } from "@restatedev/restate-sdk-clients";
 import type { StateFile, InboxMessage, ThreadSummary, ScheduledWake } from "../core/types";
-import { STALE_MS } from "../core/types";
+import { toSummary } from "../core/types";
 import type { StorageAdapter } from "../adapter/types";
 import type { ThreadObjectApi, ThreadRegistryApi } from "./service";
 
@@ -16,6 +16,7 @@ const POLL_MS = 2000;
  *  `restate-server`). See README.md "Running with the Restate adapter". */
 export function createRestateAdapter(opts: { url?: string }): StorageAdapter {
   const ingress = connect({ url: opts.url ?? "http://localhost:8080" });
+  const thread = (id: string) => ingress.objectClient(ThreadObjectRef, id);
 
   return {
     async configure() {
@@ -24,53 +25,41 @@ export function createRestateAdapter(opts: { url?: string }): StorageAdapter {
     },
 
     async loadState(threadId: string): Promise<StateFile | undefined> {
-      const s = await ingress.objectClient(ThreadObjectRef, threadId).loadState();
-      return s ?? undefined;
+      return (await thread(threadId).loadState()) ?? undefined;
     },
 
     async saveState(threadId: string, state: StateFile) {
-      await ingress.objectClient(ThreadObjectRef, threadId).saveState(state);
+      await thread(threadId).saveState(state);
     },
 
     async appendJournal(threadId: string, entry: string) {
-      await ingress.objectClient(ThreadObjectRef, threadId).appendJournal(entry);
+      await thread(threadId).appendJournal(entry);
     },
 
     async readJournal(threadId: string): Promise<string | undefined> {
-      const j = await ingress.objectClient(ThreadObjectRef, threadId).readJournal();
-      return j ?? undefined;
+      return (await thread(threadId).readJournal()) ?? undefined;
     },
 
     async listThreads(): Promise<ThreadSummary[]> {
       const ids = await ingress.objectClient(RegistryRef, "all").list();
       const out: ThreadSummary[] = [];
       for (const id of ids) {
-        const s = await ingress.objectClient(ThreadObjectRef, id).loadState();
-        if (!s) continue;
-        const stale = Date.now() - new Date(s.lastSeen).getTime() > STALE_MS;
-        out.push({
-          id: s.id,
-          state: s.state,
-          status: stale ? "stopped" : s.status,
-          parent: s.parent,
-          role: s.role ?? null,
-          lastSeen: s.lastSeen,
-        });
+        const s = await thread(id).loadState();
+        if (s) out.push(toSummary(s));
       }
       return out;
     },
 
     async threadExists(threadId: string): Promise<boolean> {
-      const s = await ingress.objectClient(ThreadObjectRef, threadId).loadState();
-      return s != null;
+      return (await thread(threadId).loadState()) != null;
     },
 
     async enqueueMessage(targetId: string, message: InboxMessage) {
-      await ingress.objectClient(ThreadObjectRef, targetId).enqueueMessage(message);
+      await thread(targetId).enqueueMessage(message);
     },
 
     async drainInbox(threadId: string): Promise<InboxMessage[]> {
-      return ingress.objectClient(ThreadObjectRef, threadId).drainInbox();
+      return thread(threadId).drainInbox();
     },
 
     watchInbox(_threadId: string, cb: () => void): () => void {
@@ -86,10 +75,10 @@ export function createRestateAdapter(opts: { url?: string }): StorageAdapter {
       // Persist first — mirrors LocalFsAdapter.scheduleWake's read-modify-
       // write, so thread_status sees it immediately regardless of backend —
       // then arm the durable delayed invocation that actually fires it.
-      const s = await ingress.objectClient(ThreadObjectRef, threadId).loadState();
+      const s = await thread(threadId).loadState();
       if (s) {
         s.schedules = [...s.schedules, wake];
-        await ingress.objectClient(ThreadObjectRef, threadId).saveState(s);
+        await thread(threadId).saveState(s);
       }
       const delayMs = Math.max(0, new Date(wake.fireAt).getTime() - Date.now());
       await ingress
@@ -101,10 +90,10 @@ export function createRestateAdapter(opts: { url?: string }): StorageAdapter {
       // Restate's client API can't cancel an already-armed delayed send —
       // fireWake() re-checks the persisted schedules list at fire time and
       // no-ops if it's gone, so removing it from state here is sufficient.
-      const s = await ingress.objectClient(ThreadObjectRef, threadId).loadState();
+      const s = await thread(threadId).loadState();
       if (!s) return;
       s.schedules = s.schedules.filter(w => w.id !== id);
-      await ingress.objectClient(ThreadObjectRef, threadId).saveState(s);
+      await thread(threadId).saveState(s);
     },
   };
 }
