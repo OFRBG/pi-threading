@@ -35,6 +35,7 @@ import { registerCommands } from "../src/commands";
 import {
   journalFingerprint,
   isDuplicateOfLastEntry,
+  journalForkArgs,
   journalSignature,
   shouldJournal,
   JOURNAL_MIN_INTERVAL_MS,
@@ -1130,6 +1131,16 @@ describe("lifecycle: journalSignature / shouldJournal", () => {
     shouldJournal(h.store, false);
     assert.strictEqual(shouldJournal(h.store, true, "done"), true);
     assert.strictEqual(shouldJournal(h.store, false, "done"), false);
+  });
+
+  it("the journal fork opts out of extensions so it can never become a thread itself", () => {
+    // Regression: with pi-threading installed via discovery, a fork without
+    // --no-extensions loaded the extension, minted a ghost thread identity,
+    // and forked another journal pi at its own turn_end — chaining forever.
+    const args = journalForkArgs("/sessions/parent.jsonl", "/tmp/jf");
+    assert.ok(args.includes("--no-extensions"));
+    assert.deepStrictEqual(args.slice(0, 2), ["--fork", "/sessions/parent.jsonl"]);
+    assert.ok(!args.includes("--thread-id"));
   });
 
   it("journalSignature changes when an obligation is added", () => {

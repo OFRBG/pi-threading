@@ -115,28 +115,38 @@ export function shouldJournal(
   return write;
 }
 
+/** Spawn args for the journal fork. `--no-extensions` is load-bearing: when
+ *  pi-threading is installed via extension discovery, a fork without it
+ *  loads the extension too — and having no --thread-id, it mints a fresh
+ *  identity, writes a ghost .thread/threads/thread-<uuid>/ into the shared
+ *  workspace, and at its own turn_end forks yet another journal pi,
+ *  chaining forever. The fork's only job is to summarize the session it was
+ *  forked from; it must never become a thread. */
+export function journalForkArgs(sessionFile: string, sessionDir: string): string[] {
+  return [
+    "--fork",
+    sessionFile,
+    "--session-dir",
+    sessionDir,
+    "--no-extensions",
+    "--model",
+    "deepseek/deepseek-chat",
+    "--thinking",
+    "off",
+    "--print",
+    JOURNAL_PROMPT,
+  ];
+}
+
 /** Fork the session into a throwaway cheap-model run that writes one journal
  *  entry. Fire-and-forget: runs in the background after turn_end/agent_end,
  *  the main thread never pauses on it. */
 export function forkJournalEntry(store: ThreadStore, sessionFile: string): void {
   const tmpSes = fs.mkdtempSync(path.join(os.tmpdir(), "pi-journal-"));
   let out = "";
-  const proc = spawn(
-    "pi",
-    [
-      "--fork",
-      sessionFile,
-      "--session-dir",
-      tmpSes,
-      "--model",
-      "deepseek/deepseek-chat",
-      "--thinking",
-      "off",
-      "--print",
-      JOURNAL_PROMPT,
-    ],
-    { stdio: ["ignore", "pipe", "ignore"] },
-  );
+  const proc = spawn("pi", journalForkArgs(sessionFile, tmpSes), {
+    stdio: ["ignore", "pipe", "ignore"],
+  });
   proc.on("error", () => {
     fs.rmSync(tmpSes, { recursive: true, force: true });
   });
