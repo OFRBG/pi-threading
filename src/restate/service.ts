@@ -40,7 +40,14 @@ export const ThreadObject = restate.object({
 
     saveState: async (ctx: ObjectContext, state: StateFile) => {
       ctx.set("state", state);
-      ctx.objectSendClient(ThreadRegistry, "all").register(state.id);
+      // First-time registration is awaited: a fire-and-forget send here races
+      // listThreads — a thread wouldn't be reliably listable (broadcastable)
+      // the moment its own saveState returns. The flag keeps every later
+      // save (one per heartbeat) from paying the registry round-trip.
+      if (!(await ctx.get<boolean>("registered"))) {
+        await ctx.objectClient(ThreadRegistry, "all").register(state.id);
+        ctx.set("registered", true);
+      }
     },
 
     appendJournal: async (ctx: ObjectContext, entry: string) => {
