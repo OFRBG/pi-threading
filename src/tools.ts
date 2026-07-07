@@ -1,9 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import type { ThreadStore, MessageType, Barrier } from "./core/types";
+import type { ThreadStore, MessageType, Barrier, ScheduledWake } from "./core/types";
 import type { Inbox } from "./inbox";
+import { mintId } from "./core/ids";
 
 function err(text: string) {
   return {
@@ -12,23 +11,33 @@ function err(text: string) {
   };
 }
 
+/** Shared by thread_status and /thread-status. */
+export function scheduleLines(schedules: ScheduledWake[]): string {
+  return schedules.length
+    ? "\n" +
+        schedules
+          .map(w => `  - ${w.id} at ${w.fireAt}: "${w.reason}"${w.nudged ? " (fired)" : ""}`)
+          .join("\n")
+    : " none";
+}
+
 /** Shared by thread_send(wait=true) and thread_await — arm a barrier that
  *  wakes this thread (passively, at next Open) once its requestIds resolve. */
-function armBarrier(
+async function armBarrier(
   store: ThreadStore,
   requestIds: string[],
   mode: "all" | "any",
   deadline?: string,
-): Barrier {
+): Promise<Barrier> {
   const barrier: Barrier = {
-    id: `barrier.${store.threadId}.${Date.now()}`,
+    id: mintId(`barrier.${store.threadId}`),
     pending: [...requestIds],
     mode,
     createdAt: new Date().toISOString(),
     ...(deadline ? { deadline } : {}),
   };
   store.barriers.push(barrier);
-  store.writeFile();
+  await store.writeFile();
   return barrier;
 }
 
@@ -40,10 +49,8 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
       "Read this thread's own state and journal. Use this to understand what you were doing before a compaction.",
     parameters: Type.Object({}),
     async execute() {
-      const journalPath = path.join(store.threadDir, "journal.md");
-      const journal = fs.existsSync(journalPath)
-        ? fs.readFileSync(journalPath, "utf8").trim()
-        : "(no journal yet — this is the first turn)";
+      const journal =
+        (await store.readJournal(store.threadId)) ?? "(no journal yet — this is the first turn)";
       const lockDesc = `${store.lockEventId ?? "none"}${store.lockPartner ? ` (with ${store.lockPartner})` : ""}`;
       const obligationLines = store.obligations.length
         ? "\n" +
@@ -63,11 +70,20 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
             )
             .join("\n")
         : " none";
+      const owedLines = store.owed.length
+        ? "\n" +
+          store.owed
+            .map(
+              o =>
+                `  - you owe ${o.type === "Brief" ? "a Result" : "an Answer"} to ${o.from} for their ${o.type} #${o.requestId} "${o.summary}" — echo that exact requestId`,
+            )
+            .join("\n")
+        : " none";
       return {
         content: [
           {
             type: "text" as const,
-            text: `Id: ${store.threadId}\nRole: ${store.role ?? "-"}\nState: ${store.state}${store.holdReason ? ` (${store.holdReason})` : ""}\nStatus: ${store.status}\nLock: ${lockDesc}\nSubscriptions: ${store.subscriptions.length}\nBarriers:${barrierLines}\nObligations:${obligationLines}\n\n${journal}`,
+            text: `Id: ${store.threadId}\nRole: ${store.role ?? "-"}\nState: ${store.state}${store.holdReason ? ` (${store.holdReason})` : ""}\nStatus: ${store.status}\nLock: ${lockDesc}\nSubscriptions: ${store.subscriptions.length}\nBarriers:${barrierLines}\nObligations:${obligationLines}\nOwed replies:${owedLines}\nSchedules:${scheduleLines(store.schedules)}\n\n${journal}`,
           },
         ],
         details: {
@@ -81,7 +97,9 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
           lockType: store.lockType,
           subscriptions: store.subscriptions,
           obligations: store.obligations,
+          owed: store.owed,
           barriers: store.barriers,
+          schedules: store.schedules,
         },
       };
     },
@@ -94,7 +112,7 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
       "List all known threads sharing this workspace and their last known state. Use this to find a valid `to` id before calling thread_send or thread_sync_request.",
     parameters: Type.Object({}),
     async execute() {
-      const threads = store.listThreads();
+      const threads = await store.listThreads();
       const lines = threads.map(
         t =>
           `${t.id.padEnd(16)} [${t.state}]  ${t.status}  role=${t.role ?? "-"}  parent=${t.parent ?? "-"}  lastSeen=${t.lastSeen}`,
@@ -134,14 +152,10 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
       ),
     }),
     async execute(_id, params) {
-      const dir = path.join(store.threadsRootDir, params.id);
-      if (!fs.existsSync(path.join(dir, "state.json"))) {
+      if (!(await store.threadExists(params.id))) {
         return err(`No thread "${params.id}" found. Call thread_list to see known ids.`);
       }
-      const journalPath = path.join(dir, "journal.md");
-      let journal = fs.existsSync(journalPath)
-        ? fs.readFileSync(journalPath, "utf8").trim()
-        : "(no journal entries yet)";
+      let journal = (await store.readJournal(params.id)) ?? "(no journal entries yet)";
       if ((params.tail || params.lookbackMinutes) && journal) {
         let entries = journal.split(/\n(?=<!--)/).filter(Boolean);
         if (params.lookbackMinutes) {
@@ -238,7 +252,7 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
         );
       }
 
-      const targets = inbox.resolveTargets(toSpec).filter(t => t !== store.threadId);
+      const targets = (await inbox.resolveTargets(toSpec)).filter(t => t !== store.threadId);
       if (targets.length === 0) {
         return err(`No matching targets for "${toSpec}" (self-sends are excluded).`);
       }
@@ -249,6 +263,21 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
         );
       }
 
+      // "*"/role: targets come from listThreads and exist by construction; a
+      // direct id may be a typo. For locking types a typo is fatal — the lock
+      // waits forever for a reply that can never come — so refuse. Queueing
+      // types legitimately target threads that will boot later (durable
+      // dead-drop), so those get a warning instead.
+      const missing: string[] = [];
+      for (const t of targets) {
+        if (!(await store.threadExists(t))) missing.push(t);
+      }
+      if (locking && missing.length) {
+        return err(
+          `No thread "${missing[0]}" has ever run in this workspace — a ${type} would lock you in a wait for a reply that can never come. Check thread_list for valid ids${type === "Sync" ? "" : `, or use a Brief/Note if "${missing[0]}" will be created later`}.`,
+        );
+      }
+
       const deadline = params.deadlineSeconds
         ? new Date(Date.now() + params.deadlineSeconds * 1000).toISOString()
         : undefined;
@@ -256,12 +285,10 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
       const sent: { to: string; requestId: string; delivered: string }[] = [];
       try {
         for (const to of targets) {
-          const requestId =
-            targets.length > 1 && !params.requestId
-              ? `${type.toLowerCase()}.${store.threadId}.${Date.now()}.${to}`
-              : params.requestId;
-          const r = inbox.sendCrossThread(to, type, params.body, {
-            requestId,
+          // No explicit requestId: sendCrossThread mints a unique one per
+          // target, so fan-out replies stay individually correlatable.
+          const r = await inbox.sendCrossThread(to, type, params.body, {
+            requestId: params.requestId,
             delivery: params.delivery as "steer" | "follow-up" | undefined,
             deadline,
           });
@@ -275,12 +302,17 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
         store.lockEventId = sent[0].requestId;
         store.lockPartner = sent[0].to;
         store.lockType = "reply";
-        store.transition("listening", ctx);
+        await store.transition("listening", ctx);
       }
 
       const lines = sent.map(
         s => `${type} sent to ${s.to}. requestId=${s.requestId} (${s.delivered}).`,
       );
+      if (missing.length) {
+        lines.push(
+          `(note: ${missing.join(", ")} ${missing.length === 1 ? "has" : "have"} never been seen in this workspace — the message is queued durably and delivers if a thread with that id starts. If this was a typo, check thread_list.)`,
+        );
+      }
 
       let waitNote = "";
       if (params.wait) {
@@ -289,7 +321,7 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
         } else if (type !== "Brief") {
           waitNote = `\n(wait=true ignored — ${type} has no reply protocol, so there's nothing to wait for. Use Brief if you need a tracked reply.)`;
         } else {
-          const barrier = armBarrier(
+          const barrier = await armBarrier(
             store,
             sent.map(s => s.requestId),
             (params.waitMode as "all" | "any") ?? "all",
@@ -328,7 +360,7 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
         message: params.message,
         delivery: params.delivery as "steer" | "follow-up",
       });
-      store.writeFile();
+      await store.writeFile();
       return {
         content: [
           {
@@ -350,7 +382,7 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
       eventId: Type.String({ description: "Event name to emit" }),
     }),
     async execute(_id, params) {
-      const n = inbox.fireSubscribers(params.eventId);
+      const n = await inbox.fireSubscribers(params.eventId);
       return {
         content: [
           {
@@ -391,7 +423,7 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
       const deadline = params.deadlineSeconds
         ? new Date(Date.now() + params.deadlineSeconds * 1000).toISOString()
         : undefined;
-      const barrier = armBarrier(
+      const barrier = await armBarrier(
         store,
         params.requestIds,
         (params.mode as "all" | "any") ?? "all",
@@ -440,19 +472,26 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
           details: { ok: false },
         };
       }
-      store.lockEventId = `sync.${params.partner}.${Date.now()}`;
+      if (!(await store.threadExists(params.partner))) {
+        // Same reasoning as the locking-type guard in thread_send: a sync
+        // request to a thread that doesn't exist locks this side forever.
+        return err(
+          `No thread "${params.partner}" has ever run in this workspace — sync would lock you onto a partner that can never reply. Check thread_list for valid ids.`,
+        );
+      }
+      store.lockEventId = mintId(`sync.${params.partner}`);
       store.lockPartner = params.partner;
       store.lockType = "sync";
-      store.transition("in-sync", ctx);
+      await store.transition("in-sync", ctx);
       try {
-        inbox.sendCrossThread(params.partner, "Sync", `Sync requested by ${store.threadId}`, {
+        await inbox.sendCrossThread(params.partner, "Sync", `Sync requested by ${store.threadId}`, {
           requestId: store.lockEventId,
         });
       } catch (e) {
         store.lockEventId = null;
         store.lockPartner = null;
         store.lockType = null;
-        store.transition("open", ctx);
+        await store.transition("open", ctx);
         return err(e instanceof Error ? e.message : String(e));
       }
       return {
@@ -491,10 +530,10 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
       store.lockPartner = null;
       store.lockType = null;
       store.obligations = store.obligations.filter(o => o.requestId !== released);
-      store.transition("open", ctx);
-      const n = inbox.fireSubscribers(released);
+      await store.transition("open", ctx);
+      const n = await inbox.fireSubscribers(released);
       if (partner) {
-        inbox.sendCrossThread(partner, "Answer", "sync closed", {
+        await inbox.sendCrossThread(partner, "Answer", "sync closed", {
           requestId: released,
         });
       }
@@ -520,7 +559,7 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       store.holdReason = params.reason ?? null;
-      store.transition("on-hold", ctx);
+      await store.transition("on-hold", ctx);
       return {
         content: [
           {
@@ -551,10 +590,58 @@ export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox
         };
       }
       store.holdReason = null;
-      store.transition("open", ctx);
-      inbox.drainInbox(ctx);
+      await store.transition("open", ctx);
+      await inbox.drainInbox(ctx);
       return {
         content: [{ type: "text" as const, text: "Thread resumed (Open). Queued inbox drained." }],
+        details: { ok: true },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "thread_schedule",
+    label: "Thread Schedule",
+    description:
+      "Arm a future wake-up for THIS thread. When it fires, `reason` is delivered back to you like an obligation reminder — a passive nudge, not a forced turn. Backend-dependent: the local filesystem backend only fires while this process is still running; the Restate backend can wake a stopped thread.",
+    parameters: Type.Object({
+      fireInSeconds: Type.Number({ description: "Seconds from now until this wake fires" }),
+      reason: Type.String({ description: "Delivered back to you verbatim when the wake fires" }),
+    }),
+    async execute(_id, params) {
+      const wake: ScheduledWake = {
+        id: mintId(`wake.${store.threadId}`),
+        fireAt: new Date(Date.now() + params.fireInSeconds * 1000).toISOString(),
+        reason: params.reason,
+      };
+      await store.adapter.scheduleWake(store.threadId, wake);
+      store.schedules.push(wake);
+      return {
+        content: [
+          { type: "text" as const, text: `Scheduled wake ${wake.id} armed for ${wake.fireAt}.` },
+        ],
+        details: { ok: true, wake },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "thread_schedule_cancel",
+    label: "Thread Schedule Cancel",
+    description: "Cancel a previously armed scheduled wake by id (see thread_status).",
+    parameters: Type.Object({
+      id: Type.String({ description: "The scheduled wake's id" }),
+    }),
+    async execute(_id, params) {
+      if (!store.schedules.some(w => w.id === params.id)) {
+        return err(
+          `No scheduled wake with id "${params.id}". Call thread_status to see known ids.`,
+        );
+      }
+      await store.adapter.cancelWake(store.threadId, params.id);
+      store.schedules = store.schedules.filter(w => w.id !== params.id);
+      return {
+        content: [{ type: "text" as const, text: `Cancelled scheduled wake ${params.id}.` }],
         details: { ok: true },
       };
     },

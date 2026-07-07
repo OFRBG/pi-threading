@@ -1,9 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import * as crypto from "node:crypto";
-import * as fs from "node:fs";
-import * as path from "node:path";
 import type { ThreadStore, MessageType, InboxMessage } from "./core/types";
 import { DEFAULT_DELIVERY, OBLIGATION_TYPES, STALE_MS } from "./core/types";
+import { mintId } from "./core/ids";
 
 export interface SendResult {
   requestId: string;
@@ -16,35 +14,31 @@ export interface Inbox {
     type: MessageType,
     body: string,
     opts?: { requestId?: string; delivery?: "steer" | "follow-up"; deadline?: string },
-  ): SendResult;
+  ): Promise<SendResult>;
   /** Expand a `to` spec — "*", "role:<role>", or comma-separated ids — into thread ids. */
-  resolveTargets(to: string): string[];
-  deliver(msg: InboxMessage, ctx: ExtensionContext): void;
-  drainInbox(ctx: ExtensionContext): void;
-  isTargetLive(to: string): boolean;
-  fireSubscribers(eventId: string): number;
+  resolveTargets(to: string): Promise<string[]>;
+  deliver(msg: InboxMessage, ctx: ExtensionContext): Promise<void>;
+  drainInbox(ctx: ExtensionContext): Promise<void>;
+  isTargetLive(to: string): Promise<boolean>;
+  fireSubscribers(eventId: string): Promise<number>;
   /** Called from the heartbeat: injects a one-time reminder per overdue obligation. */
-  checkDeadlines(): void;
+  checkDeadlines(): Promise<void>;
+  /** Called from the heartbeat: fires any scheduled wake whose time has come.
+   *  Local-fs backend only — the Restate backend fires independently via
+   *  the companion service's own durable timer + runner. */
+  checkSchedules(): Promise<void>;
 }
 
 export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
-  function inboxDirFor(id: string): string {
-    return path.join(store.threadsRootDir, id, "inbox");
+  async function isTargetLive(to: string): Promise<boolean> {
+    const s = await store.adapter.loadState(to);
+    if (!s) return false;
+    return s.status === "running" && Date.now() - new Date(s.lastSeen).getTime() < STALE_MS;
   }
 
-  function isTargetLive(to: string): boolean {
-    try {
-      const f = path.join(store.threadsRootDir, to, "state.json");
-      const s = JSON.parse(fs.readFileSync(f, "utf8"));
-      return s.status === "running" && Date.now() - new Date(s.lastSeen).getTime() < STALE_MS;
-    } catch {
-      return false;
-    }
-  }
-
-  function resolveTargets(to: string): string[] {
+  async function resolveTargets(to: string): Promise<string[]> {
     if (to !== "*" && !to.startsWith("role:") && !to.includes(",")) return [to];
-    const all = store.listThreads().filter(t => t.id !== store.threadId);
+    const all = (await store.listThreads()).filter(t => t.id !== store.threadId);
     if (to === "*") return all.map(t => t.id);
     if (to.startsWith("role:")) {
       const role = to.slice(5);
@@ -56,18 +50,18 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       .filter(s => s && s !== store.threadId);
   }
 
-  function sendCrossThread(
+  async function sendCrossThread(
     to: string,
     type: MessageType,
     body: string,
     opts: { requestId?: string; delivery?: "steer" | "follow-up"; deadline?: string } = {},
-  ): SendResult {
+  ): Promise<SendResult> {
     if (!store.threadId || !store.threadsRootDir) {
       // Without an identity the message would land at a cwd-relative path
       // nothing ever drains (observed in the wild as <cwd>/<to>/inbox/).
       throw new Error("Thread system not initialized yet — cannot send.");
     }
-    const requestId = opts.requestId ?? `${type.toLowerCase()}.${store.threadId}.${Date.now()}`;
+    const requestId = opts.requestId ?? mintId(`${type.toLowerCase()}.${store.threadId}`);
     const delivery = opts.delivery ?? DEFAULT_DELIVERY[type];
     const msg: InboxMessage = {
       from: store.threadId,
@@ -79,18 +73,20 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       sentAt: new Date().toISOString(),
     };
 
-    const delivered = isTargetLive(to) ? "live" : "queued";
-    const targetInbox = inboxDirFor(to);
-    fs.mkdirSync(targetInbox, { recursive: true });
-    const fname = `${Date.now()}-${crypto.randomUUID()}.json`;
-    const tmp = path.join(targetInbox, `.tmp-${fname}`);
-    const final = path.join(targetInbox, fname);
-    fs.writeFileSync(tmp, JSON.stringify(msg, null, 2));
-    fs.renameSync(tmp, final);
+    const delivered = (await isTargetLive(to)) ? "live" : "queued";
+    await store.adapter.enqueueMessage(to, msg);
 
     if (to === store.lockPartner) {
       store.sentToPartnerThisTurn = true;
       store.nudgedSinceLastSend = false;
+    }
+
+    if (type === "Answer" || type === "Result") {
+      // Sending the reply settles the durable owed-reply record made when the
+      // Brief/Question/Blocker was delivered (see deliver()).
+      const before = store.owed.length;
+      store.owed = store.owed.filter(o => o.requestId !== requestId);
+      if (store.owed.length !== before) await store.writeFile();
     }
 
     if (OBLIGATION_TYPES.has(type)) {
@@ -102,12 +98,12 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
         sentAt: msg.sentAt,
         ...(opts.deadline ? { deadline: opts.deadline } : {}),
       });
-      store.writeFile();
+      await store.writeFile();
     }
     return { requestId, delivered };
   }
 
-  function fireSubscribers(eventId: string): number {
+  async function fireSubscribers(eventId: string): Promise<number> {
     const fired = store.subscriptions.filter(s => s.eventId === eventId);
     for (const sub of fired) {
       pi.sendUserMessage(sub.message, {
@@ -115,7 +111,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       });
     }
     store.subscriptions = store.subscriptions.filter(s => s.eventId !== eventId);
-    store.writeFile();
+    await store.writeFile();
     return fired.length;
   }
 
@@ -160,7 +156,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     return `${header}\n${msg.body}${hint}`;
   }
 
-  function deliver(msg: InboxMessage, ctx: ExtensionContext) {
+  async function deliver(msg: InboxMessage, ctx: ExtensionContext): Promise<void> {
     let barrierNotes: string[] = [];
     if (msg.type === "Answer" || msg.type === "Result") {
       store.obligations = store.obligations.filter(o => o.requestId !== msg.requestId);
@@ -171,72 +167,66 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
         store.lockEventId = null;
         store.lockPartner = null;
         store.lockType = null;
-        store.transition("open", ctx);
+        await store.transition("open", ctx);
       }
-      fireSubscribers(msg.requestId);
+      await fireSubscribers(msg.requestId);
       barrierNotes = resolveBarriers(msg.requestId);
+    }
+
+    if (msg.type === "Brief" || msg.type === "Question" || msg.type === "Blocker") {
+      // Record the reply this thread now owes, durably: the envelope (and its
+      // requestId, which the eventual Result/Answer must echo) exists only in
+      // the receiving session's context — without this record, a thread
+      // revived after a restart has no protocol-level way to recover the id.
+      // Sync is excluded: its reply is produced by thread_sync_close via the
+      // lock, and sync locks are deliberately not durable.
+      if (!store.owed.some(o => o.requestId === msg.requestId)) {
+        store.owed.push({
+          requestId: msg.requestId,
+          type: msg.type,
+          from: msg.from,
+          summary: msg.body.slice(0, 80),
+          receivedAt: msg.sentAt,
+        });
+      }
     }
 
     if (msg.type === "Sync") {
       if (store.lockEventId) {
         // Already locked — reject as an Answer so the requester's own lock
         // (keyed to this requestId) unwinds instead of hanging forever.
-        sendCrossThread(
+        await sendCrossThread(
           msg.from,
           "Answer",
           `Rejected sync: ${store.threadId} is already in sync with ${store.lockPartner ?? "another thread"}. Try again later or subscribe to my current lock.`,
           { requestId: msg.requestId },
         );
-        store.writeFile();
+        await store.writeFile();
         return;
       }
       store.lockEventId = msg.requestId;
       store.lockPartner = msg.from;
       store.lockType = "sync";
-      store.transition("in-sync", ctx);
+      await store.transition("in-sync", ctx);
     }
 
     const extra = barrierNotes.length ? "\n\n" + barrierNotes.join("\n") : "";
     pi.sendUserMessage(renderEnvelope(msg) + extra, {
       deliverAs: msg.delivery === "steer" ? "steer" : "followUp",
     });
-    store.writeFile();
+    await store.writeFile();
   }
 
-  function drainInbox(ctx: ExtensionContext) {
+  async function drainInbox(ctx: ExtensionContext): Promise<void> {
     // On Hold means "don't wake me": messages stay queued until resume.
     if (store.state === "on-hold") return;
-    const inboxDir = path.join(store.threadDir, "inbox");
-    const processedDir = path.join(inboxDir, "processed");
-    let files: string[];
-    try {
-      files = fs
-        .readdirSync(inboxDir)
-        .filter(f => f.endsWith(".json"))
-        .sort();
-    } catch {
-      return;
-    }
-    for (const f of files) {
-      const full = path.join(inboxDir, f);
-      let msg: InboxMessage;
-      try {
-        msg = JSON.parse(fs.readFileSync(full, "utf8"));
-      } catch {
-        continue;
-      }
-      // Rename before delivering: if deliver() throws, message is already
-      // moved and won't be redelivered.
-      try {
-        fs.renameSync(full, path.join(processedDir, f));
-      } catch {
-        continue; // already claimed — shouldn't happen (single reader)
-      }
-      deliver(msg, ctx);
+    const messages = await store.adapter.drainInbox(store.threadId);
+    for (const msg of messages) {
+      await deliver(msg, ctx);
     }
   }
 
-  function checkDeadlines() {
+  async function checkDeadlines(): Promise<void> {
     const now = Date.now();
     let changed = false;
     for (const ob of store.obligations) {
@@ -257,7 +247,23 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
         { deliverAs: "steer" },
       );
     }
-    if (changed) store.writeFile();
+    if (changed) await store.writeFile();
+  }
+
+  async function checkSchedules(): Promise<void> {
+    const now = Date.now();
+    // Fired wakes are pruned, not kept — otherwise thread_status accumulates
+    // "(fired)" entries forever. Already-nudged entries (the Restate service
+    // fired them while this process was down and it spawned us with the
+    // reason as the prompt) are pruned too, without re-firing.
+    const due = store.schedules.filter(w => !w.nudged && new Date(w.fireAt).getTime() <= now);
+    const keep = store.schedules.filter(w => !w.nudged && new Date(w.fireAt).getTime() > now);
+    if (keep.length === store.schedules.length) return;
+    store.schedules = keep;
+    for (const w of due) {
+      pi.sendUserMessage(`[scheduled wake #${w.id}]: ${w.reason}`, { deliverAs: "steer" });
+    }
+    await store.writeFile();
   }
 
   return {
@@ -268,5 +274,6 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     isTargetLive,
     fireSubscribers,
     checkDeadlines,
+    checkSchedules,
   };
 }

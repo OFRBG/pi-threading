@@ -14,40 +14,43 @@ function restingState(store: ThreadStore, whenUnlocked: ThreadState): ThreadStat
 export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox) {
   let toolUsedThisTurn = false;
 
-  pi.on("session_start", (_event, ctx) => {
-    store.init(ctx.cwd, ctx);
+  pi.on("session_start", async (_event, ctx) => {
+    await store.init(ctx.cwd, ctx);
 
     // Defer initial drain to next tick — calling pi.sendUserMessage
     // synchronously from session_start deadlocks turn scheduling.
-    setImmediate(() => inbox.drainInbox(ctx));
+    setImmediate(() => void inbox.drainInbox(ctx));
     store.startWatcher(inbox.drainInbox, ctx);
-    store.startHeartbeat(() => inbox.checkDeadlines());
+    store.startHeartbeat(async () => {
+      await inbox.checkDeadlines();
+      await inbox.checkSchedules();
+    });
   });
 
-  pi.on("session_shutdown", event => {
-    store.shutdown(event.reason);
+  pi.on("session_shutdown", async event => {
+    await store.shutdown(event.reason);
   });
 
-  pi.on("turn_start", (_event, ctx) => {
+  pi.on("turn_start", async (_event, ctx) => {
     const wasOnHold = store.state === "on-hold";
     store.sentToPartnerThisTurn = false;
     toolUsedThisTurn = false;
-    store.transition("thinking", ctx);
+    await store.transition("thinking", ctx);
     if (wasOnHold) {
       // A prompt landing on a suspended thread is an implicit resume.
       store.holdReason = null;
-      store.writeFile();
-      inbox.drainInbox(ctx);
+      await store.writeFile();
+      await inbox.drainInbox(ctx);
     }
   });
 
-  pi.on("tool_execution_start", (_event, ctx) => {
+  pi.on("tool_execution_start", async (_event, ctx) => {
     toolUsedThisTurn = true;
-    store.transition("working", ctx);
+    await store.transition("working", ctx);
   });
 
-  pi.on("turn_end", (_event, ctx) => {
-    store.transition(restingState(store, "open"), ctx);
+  pi.on("turn_end", async (_event, ctx) => {
+    await store.transition(restingState(store, "open"), ctx);
 
     // Channel-confusion guard: a pure-text turn while In Sync is the classic
     // failure — the model "talks" to its partner but only the user sees it.
@@ -72,15 +75,20 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
       );
     }
 
-    if (journalMode(pi) === "turn" && shouldJournal(store, toolUsedThisTurn)) {
+    if (journalMode(pi) === "turn" && shouldJournal(store, toolUsedThisTurn, "turn")) {
       const sf = ctx.sessionManager.getSessionFile();
       if (sf) store.forkJournal(sf);
     }
   });
 
-  pi.on("agent_end", (_event, ctx) => {
-    store.transition(restingState(store, "done"), ctx);
-    if (journalMode(pi) === "done" && shouldJournal(store, toolUsedThisTurn)) {
+  pi.on("agent_end", async (_event, ctx) => {
+    await store.transition(restingState(store, "done"), ctx);
+    const mode = journalMode(pi);
+    const write =
+      mode === "done"
+        ? shouldJournal(store, toolUsedThisTurn, "done")
+        : mode === "turn" && shouldJournal(store, toolUsedThisTurn, "run-end");
+    if (write) {
       const sf = ctx.sessionManager.getSessionFile();
       if (sf) store.forkJournal(sf);
     }
@@ -116,10 +124,46 @@ export function journalSignature(store: ThreadStore): string {
   ].join("|");
 }
 
-export function shouldJournal(store: ThreadStore, toolUsedThisTurn: boolean): boolean {
+/** Minimum spacing between per-turn journal forks. Structural changes (new
+ *  obligation, lock, barrier — the things teammates key off) still journal
+ *  immediately; this only rate-limits the "another tool turn on the same
+ *  task" entries that used to land once per turn, ~17 near-duplicates per
+ *  work session. */
+export const JOURNAL_MIN_INTERVAL_MS = 120_000;
+
+/** Decide whether this moment deserves a forked journal entry.
+ *
+ *  - "turn"    — turn_end in per-turn mode: journal on structural change, or
+ *                on tool-using turns at most every JOURNAL_MIN_INTERVAL_MS;
+ *                a rate-limited turn records a debt instead.
+ *  - "run-end" — agent_end in per-turn mode: journal only if a debt is
+ *                outstanding, so the run's final state is always captured
+ *                exactly once (the state flip to done/open on agent_end
+ *                itself is not news — the last turn already covered it).
+ *  - "done"    — agent_end in journal-mode "done": one entry per run when
+ *                anything happened.
+ */
+export function shouldJournal(
+  store: ThreadStore,
+  toolUsedThisTurn: boolean,
+  phase: "turn" | "run-end" | "done" = "turn",
+): boolean {
   const sig = journalSignature(store);
   const changed = sig !== store.lastJournalSignature;
-  if (!changed && !toolUsedThisTurn) return false;
-  store.lastJournalSignature = sig;
-  return true;
+  let write: boolean;
+  if (phase === "run-end") {
+    write = store.journalDebt;
+  } else if (phase === "done") {
+    write = changed || toolUsedThisTurn;
+  } else {
+    if (!changed && !toolUsedThisTurn) return false;
+    write = changed || Date.now() - store.lastJournalAt >= JOURNAL_MIN_INTERVAL_MS;
+    if (!write) store.journalDebt = true;
+  }
+  if (write) {
+    store.lastJournalSignature = sig;
+    store.lastJournalAt = Date.now();
+    store.journalDebt = false;
+  }
+  return write;
 }

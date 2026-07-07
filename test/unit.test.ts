@@ -23,12 +23,21 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { createThreadStore, journalFingerprint, isDuplicateOfLastEntry } from "../src/state";
 import { createInbox } from "../src/inbox";
 import { registerTools } from "../src/tools";
 import { registerCommands } from "../src/commands";
-import { journalSignature, shouldJournal } from "../src/lifecycle";
+import { journalSignature, shouldJournal, JOURNAL_MIN_INTERVAL_MS } from "../src/lifecycle";
+import { buildWakeLaunch } from "../src/restate/wake-launch";
+import { createLocalFsAdapter } from "../src/adapter/local-fs";
+import type { StorageAdapter } from "../src/adapter/types";
+import type { StateFile, InboxMessage, ThreadSummary } from "../src/core/types";
+import { STALE_MS } from "../src/core/types";
 
 // --- harness -----------------------------------------------------------
 
@@ -69,6 +78,10 @@ function makeHarness(dir: string, id = "t1") {
   } as unknown as ExtensionAPI;
 
   const store = createThreadStore(stubPi);
+  // No internal `await` in LocalFsAdapter.configure — this synchronously
+  // sets its root before the call returns, same reasoning as writeFile()
+  // below, so the harness doesn't need to become async just for this.
+  void store.adapter.configure(dir);
   store.threadId = id;
   store.threadsRootDir = join(dir, ".thread", "threads");
   store.threadDir = join(store.threadsRootDir, id);
@@ -77,7 +90,11 @@ function makeHarness(dir: string, id = "t1") {
   const inbox = createInbox(store, stubPi);
   registerTools(stubPi, store, inbox);
   registerCommands(stubPi, store, inbox);
-  store.writeFile(); // state.json exists from the start, matching real session_start
+  // Fire-and-forget: LocalFsAdapter's writes have no internal `await`, so the
+  // fs side effect (state.json existing, matching real session_start) has
+  // already happened synchronously by the time this call returns, even
+  // though the returned promise itself settles a microtask later.
+  void store.writeFile();
 
   const ctx = {
     ui: {
@@ -239,6 +256,7 @@ describe("tools: thread_send", () => {
   it("Blocker with no `to` defaults to the parent", async () => {
     const h = makeHarness(tmpDir);
     h.store.parent = "boss";
+    seedRemoteThread(h, "boss");
     const r = await callTool(h, "thread_send", { type: "Blocker", body: "stuck" });
     assert.strictEqual(r.details.sent[0].to, "boss");
     assert.strictEqual(h.store.lockPartner, "boss");
@@ -267,6 +285,7 @@ describe("tools: thread_send", () => {
 
   it("wait=true no-ops for a locking type", async () => {
     const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
     const r = await callTool(h, "thread_send", {
       to: "alice",
       type: "Question",
@@ -287,6 +306,54 @@ describe("tools: thread_send", () => {
     });
     assert.strictEqual(h.store.barriers.length, 0);
     assert.match(r.content[0].text, /wait=true ignored.*no reply protocol/);
+  });
+
+  it("a Question to a never-seen id is refused instead of locking forever", async () => {
+    const h = makeHarness(tmpDir);
+    const r = await callTool(h, "thread_send", { to: "alcie", type: "Question", body: "?" });
+    assert.strictEqual(r.details.ok, false);
+    assert.match(r.content[0].text, /No thread "alcie" has ever run/);
+    assert.strictEqual(h.store.lockEventId, null);
+    assert.strictEqual(h.store.state, "idle");
+    assert.strictEqual(h.store.obligations.length, 0);
+    assert.strictEqual(inboxFileCount(h, "alcie"), 0);
+  });
+
+  it("a Brief to a never-seen id queues durably but carries a typo warning", async () => {
+    const h = makeHarness(tmpDir);
+    const r = await callTool(h, "thread_send", {
+      to: "future-worker",
+      type: "Brief",
+      body: "task",
+    });
+    assert.strictEqual(r.details.ok, true);
+    assert.match(r.content[0].text, /never been seen/);
+    assert.strictEqual(inboxFileCount(h, "future-worker"), 1);
+  });
+
+  it("a Brief to a known thread carries no typo warning", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    const r = await callTool(h, "thread_send", { to: "alice", type: "Brief", body: "task" });
+    assert.doesNotMatch(r.content[0].text, /never been seen/);
+  });
+});
+
+describe("inbox: requestId minting", () => {
+  it("two sends of the same type in the same millisecond get distinct requestIds", async () => {
+    const h = makeHarness(tmpDir);
+    const a = await h.inbox.sendCrossThread("alice", "Note", "one");
+    const b = await h.inbox.sendCrossThread("alice", "Note", "two");
+    assert.notStrictEqual(a.requestId, b.requestId);
+  });
+
+  it("a fan-out send mints a distinct requestId per target", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    seedRemoteThread(h, "bob");
+    const r = await callTool(h, "thread_send", { to: "*", type: "Update", body: "standup" });
+    const ids = r.details.sent.map((s: { requestId: string }) => s.requestId);
+    assert.strictEqual(new Set(ids).size, ids.length);
   });
 });
 
@@ -322,6 +389,7 @@ describe("tools: thread_await", () => {
 describe("tools: thread_sync_request / thread_sync_close", () => {
   it("acquires the lock when unlocked", async () => {
     const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
     const r = await callTool(h, "thread_sync_request", { partner: "alice" });
     assert.strictEqual(r.details.ok, true);
     assert.strictEqual(h.store.lockPartner, "alice");
@@ -332,6 +400,7 @@ describe("tools: thread_sync_request / thread_sync_close", () => {
 
   it("returns locked when already in sync with someone else", async () => {
     const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
     await callTool(h, "thread_sync_request", { partner: "alice" });
     const r = await callTool(h, "thread_sync_request", { partner: "bob" });
     assert.strictEqual(r.details.locked, true);
@@ -345,8 +414,18 @@ describe("tools: thread_sync_request / thread_sync_close", () => {
     assert.strictEqual(h.store.lockEventId, null);
   });
 
+  it("rejects syncing with a never-seen partner and leaves no lock", async () => {
+    const h = makeHarness(tmpDir);
+    const r = await callTool(h, "thread_sync_request", { partner: "gohst" });
+    assert.strictEqual(r.details.ok, false);
+    assert.match(r.content[0].text, /No thread "gohst" has ever run/);
+    assert.strictEqual(h.store.lockEventId, null);
+    assert.strictEqual(inboxFileCount(h, "gohst"), 0);
+  });
+
   it("close releases the lock, fires local subscribers, and notifies the partner", async () => {
     const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
     await callTool(h, "thread_sync_request", { partner: "alice" });
     const eventId = h.store.lockEventId!;
     await callTool(h, "thread_subscribe", {
@@ -418,6 +497,17 @@ describe("tools: thread_status", () => {
     const r = await callTool(h, "thread_status", {});
     assert.match(r.content[0].text, /Brief to alice #brief\.t1\.1/);
     assert.match(r.content[0].text, /barrier\.t1\.1 \(all\) pending: brief\.t1\.1/);
+  });
+
+  it("itemizes scheduled wakes in the text output", async () => {
+    const h = makeHarness(tmpDir);
+    h.store.schedules.push({
+      id: "wake.t1.1",
+      fireAt: new Date().toISOString(),
+      reason: "check in",
+    });
+    const r = await callTool(h, "thread_status", {});
+    assert.match(r.content[0].text, /wake\.t1\.1 at .* "check in"/);
   });
 
   it("shows 'none' for empty obligations and barriers", async () => {
@@ -530,7 +620,7 @@ describe("tools: thread_subscribe / thread_emit", () => {
 });
 
 describe("inbox: deliver", () => {
-  it("a Result that resolves a barrier sends exactly one message", () => {
+  it("a Result that resolves a barrier sends exactly one message", async () => {
     const h = makeHarness(tmpDir);
     h.store.obligations.push({
       requestId: "brief.t1.1",
@@ -546,7 +636,7 @@ describe("inbox: deliver", () => {
       createdAt: new Date().toISOString(),
     });
 
-    h.inbox.deliver(
+    await h.inbox.deliver(
       {
         from: "alice",
         to: "t1",
@@ -566,7 +656,7 @@ describe("inbox: deliver", () => {
     assert.strictEqual(h.store.obligations.length, 0);
   });
 
-  it("an Answer clears only the matching obligation", () => {
+  it("an Answer clears only the matching obligation", async () => {
     const h = makeHarness(tmpDir);
     h.store.obligations.push(
       {
@@ -584,7 +674,7 @@ describe("inbox: deliver", () => {
         sentAt: new Date().toISOString(),
       },
     );
-    h.inbox.deliver(
+    await h.inbox.deliver(
       {
         from: "alice",
         to: "t1",
@@ -600,13 +690,13 @@ describe("inbox: deliver", () => {
     assert.strictEqual(h.store.obligations[0].requestId, "q.2");
   });
 
-  it("clears the lock only when the incoming requestId matches lockEventId", () => {
+  it("clears the lock only when the incoming requestId matches lockEventId", async () => {
     const h = makeHarness(tmpDir);
     h.store.lockEventId = "q.1";
     h.store.lockPartner = "alice";
     h.store.lockType = "reply";
     h.store.state = "listening";
-    h.inbox.deliver(
+    await h.inbox.deliver(
       {
         from: "bob",
         to: "t1",
@@ -622,9 +712,9 @@ describe("inbox: deliver", () => {
     assert.strictEqual(h.store.state, "listening");
   });
 
-  it("Sync is accepted and locks this thread when unlocked", () => {
+  it("Sync is accepted and locks this thread when unlocked", async () => {
     const h = makeHarness(tmpDir);
-    h.inbox.deliver(
+    await h.inbox.deliver(
       {
         from: "alice",
         to: "t1",
@@ -642,12 +732,12 @@ describe("inbox: deliver", () => {
     assert.strictEqual(h.store.state, "in-sync");
   });
 
-  it("Sync auto-rejects (sends an Answer back) when already locked", () => {
+  it("Sync auto-rejects (sends an Answer back) when already locked", async () => {
     const h = makeHarness(tmpDir);
     h.store.lockEventId = "sync.bob.1";
     h.store.lockPartner = "bob";
     h.store.lockType = "sync";
-    h.inbox.deliver(
+    await h.inbox.deliver(
       {
         from: "alice",
         to: "t1",
@@ -665,7 +755,7 @@ describe("inbox: deliver", () => {
     assert.strictEqual(reply.requestId, "sync.alice.2");
   });
 
-  it('"any" mode resolves on the first reply, ignoring the rest', () => {
+  it('"any" mode resolves on the first reply, ignoring the rest', async () => {
     const h = makeHarness(tmpDir);
     h.store.barriers.push({
       id: "b.1",
@@ -673,7 +763,7 @@ describe("inbox: deliver", () => {
       mode: "any",
       createdAt: new Date().toISOString(),
     });
-    h.inbox.deliver(
+    await h.inbox.deliver(
       {
         from: "alice",
         to: "t1",
@@ -689,7 +779,7 @@ describe("inbox: deliver", () => {
     assert.match(h.calls[0].content, /barrier "b\.1" resolved/);
   });
 
-  it('"all" mode waits for every pending id before resolving', () => {
+  it('"all" mode waits for every pending id before resolving', async () => {
     const h = makeHarness(tmpDir);
     h.store.barriers.push({
       id: "b.1",
@@ -697,7 +787,7 @@ describe("inbox: deliver", () => {
       mode: "all",
       createdAt: new Date().toISOString(),
     });
-    h.inbox.deliver(
+    await h.inbox.deliver(
       {
         from: "alice",
         to: "t1",
@@ -714,13 +804,13 @@ describe("inbox: deliver", () => {
     assert.doesNotMatch(h.calls[0].content, /barrier/);
   });
 
-  it("multiple barriers resolved by one requestId fold into one message", () => {
+  it("multiple barriers resolved by one requestId fold into one message", async () => {
     const h = makeHarness(tmpDir);
     h.store.barriers.push(
       { id: "b.1", pending: ["a.1"], mode: "all", createdAt: new Date().toISOString() },
       { id: "b.2", pending: ["a.1", "a.2"], mode: "any", createdAt: new Date().toISOString() },
     );
-    h.inbox.deliver(
+    await h.inbox.deliver(
       {
         from: "alice",
         to: "t1",
@@ -738,17 +828,89 @@ describe("inbox: deliver", () => {
   });
 });
 
+describe("inbox: owed replies (recipient-side durability)", () => {
+  function envelope(type: "Brief" | "Question" | "Blocker" | "Note", requestId: string) {
+    return {
+      from: "alice",
+      to: "t1",
+      type,
+      body: "please do the thing",
+      requestId,
+      delivery: "steer" as const,
+      sentAt: new Date().toISOString(),
+    };
+  }
+
+  it("delivering a Brief records a durable owed reply with the requestId to echo", async () => {
+    const h = makeHarness(tmpDir);
+    await h.inbox.deliver(envelope("Brief", "brief.alice.1"), h.ctx);
+    assert.deepStrictEqual(
+      h.store.owed.map(o => ({ requestId: o.requestId, type: o.type, from: o.from })),
+      [{ requestId: "brief.alice.1", type: "Brief", from: "alice" }],
+    );
+    // Durable, not just in memory: the record must survive this process.
+    const onDisk: StateFile = JSON.parse(
+      readFileSync(join(h.store.threadDir, "state.json"), "utf8"),
+    );
+    assert.strictEqual(onDisk.owed[0].requestId, "brief.alice.1");
+  });
+
+  it("Note does not record an owed reply (no reply protocol)", async () => {
+    const h = makeHarness(tmpDir);
+    await h.inbox.deliver(envelope("Note", "note.alice.1"), h.ctx);
+    assert.strictEqual(h.store.owed.length, 0);
+  });
+
+  it("redelivering the same requestId does not double-record", async () => {
+    const h = makeHarness(tmpDir);
+    await h.inbox.deliver(envelope("Question", "q.alice.1"), h.ctx);
+    await h.inbox.deliver(envelope("Question", "q.alice.1"), h.ctx);
+    assert.strictEqual(h.store.owed.length, 1);
+  });
+
+  it("sending the matching Result settles the owed reply, on disk too", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    await h.inbox.deliver(envelope("Brief", "brief.alice.1"), h.ctx);
+    await h.inbox.sendCrossThread("alice", "Result", "done", { requestId: "brief.alice.1" });
+    assert.strictEqual(h.store.owed.length, 0);
+    const onDisk: StateFile = JSON.parse(
+      readFileSync(join(h.store.threadDir, "state.json"), "utf8"),
+    );
+    assert.strictEqual(onDisk.owed.length, 0);
+  });
+
+  it("an Answer with a different requestId leaves the owed reply intact", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    await h.inbox.deliver(envelope("Blocker", "blocker.alice.1"), h.ctx);
+    await h.inbox.sendCrossThread("alice", "Answer", "about something else", {
+      requestId: "other.id",
+    });
+    assert.strictEqual(h.store.owed.length, 1);
+    assert.strictEqual(h.store.owed[0].requestId, "blocker.alice.1");
+  });
+
+  it("thread_status itemizes owed replies with the requestId to echo", async () => {
+    const h = makeHarness(tmpDir);
+    await h.inbox.deliver(envelope("Brief", "brief.alice.1"), h.ctx);
+    const res = await callTool(h, "thread_status");
+    assert.match(res.content[0].text, /Owed replies:/);
+    assert.match(res.content[0].text, /you owe a Result to alice .* #brief\.alice\.1/);
+  });
+});
+
 describe("inbox: drainInbox", () => {
-  it("skips malformed JSON without crashing or redelivering it", () => {
+  it("skips malformed JSON without crashing or redelivering it", async () => {
     const h = makeHarness(tmpDir);
     const inboxDir = join(h.store.threadDir, "inbox");
     writeFileSync(join(inboxDir, "1-bad.json"), "{not valid json");
-    assert.doesNotThrow(() => h.inbox.drainInbox(h.ctx));
+    await assert.doesNotReject(() => h.inbox.drainInbox(h.ctx));
     assert.strictEqual(h.calls.length, 0);
     assert.ok(existsSync(join(inboxDir, "1-bad.json"))); // left in place, not moved
   });
 
-  it("processes files in FIFO filename order", () => {
+  it("processes files in FIFO filename order", async () => {
     const h = makeHarness(tmpDir);
     const inboxDir = join(h.store.threadDir, "inbox");
     const msg = (body: string, requestId: string) =>
@@ -763,7 +925,7 @@ describe("inbox: drainInbox", () => {
       });
     writeFileSync(join(inboxDir, "1-first.json"), msg("first", "n.1"));
     writeFileSync(join(inboxDir, "2-second.json"), msg("second", "n.2"));
-    h.inbox.drainInbox(h.ctx);
+    await h.inbox.drainInbox(h.ctx);
     assert.strictEqual(h.calls.length, 2);
     assert.match(h.calls[0].content, /first/);
     assert.match(h.calls[1].content, /second/);
@@ -771,7 +933,7 @@ describe("inbox: drainInbox", () => {
 });
 
 describe("inbox: checkDeadlines", () => {
-  it("an overdue obligation nudges once and not twice", () => {
+  it("an overdue obligation nudges once and not twice", async () => {
     const h = makeHarness(tmpDir);
     h.store.obligations.push({
       requestId: "brief.t1.1",
@@ -781,15 +943,15 @@ describe("inbox: checkDeadlines", () => {
       sentAt: new Date().toISOString(),
       deadline: new Date(Date.now() - 1000).toISOString(),
     });
-    h.inbox.checkDeadlines();
+    await h.inbox.checkDeadlines();
     assert.strictEqual(h.calls.length, 1);
     assert.match(h.calls[0].content, /obligation overdue #brief\.t1\.1/);
     assert.strictEqual(h.store.obligations[0].nudged, true);
-    h.inbox.checkDeadlines();
+    await h.inbox.checkDeadlines();
     assert.strictEqual(h.calls.length, 1);
   });
 
-  it("an overdue barrier nudges once and not twice", () => {
+  it("an overdue barrier nudges once and not twice", async () => {
     const h = makeHarness(tmpDir);
     h.store.barriers.push({
       id: "barrier.t1.1",
@@ -798,15 +960,15 @@ describe("inbox: checkDeadlines", () => {
       createdAt: new Date().toISOString(),
       deadline: new Date(Date.now() - 1000).toISOString(),
     });
-    h.inbox.checkDeadlines();
+    await h.inbox.checkDeadlines();
     assert.strictEqual(h.calls.length, 1);
     assert.match(h.calls[0].content, /barrier overdue "barrier\.t1\.1"/);
     assert.strictEqual(h.store.barriers[0].nudged, true);
-    h.inbox.checkDeadlines();
+    await h.inbox.checkDeadlines();
     assert.strictEqual(h.calls.length, 1);
   });
 
-  it("no nudge before the deadline passes", () => {
+  it("no nudge before the deadline passes", async () => {
     const h = makeHarness(tmpDir);
     h.store.obligations.push({
       requestId: "brief.t1.1",
@@ -816,8 +978,84 @@ describe("inbox: checkDeadlines", () => {
       sentAt: new Date().toISOString(),
       deadline: new Date(Date.now() + 60_000).toISOString(),
     });
-    h.inbox.checkDeadlines();
+    await h.inbox.checkDeadlines();
     assert.strictEqual(h.calls.length, 0);
+  });
+});
+
+describe("inbox: checkSchedules", () => {
+  it("an overdue scheduled wake fires once and is pruned from state", async () => {
+    const h = makeHarness(tmpDir);
+    h.store.schedules.push({
+      id: "wake.t1.1",
+      fireAt: new Date(Date.now() - 1000).toISOString(),
+      reason: "check in on the auth task",
+    });
+    await h.inbox.checkSchedules();
+    assert.strictEqual(h.calls.length, 1);
+    assert.match(h.calls[0].content, /scheduled wake #wake\.t1\.1.*check in on the auth task/);
+    assert.strictEqual(h.store.schedules.length, 0);
+    const persisted = await h.store.adapter.loadState("t1");
+    assert.strictEqual(persisted?.schedules.length, 0);
+    await h.inbox.checkSchedules();
+    assert.strictEqual(h.calls.length, 1);
+  });
+
+  it("a wake already fired elsewhere (nudged) is pruned without re-firing", async () => {
+    const h = makeHarness(tmpDir);
+    h.store.schedules.push({
+      id: "wake.t1.1",
+      fireAt: new Date(Date.now() - 1000).toISOString(),
+      reason: "already delivered by the restate runner",
+      nudged: true,
+    });
+    await h.inbox.checkSchedules();
+    assert.strictEqual(h.calls.length, 0);
+    assert.strictEqual(h.store.schedules.length, 0);
+  });
+
+  it("no nudge before fireAt passes", async () => {
+    const h = makeHarness(tmpDir);
+    h.store.schedules.push({
+      id: "wake.t1.1",
+      fireAt: new Date(Date.now() + 60_000).toISOString(),
+      reason: "too early",
+    });
+    await h.inbox.checkSchedules();
+    assert.strictEqual(h.calls.length, 0);
+  });
+});
+
+describe("tools: thread_schedule / thread_schedule_cancel", () => {
+  it("arms a wake fireInSeconds from now and persists it via the adapter", async () => {
+    const h = makeHarness(tmpDir);
+    const before = Date.now();
+    const r = await callTool(h, "thread_schedule", { fireInSeconds: 60, reason: "ping me" });
+    assert.strictEqual(r.details.ok, true);
+    assert.strictEqual(h.store.schedules.length, 1);
+    const wake = h.store.schedules[0];
+    assert.strictEqual(wake.reason, "ping me");
+    assert.ok(new Date(wake.fireAt).getTime() >= before + 59_000);
+    const persisted = await h.store.adapter.loadState("t1");
+    assert.strictEqual(persisted?.schedules.length, 1);
+    assert.strictEqual(persisted?.schedules[0].id, wake.id);
+  });
+
+  it("cancel removes a scheduled wake by id, from memory and the adapter", async () => {
+    const h = makeHarness(tmpDir);
+    const r1 = await callTool(h, "thread_schedule", { fireInSeconds: 60, reason: "ping me" });
+    const id = r1.details.wake.id;
+    const r2 = await callTool(h, "thread_schedule_cancel", { id });
+    assert.strictEqual(r2.details.ok, true);
+    assert.strictEqual(h.store.schedules.length, 0);
+    const persisted = await h.store.adapter.loadState("t1");
+    assert.strictEqual(persisted?.schedules.length, 0);
+  });
+
+  it("cancel errors on an unknown id", async () => {
+    const h = makeHarness(tmpDir);
+    const r = await callTool(h, "thread_schedule_cancel", { id: "ghost" });
+    assert.strictEqual(r.details.ok, false);
   });
 });
 
@@ -833,25 +1071,21 @@ describe("state: journal gating", () => {
   });
 
   it("isDuplicateOfLastEntry matches when Working on/Done are identical to the last entry", () => {
-    const h = makeHarness(tmpDir);
-    const journalPath = join(h.store.threadDir, "journal.md");
-    writeFileSync(journalPath, journalEntry(nowStamp(), "task A", "same done line"));
+    const content = journalEntry(nowStamp(), "task A", "same done line");
     const dup =
       "Working on: task A\nDone: same done line\nDoing: something new\nNext: ship\nBlockers: none";
-    assert.strictEqual(isDuplicateOfLastEntry(journalPath, dup), true);
+    assert.strictEqual(isDuplicateOfLastEntry(content, dup), true);
   });
 
   it("isDuplicateOfLastEntry does not match genuinely different content", () => {
-    const h = makeHarness(tmpDir);
-    const journalPath = join(h.store.threadDir, "journal.md");
-    writeFileSync(journalPath, journalEntry(nowStamp(), "task A", "wrote the middleware"));
+    const content = journalEntry(nowStamp(), "task A", "wrote the middleware");
     const fresh =
       "Working on: task A\nDone: fixed the bug\nDoing: tests\nNext: ship\nBlockers: none";
-    assert.strictEqual(isDuplicateOfLastEntry(journalPath, fresh), false);
+    assert.strictEqual(isDuplicateOfLastEntry(content, fresh), false);
   });
 
-  it("isDuplicateOfLastEntry returns false when no journal file exists yet", () => {
-    assert.strictEqual(isDuplicateOfLastEntry(join(tmpDir, "nope.md"), "Working on: x"), false);
+  it("isDuplicateOfLastEntry returns false when no journal content exists yet", () => {
+    assert.strictEqual(isDuplicateOfLastEntry(undefined, "Working on: x"), false);
   });
 });
 
@@ -862,17 +1096,34 @@ describe("lifecycle: journalSignature / shouldJournal", () => {
     assert.strictEqual(shouldJournal(h.store, false), false);
   });
 
-  it("a tool call always journals even if the signature is unchanged", () => {
+  it("a tool-using turn inside the rate-limit window defers to a run-end wrap-up", () => {
     const h = makeHarness(tmpDir);
-    shouldJournal(h.store, false);
-    assert.strictEqual(shouldJournal(h.store, true), true);
+    shouldJournal(h.store, false); // baseline write — lastJournalAt is now
+    assert.strictEqual(shouldJournal(h.store, true, "turn"), false);
+    assert.strictEqual(h.store.journalDebt, true);
+    assert.strictEqual(shouldJournal(h.store, true, "run-end"), true); // the owed wrap-up
+    assert.strictEqual(shouldJournal(h.store, true, "run-end"), false); // exactly once
   });
 
-  it("a changed signature journals even without a tool call", () => {
+  it("a tool-using turn past the rate-limit window journals immediately", () => {
+    const h = makeHarness(tmpDir);
+    shouldJournal(h.store, false);
+    h.store.lastJournalAt = Date.now() - JOURNAL_MIN_INTERVAL_MS - 1;
+    assert.strictEqual(shouldJournal(h.store, true, "turn"), true);
+  });
+
+  it("a changed signature journals even without a tool call, ignoring the rate limit", () => {
     const h = makeHarness(tmpDir);
     shouldJournal(h.store, false);
     h.store.state = "listening";
     assert.strictEqual(shouldJournal(h.store, false), true);
+  });
+
+  it('phase "done" journals a run that used tools, exactly once', () => {
+    const h = makeHarness(tmpDir);
+    shouldJournal(h.store, false);
+    assert.strictEqual(shouldJournal(h.store, true, "done"), true);
+    assert.strictEqual(shouldJournal(h.store, false, "done"), false);
   });
 
   it("journalSignature changes when an obligation is added", () => {
@@ -903,6 +1154,13 @@ describe("commands: slash commands", () => {
     assert.match(h.notifications[0].text, /Barriers: 1/);
   });
 
+  it("/thread-status notification includes the schedules count", async () => {
+    const h = makeHarness(tmpDir);
+    h.store.schedules.push({ id: "w.1", fireAt: new Date().toISOString(), reason: "check in" });
+    await callCommand(h, "/thread-status", "");
+    assert.match(h.notifications[0].text, /Schedules: 1/);
+  });
+
   it("/thread-suspend then /thread-resume round-trips on-hold state", async () => {
     const h = makeHarness(tmpDir);
     await callCommand(h, "/thread-suspend", "waiting on review");
@@ -930,5 +1188,317 @@ describe("commands: slash commands", () => {
     await callTool(h, "thread_subscribe", { eventId: "ready", message: "go", delivery: "steer" });
     await callCommand(h, "/thread-emit", "ready");
     assert.match(h.notifications[h.notifications.length - 1].text, /1 subscriber\(s\) notified/);
+  });
+});
+
+// --- adapter layer --------------------------------------------------------
+
+function baseState(id: string, overrides: Partial<StateFile> = {}): StateFile {
+  const now = new Date().toISOString();
+  return {
+    id,
+    pid: 1,
+    cwd: "/virtual",
+    parent: null,
+    role: null,
+    sessionFile: null,
+    state: "open",
+    status: "running",
+    lockEventId: null,
+    lockPartner: null,
+    lockType: null,
+    holdReason: null,
+    subscriptions: [],
+    obligations: [],
+    owed: [],
+    barriers: [],
+    schedules: [],
+    startedAt: now,
+    lastSeen: now,
+    updatedAt: now,
+    ...overrides,
+  };
+}
+
+describe("adapter: LocalFsAdapter", () => {
+  it("saveState/loadState round-trips through state.json", async () => {
+    const adapter = createLocalFsAdapter();
+    await adapter.configure(tmpDir);
+    await adapter.saveState("a", baseState("a"));
+    const loaded = await adapter.loadState("a");
+    assert.strictEqual(loaded?.id, "a");
+    assert.ok(existsSync(join(tmpDir, ".thread", "threads", "a", "state.json")));
+  });
+
+  it("loadState returns undefined for an unknown thread", async () => {
+    const adapter = createLocalFsAdapter();
+    await adapter.configure(tmpDir);
+    assert.strictEqual(await adapter.loadState("ghost"), undefined);
+  });
+
+  it("threadExists reflects whether state.json is present", async () => {
+    const adapter = createLocalFsAdapter();
+    await adapter.configure(tmpDir);
+    assert.strictEqual(await adapter.threadExists("a"), false);
+    await adapter.saveState("a", baseState("a"));
+    assert.strictEqual(await adapter.threadExists("a"), true);
+  });
+
+  it("enqueueMessage + drainInbox delivers everything enqueued exactly once, then clears the pending set", async () => {
+    const adapter = createLocalFsAdapter();
+    await adapter.configure(tmpDir);
+    const msg = (body: string): InboxMessage => ({
+      from: "alice",
+      to: "bob",
+      type: "Note",
+      body,
+      requestId: `n.${body}`,
+      delivery: "steer",
+      sentAt: new Date().toISOString(),
+    });
+    await adapter.enqueueMessage("bob", msg("first"));
+    await adapter.enqueueMessage("bob", msg("second"));
+    const claimed = await adapter.drainInbox("bob");
+    // Filenames tie on Date.now() when enqueued this close together, so
+    // exact order isn't guaranteed by this scheme (real FIFO-under-normal-
+    // timing is covered by "processes files in FIFO filename order" below,
+    // using distinguishable filenames) — what must hold is both delivered
+    // exactly once, none lost or duplicated.
+    assert.deepStrictEqual(claimed.map(m => m.body).sort(), ["first", "second"]);
+    assert.deepStrictEqual(await adapter.drainInbox("bob"), []);
+  });
+
+  it("drainInbox leaves malformed JSON in place and never returns it", async () => {
+    const adapter = createLocalFsAdapter();
+    await adapter.configure(tmpDir);
+    const dir = join(tmpDir, ".thread", "threads", "bob", "inbox");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "1-bad.json"), "{not valid json");
+    const claimed = await adapter.drainInbox("bob");
+    assert.strictEqual(claimed.length, 0);
+    assert.ok(existsSync(join(dir, "1-bad.json")));
+  });
+
+  it("listThreads reports a thread stale past STALE_MS as stopped", async () => {
+    const adapter = createLocalFsAdapter();
+    await adapter.configure(tmpDir);
+    await adapter.saveState(
+      "ghost",
+      baseState("ghost", { lastSeen: new Date(Date.now() - STALE_MS - 1000).toISOString() }),
+    );
+    const threads = await adapter.listThreads();
+    assert.strictEqual(threads[0]?.status, "stopped");
+  });
+
+  it("scheduleWake persists a wake and cancelWake removes it", async () => {
+    const adapter = createLocalFsAdapter();
+    await adapter.configure(tmpDir);
+    await adapter.saveState("a", baseState("a"));
+    await adapter.scheduleWake("a", {
+      id: "w.1",
+      fireAt: new Date().toISOString(),
+      reason: "check in",
+    });
+    let loaded = await adapter.loadState("a");
+    assert.strictEqual(loaded?.schedules.length, 1);
+    await adapter.cancelWake("a", "w.1");
+    loaded = await adapter.loadState("a");
+    assert.strictEqual(loaded?.schedules.length, 0);
+  });
+
+  it("watchInbox doesn't throw for a thread that has never received a message (no inbox/ dir yet)", async () => {
+    const adapter = createLocalFsAdapter();
+    await adapter.configure(tmpDir);
+    await adapter.saveState("fresh", baseState("fresh"));
+    assert.ok(!existsSync(join(tmpDir, ".thread", "threads", "fresh", "inbox")));
+    let fired = false;
+    const dispose = adapter.watchInbox("fresh", () => {
+      fired = true;
+    });
+    assert.ok(existsSync(join(tmpDir, ".thread", "threads", "fresh", "inbox")));
+    // A message arriving after the (now-live) watch should still be observed.
+    await adapter.enqueueMessage("fresh", {
+      from: "other",
+      to: "fresh",
+      type: "Note",
+      body: "hi",
+      requestId: "n.1",
+      delivery: "steer",
+      sentAt: new Date().toISOString(),
+    });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.strictEqual(fired, true);
+    dispose();
+  });
+});
+
+/** Minimal in-memory StorageAdapter — proves state.ts/inbox.ts never reach
+ *  into fs directly, only through store.adapter, by running the same
+ *  cross-thread send/deliver flow against a backend with no filesystem at
+ *  all (the shape any future non-local adapter, e.g. Restate, must fit). */
+function createFakeAdapter(): StorageAdapter {
+  const states = new Map<string, StateFile>();
+  const inboxes = new Map<string, InboxMessage[]>();
+  const journals = new Map<string, string>();
+
+  return {
+    async configure() {},
+    async loadState(id) {
+      return states.get(id);
+    },
+    async saveState(id, state) {
+      states.set(id, structuredClone(state));
+    },
+    async appendJournal(id, entry) {
+      journals.set(id, (journals.get(id) ?? "") + entry);
+    },
+    async readJournal(id) {
+      return journals.get(id)?.trim() || undefined;
+    },
+    async listThreads(): Promise<ThreadSummary[]> {
+      return [...states.values()].map(s => ({
+        id: s.id,
+        state: s.state,
+        status: s.status,
+        parent: s.parent,
+        role: s.role ?? null,
+        lastSeen: s.lastSeen,
+      }));
+    },
+    async threadExists(id) {
+      return states.has(id);
+    },
+    async enqueueMessage(targetId, message) {
+      const arr = inboxes.get(targetId) ?? [];
+      arr.push(message);
+      inboxes.set(targetId, arr);
+    },
+    async drainInbox(id) {
+      const arr = inboxes.get(id) ?? [];
+      inboxes.set(id, []);
+      return arr;
+    },
+    watchInbox() {
+      return () => {};
+    },
+    async scheduleWake(id, wake) {
+      const s = states.get(id);
+      if (!s) return;
+      s.schedules = [...s.schedules, wake];
+    },
+    async cancelWake(id, wakeId) {
+      const s = states.get(id);
+      if (!s) return;
+      s.schedules = s.schedules.filter(w => w.id !== wakeId);
+    },
+  };
+}
+
+describe("adapter seam: core logic against a fake in-memory adapter", () => {
+  it("a Note sent from one thread is drained and delivered on the other, with no fs involved", async () => {
+    const fake = createFakeAdapter();
+    const calls: Call[] = [];
+    const stubPi = {
+      sendUserMessage: (content: string, options?: { deliverAs?: string }) => {
+        calls.push({ content, options });
+      },
+      registerTool: () => {},
+      registerCommand: () => {},
+    } as unknown as ExtensionAPI;
+    const ctx = { ui: { setStatus: () => {} } } as unknown as ExtensionCommandContext;
+
+    const sender = createThreadStore(stubPi, fake);
+    sender.threadId = "sender";
+    sender.threadsRootDir = "/virtual";
+    sender.threadDir = "/virtual/sender";
+    await sender.writeFile();
+    const senderInbox = createInbox(sender, stubPi);
+
+    const receiver = createThreadStore(stubPi, fake);
+    receiver.threadId = "receiver";
+    receiver.threadsRootDir = "/virtual";
+    receiver.threadDir = "/virtual/receiver";
+    await receiver.writeFile();
+    const receiverInbox = createInbox(receiver, stubPi);
+
+    const { delivered } = await senderInbox.sendCrossThread(
+      "receiver",
+      "Note",
+      "hi from fake adapter",
+    );
+    assert.strictEqual(delivered, "live"); // receiver's state.json already exists and is fresh
+
+    await receiverInbox.drainInbox(ctx);
+    assert.strictEqual(calls.length, 1);
+    assert.match(calls[0].content, /hi from fake adapter/);
+  });
+
+  it("transition persists through adapter.saveState, not raw fs", async () => {
+    const fake = createFakeAdapter();
+    const stubPi = {
+      sendUserMessage: () => {},
+      registerTool: () => {},
+      registerCommand: () => {},
+    } as unknown as ExtensionAPI;
+    const store = createThreadStore(stubPi, fake);
+    store.threadId = "solo";
+    store.threadDir = "/virtual/solo";
+    await store.transition("open");
+    const loaded = await fake.loadState("solo");
+    assert.strictEqual(loaded?.state, "open");
+  });
+});
+
+describe("restate: buildWakeLaunch", () => {
+  const wake = { id: "wake.t1.1", fireAt: new Date().toISOString(), reason: "resume the report" };
+
+  it("spawns pi against the restate backend, in the thread's own cwd", () => {
+    const l = buildWakeLaunch("t1", wake, "/work/space", {});
+    assert.strictEqual(l.cmd, "pi");
+    assert.strictEqual(l.cwd, "/work/space");
+    const args = l.args.join(" ");
+    assert.match(args, /--thread-id t1/);
+    assert.match(args, /--thread-storage restate/);
+    assert.match(args, /--thread-storage-url http:\/\/localhost:8080/);
+    assert.match(args, /--print \[scheduled wake #wake\.t1\.1\]: resume the report/);
+    assert.doesNotMatch(args, /--extension/); // only when PI_THREAD_EXTENSION is set
+  });
+
+  it("honors RESTATE_INGRESS_URL and PI_THREAD_EXTENSION from the service environment", () => {
+    const l = buildWakeLaunch("t1", wake, "/w", {
+      RESTATE_INGRESS_URL: "http://restate.internal:8080",
+      PI_THREAD_EXTENSION: "/opt/pi-threading/src/index.ts",
+    });
+    const args = l.args.join(" ");
+    assert.match(args, /--thread-storage-url http:\/\/restate\.internal:8080/);
+    assert.match(args, /--extension \/opt\/pi-threading\/src\/index\.ts/);
+  });
+});
+
+describe("state: watcher idempotency", () => {
+  it("startWatcher twice keeps exactly one live watch; stopWatcher is idempotent", () => {
+    let active = 0;
+    const counting: StorageAdapter = {
+      ...createFakeAdapter(),
+      watchInbox() {
+        active++;
+        return () => active--;
+      },
+    };
+    const stubPi = {
+      sendUserMessage: () => {},
+      registerTool: () => {},
+      registerCommand: () => {},
+    } as unknown as ExtensionAPI;
+    const store = createThreadStore(stubPi, counting);
+    store.threadId = "w1";
+    const ctx = { ui: { setStatus: () => {} } } as unknown as ExtensionContext;
+    store.startWatcher(() => {}, ctx);
+    store.startWatcher(() => {}, ctx); // e.g. a second session_start
+    assert.strictEqual(active, 1);
+    store.stopWatcher();
+    assert.strictEqual(active, 0);
+    store.stopWatcher();
+    assert.strictEqual(active, 0);
   });
 });

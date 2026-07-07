@@ -340,6 +340,7 @@ describe("sync rendezvous", () => {
     "request lands as a lock on the partner across two real processes; close unwinds both",
     { timeout: TIMEOUT * 4 },
     () => {
+      seedThread(tmpDir, "thread-b"); // sync to a never-seen id is now refused
       const requestPrompt = `Call thread_sync_request with partner="thread-b". Then say done.`;
       runPi(requestPrompt, tmpDir, { threadId: "thread-a" });
 

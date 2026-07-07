@@ -4,6 +4,7 @@ import { createInbox } from "./inbox";
 import { registerLifecycle } from "./lifecycle";
 import { registerTools } from "./tools";
 import { registerCommands } from "./commands";
+import { createConfiguredAdapter } from "./adapter/registry";
 
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("thread-id", {
@@ -23,8 +24,17 @@ export default function (pi: ExtensionAPI) {
     type: "string",
     description: 'Journal cadence: "turn" (default, one model call per turn), "done", or "off"',
   });
+  pi.registerFlag("thread-storage", {
+    type: "string",
+    description: 'Storage backend: "local" (default) or "restate"',
+  });
+  pi.registerFlag("thread-storage-url", {
+    type: "string",
+    description: "Backend connection URL (e.g. Restate ingress URL) — ignored by the local backend",
+  });
 
-  const store = createThreadStore(pi);
+  const adapter = createConfiguredAdapter(pi);
+  const store = createThreadStore(pi, adapter);
   const inbox = createInbox(store, pi);
 
   registerLifecycle(pi, store, inbox);

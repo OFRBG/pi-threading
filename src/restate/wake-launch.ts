@@ -1,0 +1,38 @@
+import type { ScheduledWake } from "../core/types";
+
+/** How the companion service revives a stopped thread when a durable wake
+ *  fires. Kept SDK-free and pure so it's unit-testable without a
+ *  restate-server.
+ *
+ *  The spawned `pi` must be told where its state lives: without
+ *  `--thread-storage restate` it would boot against the local-fs backend and
+ *  never see the thread it's supposed to revive. The service can't know the
+ *  ingress URL its clients used, so it comes from the service's own
+ *  environment:
+ *
+ *  - RESTATE_INGRESS_URL  — ingress the revived thread connects back to
+ *                           (default http://localhost:8080)
+ *  - PI_THREAD_EXTENSION  — path to this extension's entry point, passed as
+ *                           `--extension`; omit if pi loads it from its own
+ *                           config
+ */
+export function buildWakeLaunch(
+  threadId: string,
+  wake: ScheduledWake,
+  cwd: string,
+  env: Record<string, string | undefined> = process.env,
+): { cmd: string; args: string[]; cwd: string } {
+  const args = [
+    "--thread-id",
+    threadId,
+    "--thread-storage",
+    "restate",
+    "--thread-storage-url",
+    env.RESTATE_INGRESS_URL ?? "http://localhost:8080",
+  ];
+  if (env.PI_THREAD_EXTENSION) args.push("--extension", env.PI_THREAD_EXTENSION);
+  // Same envelope shape the live heartbeat's checkSchedules delivers, so a
+  // wake reads identically whether or not the process survived to see it.
+  args.push("--print", `[scheduled wake #${wake.id}]: ${wake.reason}`);
+  return { cmd: "pi", args, cwd };
+}

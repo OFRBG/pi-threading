@@ -1,6 +1,4 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import * as fs from "node:fs";
-import * as path from "node:path";
 import type { ThreadStore, MessageType } from "./core/types";
 import type { Inbox } from "./inbox";
 
@@ -9,13 +7,11 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
     description: "Show this thread's own state and latest journal entry",
     async handler(_args, ctx) {
       await ctx.waitForIdle();
-      const journalPath = path.join(store.threadDir, "journal.md");
-      const lines = fs.existsSync(journalPath)
-        ? fs.readFileSync(journalPath, "utf8").trim().split("\n").slice(-12).join("\n")
-        : "(no journal yet)";
+      const journal = await store.readJournal(store.threadId);
+      const lines = journal ? journal.split("\n").slice(-12).join("\n") : "(no journal yet)";
       const lockDesc = `${store.lockEventId ?? "none"}${store.lockPartner ? ` (with ${store.lockPartner})` : ""}`;
       ctx.ui.notify(
-        `Id: ${store.threadId} | State: ${store.state} | Status: ${store.status} | Lock: ${lockDesc} | Subs: ${store.subscriptions.length} | Obligations: ${store.obligations.length} | Barriers: ${store.barriers.length}\n\n${lines}`,
+        `Id: ${store.threadId} | State: ${store.state} | Status: ${store.status} | Lock: ${lockDesc} | Subs: ${store.subscriptions.length} | Obligations: ${store.obligations.length} | Owed: ${store.owed.length} | Barriers: ${store.barriers.length} | Schedules: ${store.schedules.length}\n\n${lines}`,
         "info",
       );
     },
@@ -29,7 +25,7 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
         ctx.ui.notify("Usage: /thread-emit <eventId>", "warning");
         return;
       }
-      const n = inbox.fireSubscribers(eventId);
+      const n = await inbox.fireSubscribers(eventId);
       ctx.ui.notify(`Event "${eventId}" fired. ${n} subscriber(s) notified.`, "info");
     },
   });
@@ -37,7 +33,7 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
   pi.registerCommand("/thread-list", {
     description: "List all known threads sharing this workspace",
     async handler(_args, ctx) {
-      const threads = store.listThreads();
+      const threads = await store.listThreads();
       if (!threads.length) {
         ctx.ui.notify("(no other threads found)", "info");
         return;
@@ -75,14 +71,22 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
         return;
       }
       try {
-        const targets = inbox.resolveTargets(to).filter(t => t !== store.threadId);
+        const targets = (await inbox.resolveTargets(to)).filter(t => t !== store.threadId);
         if (!targets.length) {
           ctx.ui.notify(`No matching targets for "${to}".`, "warning");
           return;
         }
         for (const t of targets) {
-          const { requestId, delivered } = inbox.sendCrossThread(t, type as MessageType, body);
-          ctx.ui.notify(`${type} sent to ${t}. requestId=${requestId} (${delivered}).`, "info");
+          const seen = await store.threadExists(t);
+          const { requestId, delivered } = await inbox.sendCrossThread(
+            t,
+            type as MessageType,
+            body,
+          );
+          ctx.ui.notify(
+            `${type} sent to ${t}. requestId=${requestId} (${delivered}).${seen ? "" : ` Warning: "${t}" has never been seen in this workspace — delivers only if a thread with that id starts.`}`,
+            seen ? "info" : "warning",
+          );
         }
       } catch (e) {
         ctx.ui.notify(e instanceof Error ? e.message : String(e), "error");
@@ -94,7 +98,7 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
     description: "Mark this thread On Hold: /thread-suspend [reason]",
     async handler(args, ctx) {
       store.holdReason = args.trim() || null;
-      store.transition("on-hold", ctx);
+      await store.transition("on-hold", ctx);
       ctx.ui.notify(
         `Thread suspended (On Hold)${store.holdReason ? `: ${store.holdReason}` : ""}. Inbox queues until resume.`,
         "info",
@@ -110,8 +114,8 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
         return;
       }
       store.holdReason = null;
-      store.transition("open", ctx);
-      inbox.drainInbox(ctx);
+      await store.transition("open", ctx);
+      await inbox.drainInbox(ctx);
       ctx.ui.notify("Thread resumed (Open). Queued inbox drained.", "info");
     },
   });

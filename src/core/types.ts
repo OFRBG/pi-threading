@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { StorageAdapter } from "../adapter/types";
 
 export type ThreadState =
   | "idle"
@@ -46,6 +47,18 @@ export interface Obligation {
   nudged?: boolean;
 }
 
+/** The receiving side of an Obligation: recorded when a Brief/Question/Blocker
+ *  is delivered, cleared when the matching Result/Answer is sent. Durable —
+ *  the envelope's requestId otherwise lives only in the session that received
+ *  it, so a revived thread would have no way to echo the right id back. */
+export interface OwedReply {
+  requestId: string;
+  type: "Brief" | "Question" | "Blocker";
+  from: string;
+  summary: string;
+  receivedAt: string;
+}
+
 /** Waiting on multiple obligations: resolves when all (or any) requestIds get a reply. */
 export interface Barrier {
   id: string;
@@ -60,6 +73,15 @@ export interface Subscription {
   eventId: string;
   message: string;
   delivery: "steer" | "follow-up";
+}
+
+/** A future wake-up this thread armed for itself. Fires exactly once, same
+ *  `nudged` guard pattern as Obligation/Barrier deadlines. */
+export interface ScheduledWake {
+  id: string;
+  fireAt: string;
+  reason: string;
+  nudged?: boolean;
 }
 
 export interface StateFile {
@@ -77,7 +99,9 @@ export interface StateFile {
   holdReason: string | null;
   subscriptions: Subscription[];
   obligations: Obligation[];
+  owed: OwedReply[];
   barriers: Barrier[];
+  schedules: ScheduledWake[];
   startedAt: string;
   lastSeen: string;
   updatedAt: string;
@@ -103,13 +127,16 @@ export interface ThreadSummary {
 }
 
 export interface ThreadStore extends ThreadData {
-  transition: (next: ThreadState, ctx?: ExtensionContext) => void;
-  writeFile: () => void;
-  init: (cwd: string, ctx: ExtensionContext) => void;
-  shutdown: (reason: string) => void;
-  listThreads: () => ThreadSummary[];
+  adapter: StorageAdapter;
+  transition: (next: ThreadState, ctx?: ExtensionContext) => Promise<void>;
+  writeFile: () => Promise<void>;
+  init: (cwd: string, ctx: ExtensionContext) => Promise<void>;
+  shutdown: (reason: string) => Promise<void>;
+  listThreads: () => Promise<ThreadSummary[]>;
+  readJournal: (threadId: string) => Promise<string | undefined>;
+  threadExists: (threadId: string) => Promise<boolean>;
   forkJournal: (sessionFile: string) => void;
-  startHeartbeat: (onTick?: () => void) => void;
+  startHeartbeat: (onTick?: () => void | Promise<void>) => void;
   stopHeartbeat: () => void;
   startWatcher: (drainInbox: (ctx: ExtensionContext) => void, ctx: ExtensionContext) => void;
   stopWatcher: () => void;
@@ -132,7 +159,9 @@ export interface ThreadData {
   holdReason: string | null;
   subscriptions: Subscription[];
   obligations: Obligation[];
+  owed: OwedReply[];
   barriers: Barrier[];
+  schedules: ScheduledWake[];
   /** In-memory only: set when this thread sends to its lock partner during the
    *  current turn; drives the "your text didn't reach your partner" nudge. */
   sentToPartnerThisTurn: boolean;
@@ -141,4 +170,12 @@ export interface ThreadData {
    *  the last journal write — lets turn_end skip forking a journal entry when
    *  a turn produced no tool call and nothing structural changed. */
   lastJournalSignature: string | null;
+  /** In-memory only: epoch ms of the last journal fork — rate-limits per-turn
+   *  journaling so a long run of quick tool turns doesn't produce one
+   *  near-duplicate entry (and one forked model call) per turn. */
+  lastJournalAt: number;
+  /** In-memory only: set when a turn's journal entry was rate-limited away —
+   *  the run owes one wrap-up entry at agent_end so the final state of the
+   *  work is never lost to the rate limit. */
+  journalDebt: boolean;
 }
