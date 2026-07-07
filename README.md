@@ -88,7 +88,8 @@ Messages arrive as `[<Type> from <sender> #<requestId>]` with an explicit reply 
 - `--thread-id <id>` — stable identity for this thread (e.g., `coordinator`, `worker-a`)
 - `--thread-parent <id>` — parent thread for Blocker escalation
 - `--thread-role <role>` — role label, targetable via `thread_send to="role:<role>"`
-- `--thread-journal <turn|done|off>` — journal cadence (default `turn`; each entry is one cheap model call, rate-limited to one entry per ~2 minutes of same-task tool turns, plus a wrap-up entry when a run ends with unjournaled work; structural changes — new obligations, locks, barriers — always journal immediately)
+- `--thread-journal <turn|done|off>` — journal cadence (default `turn`; each entry is one forked model call, rate-limited to one entry per ~2 minutes of same-task tool turns, plus a wrap-up entry when a run ends with unjournaled work; structural changes — new obligations, locks, barriers — always journal immediately)
+- `--thread-journal-model <model>` — model for the journal fork (e.g. `deepseek/deepseek-chat` to keep entries cheap). Default: the thread's own model. A pinned model must resolve on the machine the thread runs on, or journaling fails (loudly, on stderr)
 - `--thread-storage <local|restate>` — storage backend (default `local`, the filesystem; see [Running with the Restate adapter](#running-with-the-restate-adapter))
 - `--thread-storage-url <url>` — backend connection URL (e.g. a Restate ingress URL); ignored by the local backend
 

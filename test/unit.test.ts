@@ -1143,6 +1143,17 @@ describe("lifecycle: journalSignature / shouldJournal", () => {
     assert.ok(!args.includes("--thread-id"));
   });
 
+  it("the journal fork inherits the session's model unless one is pinned", () => {
+    // Regression: a hardcoded cheap model only resolves on machines whose
+    // provider serves it — everywhere else every fork died before printing
+    // and journal.md silently never appeared.
+    assert.ok(!journalForkArgs("/s.jsonl", "/tmp/jf").includes("--model"));
+    const pinned = journalForkArgs("/s.jsonl", "/tmp/jf", "deepseek/deepseek-chat");
+    const i = pinned.indexOf("--model");
+    assert.ok(i > -1);
+    assert.strictEqual(pinned[i + 1], "deepseek/deepseek-chat");
+  });
+
   it("journalSignature changes when an obligation is added", () => {
     const h = makeHarness(tmpDir);
     const sig1 = journalSignature(h.store);

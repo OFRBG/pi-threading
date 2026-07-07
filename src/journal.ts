@@ -115,22 +115,29 @@ export function shouldJournal(
   return write;
 }
 
-/** Spawn args for the journal fork. `--no-extensions` is load-bearing: when
- *  pi-threading is installed via extension discovery, a fork without it
- *  loads the extension too — and having no --thread-id, it mints a fresh
- *  identity, writes a ghost .thread/threads/thread-<uuid>/ into the shared
- *  workspace, and at its own turn_end forks yet another journal pi,
- *  chaining forever. The fork's only job is to summarize the session it was
- *  forked from; it must never become a thread. */
-export function journalForkArgs(sessionFile: string, sessionDir: string): string[] {
+/** Spawn args for the journal fork.
+ *
+ *  `--no-extensions` is load-bearing: when pi-threading is installed via
+ *  extension discovery, a fork without it loads the extension too — and
+ *  having no --thread-id, it mints a fresh identity, writes a ghost
+ *  .thread/threads/thread-<uuid>/ into the shared workspace, and at its own
+ *  turn_end forks yet another journal pi, chaining forever. The fork's only
+ *  job is to summarize the session it was forked from; it must never become
+ *  a thread.
+ *
+ *  No `--model` unless one is explicitly configured: the fork then inherits
+ *  the forked session's own model, which resolves on any machine by
+ *  construction. A hardcoded cheap model looks free until the extension runs
+ *  on a machine whose provider can't serve it — then every fork dies before
+ *  printing and the journal silently never exists. */
+export function journalForkArgs(sessionFile: string, sessionDir: string, model?: string): string[] {
   return [
     "--fork",
     sessionFile,
     "--session-dir",
     sessionDir,
     "--no-extensions",
-    "--model",
-    "deepseek/deepseek-chat",
+    ...(model ? ["--model", model] : []),
     "--thinking",
     "off",
     "--print",
@@ -138,26 +145,39 @@ export function journalForkArgs(sessionFile: string, sessionDir: string): string
   ];
 }
 
-/** Fork the session into a throwaway cheap-model run that writes one journal
- *  entry. Fire-and-forget: runs in the background after turn_end/agent_end,
- *  the main thread never pauses on it. */
-export function forkJournalEntry(store: ThreadStore, sessionFile: string): void {
+/** Fork the session into a throwaway run that writes one journal entry.
+ *  Fire-and-forget: runs in the background after turn_end/agent_end, the
+ *  main thread never pauses on it. */
+export function forkJournalEntry(store: ThreadStore, sessionFile: string, model?: string): void {
   const tmpSes = fs.mkdtempSync(path.join(os.tmpdir(), "pi-journal-"));
   let out = "";
-  const proc = spawn("pi", journalForkArgs(sessionFile, tmpSes), {
-    stdio: ["ignore", "pipe", "ignore"],
+  let errOut = "";
+  const proc = spawn("pi", journalForkArgs(sessionFile, tmpSes, model), {
+    stdio: ["ignore", "pipe", "pipe"],
   });
-  proc.on("error", () => {
+  proc.on("error", err => {
+    console.error("[thread] journal fork failed to spawn:", err);
     fs.rmSync(tmpSes, { recursive: true, force: true });
   });
   proc.stdout!.on("data", (d: Buffer) => {
     out += d.toString();
   });
-  proc.on("close", () => {
+  proc.stderr!.on("data", (d: Buffer) => {
+    errOut += d.toString();
+  });
+  proc.on("close", code => {
     void (async () => {
       fs.rmSync(tmpSes, { recursive: true, force: true });
       const entry = out.trim();
-      if (!entry) return;
+      if (!entry) {
+        // A fork that never produces an entry must not fail silently — this
+        // is exactly how a misconfigured journal model reads as "journal.md
+        // just never appears".
+        console.error(
+          `[thread] journal fork produced no entry (exit ${code})${errOut.trim() ? `: ${errOut.trim().slice(0, 300)}` : ""}`,
+        );
+        return;
+      }
       const existing = await store.adapter.readJournal(store.threadId);
       if (isDuplicateOfLastEntry(existing, entry)) return;
       const ts = new Date().toISOString().slice(0, 16).replace("T", " ");

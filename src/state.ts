@@ -179,7 +179,8 @@ export function createThreadStore(
     },
 
     forkJournal(sessionFile: string) {
-      forkJournalEntry(store, sessionFile);
+      const m = pi.getFlag("thread-journal-model");
+      forkJournalEntry(store, sessionFile, typeof m === "string" && m ? m : undefined);
     },
 
     startHeartbeat(onTick?: () => void | Promise<void>) {

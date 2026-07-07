@@ -24,6 +24,11 @@ export default function (pi: ExtensionAPI) {
     type: "string",
     description: 'Journal cadence: "turn" (default, one model call per turn), "done", or "off"',
   });
+  pi.registerFlag("thread-journal-model", {
+    type: "string",
+    description:
+      "Model for journal fork entries (e.g. deepseek/deepseek-chat). Default: the thread's own model — a pinned model must resolve on this machine or journaling fails.",
+  });
   pi.registerFlag("thread-storage", {
     type: "string",
     description: 'Storage backend: "local" (default) or "restate"',
