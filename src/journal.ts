@@ -115,6 +115,27 @@ export function shouldJournal(
   return write;
 }
 
+/** How to re-invoke pi from inside a running pi process. `spawn("pi")`
+ *  breaks on Windows — npm installs pi as a `pi.cmd` shim that spawn() can't
+ *  execute (ENOENT) — and is fragile under version managers. Re-running
+ *  exactly what started this process needs no PATH lookup at all:
+ *  node-launched installs (npm, volta — including their Windows shims, which
+ *  resolve to `node.exe <entry.js>` by the time this code runs) re-invoke
+ *  `execPath entryScript`, standalone pi binaries re-invoke `execPath`
+ *  directly. */
+export function piSelfCommand(
+  args: string[],
+  execPath: string = process.execPath,
+  entryScript: string | undefined = process.argv[1],
+): { cmd: string; args: string[] } {
+  const exe = (execPath.split(/[\\/]/).pop() ?? "").toLowerCase();
+  if (exe.startsWith("node")) {
+    if (entryScript) return { cmd: execPath, args: [entryScript, ...args] };
+    return { cmd: "pi", args }; // no identifiable entry — PATH as a last resort
+  }
+  return { cmd: execPath, args }; // pi is a standalone executable
+}
+
 /** Spawn args for the journal fork.
  *
  *  `--no-extensions` is load-bearing: when pi-threading is installed via
@@ -152,7 +173,8 @@ export function forkJournalEntry(store: ThreadStore, sessionFile: string, model?
   const tmpSes = fs.mkdtempSync(path.join(os.tmpdir(), "pi-journal-"));
   let out = "";
   let errOut = "";
-  const proc = spawn("pi", journalForkArgs(sessionFile, tmpSes, model), {
+  const launch = piSelfCommand(journalForkArgs(sessionFile, tmpSes, model));
+  const proc = spawn(launch.cmd, launch.args, {
     stdio: ["ignore", "pipe", "pipe"],
   });
   proc.on("error", err => {

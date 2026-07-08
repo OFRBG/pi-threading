@@ -38,6 +38,7 @@ import {
   isDuplicateOfLastEntry,
   journalForkArgs,
   journalSignature,
+  piSelfCommand,
   shouldJournal,
   JOURNAL_MIN_INTERVAL_MS,
 } from "../src/journal";
@@ -1144,6 +1145,27 @@ describe("lifecycle: journalSignature / shouldJournal", () => {
     assert.ok(!args.includes("--thread-id"));
   });
 
+  it("piSelfCommand re-invokes pi the way this process was started", () => {
+    // Regression: spawn("pi") is ENOENT on Windows, where npm installs pi as
+    // a .cmd shim that child_process.spawn cannot execute.
+    const viaNode = piSelfCommand(["--fork", "s.jsonl"], "/usr/local/bin/node", "/opt/pi/bin.js");
+    assert.deepStrictEqual(viaNode, {
+      cmd: "/usr/local/bin/node",
+      args: ["/opt/pi/bin.js", "--fork", "s.jsonl"],
+    });
+    const winNode = piSelfCommand(
+      ["--fork", "s.jsonl"],
+      "C:\\Program Files\\nodejs\\node.exe",
+      "C:\\npm\\node_modules\\pi\\bin.js",
+    );
+    assert.strictEqual(winNode.cmd, "C:\\Program Files\\nodejs\\node.exe");
+    assert.strictEqual(winNode.args[0], "C:\\npm\\node_modules\\pi\\bin.js");
+    const standalone = piSelfCommand(["--fork", "s.jsonl"], "/usr/local/bin/pi", "--fork");
+    assert.deepStrictEqual(standalone, { cmd: "/usr/local/bin/pi", args: ["--fork", "s.jsonl"] });
+    const noEntry = piSelfCommand(["--fork"], "/usr/local/bin/node", "");
+    assert.strictEqual(noEntry.cmd, "pi");
+  });
+
   it("the journal fork inherits the session's model unless one is pinned", () => {
     // Regression: a hardcoded cheap model only resolves on machines whose
     // provider serves it — everywhere else every fork died before printing
@@ -1344,20 +1366,28 @@ describe("adapter: LocalFsAdapter", () => {
     const dispose = adapter.watchInbox("fresh", () => {
       fired = true;
     });
-    assert.ok(existsSync(join(tmpDir, ".thread", "threads", "fresh", "inbox")));
-    // A message arriving after the (now-live) watch should still be observed.
-    await adapter.enqueueMessage("fresh", {
-      from: "other",
-      to: "fresh",
-      type: "Note",
-      body: "hi",
-      requestId: "n.1",
-      delivery: "steer",
-      sentAt: new Date().toISOString(),
-    });
-    await new Promise(resolve => setTimeout(resolve, 50));
-    assert.strictEqual(fired, true);
-    dispose();
+    // Dispose in finally: a leaked FSWatcher keeps the node:test process
+    // alive forever if an assertion throws first (observed as a 5-minute
+    // hang when the fixed 50ms wait flaked under load).
+    try {
+      assert.ok(existsSync(join(tmpDir, ".thread", "threads", "fresh", "inbox")));
+      // A message arriving after the (now-live) watch should still be observed.
+      await adapter.enqueueMessage("fresh", {
+        from: "other",
+        to: "fresh",
+        type: "Note",
+        body: "hi",
+        requestId: "n.1",
+        delivery: "steer",
+        sentAt: new Date().toISOString(),
+      });
+      for (let i = 0; i < 40 && !fired; i++) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      assert.strictEqual(fired, true);
+    } finally {
+      dispose();
+    }
   });
 });
 
@@ -1486,11 +1516,13 @@ describe("restate: buildWakeLaunch", () => {
     assert.doesNotMatch(args, /--extension/); // only when PI_THREAD_EXTENSION is set
   });
 
-  it("honors RESTATE_INGRESS_URL and PI_THREAD_EXTENSION from the service environment", () => {
+  it("honors RESTATE_INGRESS_URL, PI_THREAD_EXTENSION, and PI_BIN from the service environment", () => {
     const l = buildWakeLaunch("t1", wake, "/w", {
       RESTATE_INGRESS_URL: "http://restate.internal:8080",
       PI_THREAD_EXTENSION: "/opt/pi-threading/src/index.ts",
+      PI_BIN: "/opt/pi/bin/pi",
     });
+    assert.strictEqual(l.cmd, "/opt/pi/bin/pi");
     const args = l.args.join(" ");
     assert.match(args, /--thread-storage-url http:\/\/restate\.internal:8080/);
     assert.match(args, /--extension \/opt\/pi-threading\/src\/index\.ts/);

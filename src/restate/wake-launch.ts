@@ -15,6 +15,10 @@ import type { ScheduledWake } from "../core/types";
  *  - PI_THREAD_EXTENSION  — path to this extension's entry point, passed as
  *                           `--extension`; omit if pi loads it from its own
  *                           config
+ *  - PI_BIN               — pi executable to spawn (default "pi" from PATH).
+ *                           Needed on Windows, where the npm-installed "pi"
+ *                           is a .cmd shim spawn() can't execute — point it
+ *                           at a real executable
  */
 export function buildWakeLaunch(
   threadId: string,
@@ -34,5 +38,5 @@ export function buildWakeLaunch(
   // Same envelope shape the live heartbeat's checkSchedules delivers, so a
   // wake reads identically whether or not the process survived to see it.
   args.push("--print", `[scheduled wake #${wake.id}]: ${wake.reason}`);
-  return { cmd: "pi", args, cwd };
+  return { cmd: env.PI_BIN ?? "pi", args, cwd };
 }
