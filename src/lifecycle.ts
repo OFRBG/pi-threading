@@ -4,6 +4,10 @@ import type { Inbox } from "./inbox";
 import { threadModelPrompt } from "./core/system-prompt";
 import { journalMode, shouldJournal } from "./journal";
 
+/** Wiring into pi's event stream: state transitions across the turn cycle,
+ *  the sync-channel confusion nudge, journal cadence triggers, and the
+ *  thread-model system prompt. */
+
 /** Where a thread settles between turns: waiting states and On Hold must
  *  survive the turn boundary instead of being stomped to open/done. */
 function restingState(store: ThreadStore, whenUnlocked: ThreadState): ThreadState {
@@ -40,7 +44,7 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
     if (wasOnHold) {
       // A prompt landing on a suspended thread is an implicit resume.
       store.holdReason = null;
-      await store.writeFile();
+      await store.persist();
       await inbox.drainInbox(ctx);
     }
   });

@@ -4,6 +4,9 @@ import { formatThreadLine } from "./core/format";
 import { resumeThread, suspendThread } from "./core/thread-ops";
 import type { Inbox } from "./inbox";
 
+/** Slash commands: the human operator's view of the same operations the
+ *  thread_* tools give the model. */
+
 export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox) {
   pi.registerCommand("/thread-status", {
     description: "Show this thread's own state and latest journal entry",

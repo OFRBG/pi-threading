@@ -5,6 +5,10 @@ import { mintId } from "./core/ids";
 import { nowIso } from "./core/time";
 import { acquireLock, releaseLock } from "./core/thread-ops";
 
+/** The messaging engine: typed cross-thread sends and their bookkeeping
+ *  (obligations, owed replies), delivery of incoming envelopes with barrier
+ *  and lock resolution, and the heartbeat's deadline/schedule checks. */
+
 export interface SendResult {
   requestId: string;
   delivered: "queued" | "live";
@@ -103,7 +107,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       // Brief/Question/Blocker was delivered (see deliver()).
       const before = store.owed.length;
       store.owed = store.owed.filter(o => o.requestId !== requestId);
-      if (store.owed.length !== before) await store.writeFile();
+      if (store.owed.length !== before) await store.persist();
     }
 
     if (isObligationType(type)) {
@@ -115,7 +119,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
         sentAt: msg.sentAt,
         ...(opts.deadline ? { deadline: opts.deadline } : {}),
       });
-      await store.writeFile();
+      await store.persist();
     }
     return { requestId, delivered };
   }
@@ -149,7 +153,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       });
     }
     store.subscriptions = store.subscriptions.filter(s => s.eventId !== eventId);
-    await store.writeFile();
+    await store.persist();
     return fired.length;
   }
 
@@ -236,7 +240,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
           `Rejected sync: ${store.threadId} is already in sync with ${store.lockPartner ?? "another thread"}. Try again later or subscribe to my current lock.`,
           { requestId: msg.requestId },
         );
-        await store.writeFile();
+        await store.persist();
         return;
       }
       await acquireLock(store, msg.requestId, msg.from, "sync", ctx);
@@ -246,7 +250,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     pi.sendUserMessage(renderEnvelope(msg) + extra, {
       deliverAs: msg.delivery === "steer" ? "steer" : "followUp",
     });
-    await store.writeFile();
+    await store.persist();
   }
 
   async function drainInbox(ctx: ExtensionContext): Promise<void> {
@@ -279,7 +283,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
         { deliverAs: "steer" },
       );
     }
-    if (changed) await store.writeFile();
+    if (changed) await store.persist();
   }
 
   async function checkSchedules(): Promise<void> {
@@ -295,7 +299,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     for (const w of due) {
       pi.sendUserMessage(`[scheduled wake #${w.id}]: ${w.reason}`, { deliverAs: "steer" });
     }
-    await store.writeFile();
+    await store.persist();
   }
 
   return {

@@ -31,7 +31,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { createThreadStore } from "../src/state";
 import { createInbox } from "../src/inbox";
-import { registerTools } from "../src/tools";
+import { registerTools } from "../src/tools/index";
 import { registerCommands } from "../src/commands";
 import {
   journalFingerprint,
@@ -88,7 +88,7 @@ function makeHarness(dir: string, id = "t1") {
 
   const store = createThreadStore(stubPi);
   // No internal `await` in LocalFsAdapter.configure — this synchronously
-  // sets its root before the call returns, same reasoning as writeFile()
+  // sets its root before the call returns, same reasoning as persist()
   // below, so the harness doesn't need to become async just for this.
   void store.adapter.configure(dir);
   store.threadId = id;
@@ -103,7 +103,7 @@ function makeHarness(dir: string, id = "t1") {
   // fs side effect (state.json existing, matching real session_start) has
   // already happened synchronously by the time this call returns, even
   // though the returned promise itself settles a microtask later.
-  void store.writeFile();
+  void store.persist();
 
   const ctx = {
     ui: {
@@ -1463,14 +1463,14 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
     sender.threadId = "sender";
     sender.threadsRootDir = "/virtual";
     sender.threadDir = "/virtual/sender";
-    await sender.writeFile();
+    await sender.persist();
     const senderInbox = createInbox(sender, stubPi);
 
     const receiver = createThreadStore(stubPi, fake);
     receiver.threadId = "receiver";
     receiver.threadsRootDir = "/virtual";
     receiver.threadDir = "/virtual/receiver";
-    await receiver.writeFile();
+    await receiver.persist();
     const receiverInbox = createInbox(receiver, stubPi);
 
     const { delivered } = await senderInbox.sendCrossThread(
@@ -1561,7 +1561,7 @@ describe("bin/thread-cli.mjs: external observability", () => {
       fireAt: new Date(Date.now() + 120_000).toISOString(),
       reason: "check CI",
     });
-    await h.store.writeFile();
+    await h.store.persist();
   }
 
   it("status itemizes obligations, owed, barriers, schedules, and pending inbox", async () => {
@@ -1593,8 +1593,7 @@ describe("bin/thread-cli.mjs: external observability", () => {
   });
 
   it("status errors for an unknown thread", () => {
-    const h = makeHarness(tmpDir);
-    void h;
+    makeHarness(tmpDir); // materializes .thread/threads so only the id is missing
     assert.throws(() => runCli(tmpDir, "status", "ghost"));
   });
 
@@ -1620,7 +1619,7 @@ describe("core: toSummary / formatThreadLine coordination counts", () => {
       summary: "x",
       sentAt: new Date().toISOString(),
     });
-    await h.store.writeFile();
+    await h.store.persist();
     const r = await callTool(h, "thread_list");
     const own = (r.details.threads as ThreadSummary[]).find(t => t.id === "t1")!;
     assert.strictEqual(own.obligations, 1);

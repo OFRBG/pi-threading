@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { StateFile, InboxMessage, ThreadSummary, ScheduledWake } from "../core/types";
 import { PROCESSED_TTL_MS, toSummary } from "../core/types";
+import { nowIso } from "../core/time";
 import type { StorageAdapter } from "./types";
 
 /** Keep processed/ from growing forever — messages are audit trail, not archive. */
@@ -69,9 +70,9 @@ export function createLocalFsAdapter(): StorageAdapter {
           if (fs.existsSync(oldJournal) && !fs.existsSync(path.join(migratedDir, "journal.md"))) {
             fs.copyFileSync(oldJournal, path.join(migratedDir, "journal.md"));
           }
-          fs.writeFileSync(path.join(root, ".migrated"), new Date().toISOString());
+          fs.writeFileSync(path.join(root, ".migrated"), nowIso());
         } catch (err) {
-          console.error("[thread] Failed to migrate legacy state.json:", err);
+          console.error("[thread] failed to migrate legacy state.json:", err);
         }
       }
     },
@@ -82,7 +83,7 @@ export function createLocalFsAdapter(): StorageAdapter {
       try {
         return JSON.parse(fs.readFileSync(f, "utf8")) as StateFile;
       } catch (err) {
-        console.error("[thread] Failed to read state.json:", err);
+        console.error("[thread] failed to read state.json:", err);
         return undefined;
       }
     },
@@ -191,7 +192,7 @@ export function createLocalFsAdapter(): StorageAdapter {
         const watcher = fs.watch(inboxDir(threadId), cb);
         return () => watcher.close();
       } catch (err) {
-        console.error("[thread] Failed to watch inbox:", err);
+        console.error("[thread] failed to watch inbox:", err);
         return () => {};
       }
     },

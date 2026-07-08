@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Barrier, Delivery, MessageType, ThreadStore } from "../core/types";
 import { mintId } from "../core/ids";
-import { deadlineFromSeconds } from "../core/time";
+import { deadlineFromSeconds, nowIso } from "../core/time";
 import { acquireLock } from "../core/thread-ops";
 import type { Inbox } from "../inbox";
 import { err } from "./shared";
@@ -19,11 +19,11 @@ async function armBarrier(
     id: mintId(`barrier.${store.threadId}`),
     pending: [...requestIds],
     mode,
-    createdAt: new Date().toISOString(),
+    createdAt: nowIso(),
     ...(deadline ? { deadline } : {}),
   };
   store.barriers.push(barrier);
-  await store.writeFile();
+  await store.persist();
   return barrier;
 }
 
@@ -248,7 +248,7 @@ export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inb
         message: params.message,
         delivery: params.delivery as Delivery,
       });
-      await store.writeFile();
+      await store.persist();
       return {
         content: [
           {

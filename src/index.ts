@@ -2,10 +2,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createThreadStore } from "./state";
 import { createInbox } from "./inbox";
 import { registerLifecycle } from "./lifecycle";
-import { registerTools } from "./tools";
+import { registerTools } from "./tools/index";
 import { registerCommands } from "./commands";
 import { createConfiguredAdapter } from "./adapter/registry";
 
+/** Extension entry point: register the CLI flags, build the configured
+ *  storage adapter → store → inbox stack, and attach the three surfaces
+ *  (lifecycle hooks, model-facing tools, human-facing slash commands). */
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("thread-id", {
     type: "string",

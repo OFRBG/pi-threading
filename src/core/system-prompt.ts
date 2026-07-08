@@ -41,6 +41,7 @@ When you need to do one of these, use the exact tool listed:
 | You're blocked and need parent to decide | thread_send(type="Blocker") — \`to\` defaults to your parent |
 | Wait for something to happen later | thread_subscribe(eventId, message, delivery) |
 | Wake up threads waiting on an event | thread_emit(eventId) |
+| Wake yourself up at a future time | thread_schedule(fireInSeconds, reason) — cancel with thread_schedule_cancel |
 | Check what another thread has been doing (without messaging them) | thread_journal(id) |
 | Pause yourself gracefully | thread_suspend(reason) — inbox queues until resume |
 | Wake up after being On Hold | thread_resume |

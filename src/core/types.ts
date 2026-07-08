@@ -1,6 +1,10 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { StorageAdapter } from "../adapter/types";
 
+/** The domain model: thread states, message types, the durable records
+ *  (obligations, owed replies, barriers, wakes) and the two shared views of
+ *  a thread — its own StateFile and the ThreadSummary others see. */
+
 export type ThreadState =
   | "idle"
   | "thinking"
@@ -172,7 +176,8 @@ export function toSummary(s: StateFile): ThreadSummary {
 export interface ThreadStore extends ThreadData {
   adapter: StorageAdapter;
   transition: (next: ThreadState, ctx?: ExtensionContext) => Promise<void>;
-  writeFile: () => Promise<void>;
+  /** Persist the current in-memory state through the storage adapter. */
+  persist: () => Promise<void>;
   init: (cwd: string, ctx: ExtensionContext) => Promise<void>;
   shutdown: (reason: string) => Promise<void>;
   listThreads: () => Promise<ThreadSummary[]>;

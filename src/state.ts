@@ -8,6 +8,10 @@ import { forkJournalEntry } from "./journal";
 import type { StorageAdapter } from "./adapter/types";
 import { createLocalFsAdapter } from "./adapter/local-fs";
 
+/** The ThreadStore: this thread's identity and mutable coordination state,
+ *  restored from the storage adapter at init, persisted on every change, kept
+ *  fresh by the heartbeat, and live-drained by the inbox watcher. */
+
 export function createThreadStore(
   pi: ExtensionAPI,
   adapter: StorageAdapter = createLocalFsAdapter(),
@@ -46,12 +50,12 @@ export function createThreadStore(
 
     async transition(next: ThreadState, ctx?: ExtensionContext) {
       store.state = next;
-      await store.writeFile();
+      await store.persist();
       ctx?.ui.setStatus("thread", `[${store.threadId}:${store.state}]`);
     },
 
-    async writeFile() {
-      if (!store.threadDir) return;
+    async persist() {
+      if (!store.threadId) return; // init() hasn't resolved an identity yet
       const payload: StateFile = {
         id: store.threadId,
         pid: process.pid,
@@ -149,7 +153,7 @@ export function createThreadStore(
       }
       store.startedAt = nowIso();
       store.status = "running";
-      await store.writeFile();
+      await store.persist();
       ctx.ui.setStatus("thread", `[${store.threadId}:${store.state}]`);
     },
 
@@ -162,7 +166,7 @@ export function createThreadStore(
         const preserved = new Set(["done", "listening", "on-hold"]);
         if (!preserved.has(store.state)) store.state = "stopped";
         store.status = "stopped";
-        await store.writeFile();
+        await store.persist();
       }
     },
 
@@ -190,7 +194,7 @@ export function createThreadStore(
       if (heartbeat) clearInterval(heartbeat);
       heartbeat = setInterval(() => {
         void (async () => {
-          await store.writeFile();
+          await store.persist();
           await onTick?.();
         })().catch(err => console.error("[thread] heartbeat tick failed:", err));
       }, HEARTBEAT_MS);
