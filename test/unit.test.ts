@@ -23,6 +23,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -44,7 +45,7 @@ import { buildWakeLaunch } from "../src/restate/wake-launch";
 import { createLocalFsAdapter } from "../src/adapter/local-fs";
 import type { StorageAdapter } from "../src/adapter/types";
 import type { StateFile, InboxMessage, ThreadSummary } from "../src/core/types";
-import { STALE_MS } from "../src/core/types";
+import { STALE_MS, toSummary } from "../src/core/types";
 
 // --- harness -----------------------------------------------------------
 
@@ -1384,14 +1385,7 @@ function createFakeAdapter(): StorageAdapter {
       return journals.get(id)?.trim() || undefined;
     },
     async listThreads(): Promise<ThreadSummary[]> {
-      return [...states.values()].map(s => ({
-        id: s.id,
-        state: s.state,
-        status: s.status,
-        parent: s.parent,
-        role: s.role ?? null,
-        lastSeen: s.lastSeen,
-      }));
+      return [...states.values()].map(toSummary);
     },
     async threadExists(id) {
       return states.has(id);
@@ -1500,6 +1494,113 @@ describe("restate: buildWakeLaunch", () => {
     const args = l.args.join(" ");
     assert.match(args, /--thread-storage-url http:\/\/restate\.internal:8080/);
     assert.match(args, /--extension \/opt\/pi-threading\/src\/index\.ts/);
+  });
+});
+
+describe("bin/thread-cli.mjs: external observability", () => {
+  const cli = join(import.meta.dirname, "..", "bin", "thread-cli.mjs");
+  const runCli = (dir: string, ...cliArgs: string[]) =>
+    execFileSync(process.execPath, [cli, ...cliArgs, "--dir", dir], { encoding: "utf8" });
+
+  async function seedCoordination(h: Harness) {
+    h.store.obligations.push({
+      requestId: "brief.t1.1",
+      type: "Brief",
+      to: "alice",
+      summary: "build the lexer",
+      sentAt: new Date().toISOString(),
+      deadline: new Date(Date.now() + 60_000).toISOString(),
+    });
+    h.store.owed.push({
+      requestId: "q.boss.1",
+      type: "Question",
+      from: "boss",
+      summary: "which parser?",
+      receivedAt: new Date().toISOString(),
+    });
+    h.store.barriers.push({
+      id: "barrier.t1.1",
+      pending: ["brief.t1.1"],
+      mode: "all",
+      createdAt: new Date().toISOString(),
+    });
+    h.store.schedules.push({
+      id: "wake.t1.1",
+      fireAt: new Date(Date.now() + 120_000).toISOString(),
+      reason: "check CI",
+    });
+    await h.store.writeFile();
+  }
+
+  it("status itemizes obligations, owed, barriers, schedules, and pending inbox", async () => {
+    const h = makeHarness(tmpDir);
+    await seedCoordination(h);
+    seedInboxMessage(h, "t1", {
+      from: "alice",
+      type: "Note",
+      body: "queued while away",
+      requestId: "note.alice.1",
+    });
+    const out = runCli(h.dir, "status", "t1");
+    assert.match(out, /Brief to alice #brief\.t1\.1 "build the lexer" .*due in/);
+    assert.match(out, /Answer to boss for their Question #q\.boss\.1 "which parser\?"/);
+    assert.match(out, /barrier\.t1\.1 \(all\) pending: brief\.t1\.1/);
+    assert.match(out, /wake\.t1\.1 fires in .*"check CI"/);
+    assert.match(out, /Inbox pending \(1\):/);
+    assert.match(out, /\[Note alice→t1 #note\.alice\.1\]/);
+  });
+
+  it("status --json dumps the raw state plus pending inbox", async () => {
+    const h = makeHarness(tmpDir);
+    await seedCoordination(h);
+    const parsed = JSON.parse(runCli(h.dir, "status", "t1", "--json"));
+    assert.strictEqual(parsed.id, "t1");
+    assert.strictEqual(parsed.barriers.length, 1);
+    assert.strictEqual(parsed.owed.length, 1);
+    assert.deepStrictEqual(parsed.inboxPending, []);
+  });
+
+  it("status errors for an unknown thread", () => {
+    const h = makeHarness(tmpDir);
+    void h;
+    assert.throws(() => runCli(tmpDir, "status", "ghost"));
+  });
+
+  it("list table carries coordination-count columns", async () => {
+    const h = makeHarness(tmpDir);
+    await seedCoordination(h);
+    const out = runCli(h.dir, "list");
+    assert.match(out, /OBLG\s+OWED\s+BARR\s+SCHED\s+INBOX/);
+    assert.match(out, /t1\s+/);
+    const row = out.split("\n").find(l => l.startsWith("t1"))!;
+    assert.match(row, /1\s+1\s+1\s+1\s+0/); // oblg owed barr sched inbox
+  });
+});
+
+describe("core: toSummary / formatThreadLine coordination counts", () => {
+  it("thread_list lines show non-zero coordination counts only", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    h.store.obligations.push({
+      requestId: "b.1",
+      type: "Brief",
+      to: "alice",
+      summary: "x",
+      sentAt: new Date().toISOString(),
+    });
+    await h.store.writeFile();
+    const r = await callTool(h, "thread_list");
+    const own = (r.details.threads as ThreadSummary[]).find(t => t.id === "t1")!;
+    assert.strictEqual(own.obligations, 1);
+    assert.strictEqual(own.owed, 0);
+    const text = r.content[0].text;
+    const ownLine = text.split("\n").find((l: string) => l.startsWith("t1"))!;
+    assert.match(ownLine, /obligations=1/);
+    assert.doesNotMatch(ownLine, /owed=/);
+    // seedRemoteThread writes a legacy state.json without owed/schedules —
+    // counts must tolerate that instead of crashing.
+    const alice = (r.details.threads as ThreadSummary[]).find(t => t.id === "alice")!;
+    assert.strictEqual(alice.owed, 0);
   });
 });
 

@@ -139,6 +139,15 @@ export interface ThreadSummary {
   parent: string | null;
   role: string | null;
   lastSeen: string;
+  /** Coordination load, so observers can see who is waiting on what without
+   *  reading each thread's full state: sent-side debts... */
+  obligations: number;
+  /** ...received-side debts... */
+  owed: number;
+  /** ...armed reply barriers... */
+  barriers: number;
+  /** ...and pending scheduled wakes. */
+  schedules: number;
 }
 
 /** How every reader classifies another thread: a stale lastSeen overrides the
@@ -153,6 +162,10 @@ export function toSummary(s: StateFile): ThreadSummary {
     parent: s.parent,
     role: s.role ?? null,
     lastSeen: s.lastSeen,
+    obligations: s.obligations?.length ?? 0,
+    owed: s.owed?.length ?? 0,
+    barriers: s.barriers?.length ?? 0,
+    schedules: s.schedules?.length ?? 0,
   };
 }
 

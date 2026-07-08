@@ -98,9 +98,15 @@ Messages arrive as `[<Type> from <sender> #<requestId>]` with an explicit reply 
 `bin/thread-cli.mjs` lets a human act on the thread system without running pi:
 
 ```bash
-node bin/thread-cli.mjs list                      # table of all threads
-node bin/thread-cli.mjs watch                     # live-updating view + open obligations
+node bin/thread-cli.mjs list                      # table of all threads incl. coordination counts
+node bin/thread-cli.mjs status link               # one thread's full coordination state:
+                                                  #   obligations, owed replies, barriers,
+                                                  #   schedules, pending inbox, last journal entry
+node bin/thread-cli.mjs status link --json        # same, as machine-readable JSON
+node bin/thread-cli.mjs watch                     # live coordination board: table, obligations,
+                                                  #   owed, barriers, wakes, queued inbox
 node bin/thread-cli.mjs tail link                 # follow one thread's state/journal/messages
+                                                  #   (incl. +/- diffs of obligations/barriers)
 node bin/thread-cli.mjs inbox link                # pending + recent messages
 node bin/thread-cli.mjs send link Question "status?"   # steer: message a thread as "user"
 node bin/thread-cli.mjs send '*' Update "standup in 5" # broadcast

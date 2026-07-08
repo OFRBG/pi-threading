@@ -1,8 +1,17 @@
 import type { Barrier, Obligation, OwedReply, ScheduledWake, ThreadSummary } from "./types";
 
-/** One thread per line — shared by thread_list and /thread-list. */
+/** One thread per line — shared by thread_list and /thread-list. Coordination
+ *  counts appear only when non-zero, so idle threads stay one short line. */
 export function formatThreadLine(t: ThreadSummary): string {
-  return `${t.id.padEnd(16)} [${t.state}]  ${t.status}  role=${t.role ?? "-"}  parent=${t.parent ?? "-"}  lastSeen=${t.lastSeen}`;
+  const load = [
+    t.obligations ? `obligations=${t.obligations}` : "",
+    t.owed ? `owed=${t.owed}` : "",
+    t.barriers ? `barriers=${t.barriers}` : "",
+    t.schedules ? `schedules=${t.schedules}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return `${t.id.padEnd(16)} [${t.state}]  ${t.status}  role=${t.role ?? "-"}  parent=${t.parent ?? "-"}${load ? `  ${load}` : ""}  lastSeen=${t.lastSeen}`;
 }
 
 /** Status-section list: indented bullets, or " none" inline when empty. */

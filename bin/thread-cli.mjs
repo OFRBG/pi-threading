@@ -30,6 +30,11 @@ Commands:
   list                       Show a table of all threads in the workspace
     --json                     Print raw JSON array instead of a table
 
+  status <id>                Full coordination state of one thread: obligations,
+                             owed replies, barriers, schedules, subscriptions,
+                             pending inbox, last journal entry
+    --json                     Print raw state.json + pending inbox as JSON
+
   send <to> <type> <body...>  Send a message into a thread's inbox
     --from <id>                 Sender id (default: "user")
     --request-id <id>            Request id (default: "<type>.<from>.<timestamp>")
@@ -40,7 +45,9 @@ Commands:
 
   tail <id>                  Follow a thread's state/journal/inbox changes live (Ctrl-C to stop)
 
-  watch                      Live-updating list view + open obligations (Ctrl-C to stop)
+  watch                      Live coordination board: thread table, obligations,
+                             owed replies, barriers, schedules, queued inbox
+                             (Ctrl-C to stop)
 
   delete <id...>             Delete one or more threads (removes .thread/threads/<id>)
     --all                       Delete every thread (requires --yes)
@@ -54,6 +61,7 @@ Global flags:
 
 Examples:
   thread-cli.mjs list --dir /path/to/workspace
+  thread-cli.mjs status link
   thread-cli.mjs send link Note "please pause" --from user
   thread-cli.mjs inbox link
   thread-cli.mjs tail link
@@ -167,6 +175,16 @@ function relTime(iso) {
   return `${d}d ago`;
 }
 
+/** For deadlines/fireAt: "in 30s" while pending, "5m overdue" once passed. */
+function dueIn(iso) {
+  if (!iso) return "-";
+  const ms = Date.parse(iso) - Date.now();
+  if (Number.isNaN(ms)) return "-";
+  const s = Math.floor(Math.abs(ms) / 1000);
+  const span = s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : `${Math.floor(s / 3600)}h`;
+  return ms >= 0 ? `in ${span}` : `${span} overdue`;
+}
+
 function truncate(str, n) {
   if (!str) return "";
   return str.length > n ? str.slice(0, n) : str;
@@ -192,6 +210,9 @@ function collectThreads(dir) {
       parent: state.parent ?? "-",
       lock: lockStr,
       obligations: Array.isArray(state.obligations) ? state.obligations.length : 0,
+      owed: Array.isArray(state.owed) ? state.owed.length : 0,
+      barriers: Array.isArray(state.barriers) ? state.barriers.length : 0,
+      schedules: Array.isArray(state.schedules) ? state.schedules.length : 0,
       inbox: countInboxPending(dir, id),
       lastSeen: state.lastSeen ?? null,
       raw: state,
@@ -206,7 +227,20 @@ function padCol(str, width) {
 }
 
 function renderTable(rows) {
-  const headers = ["ID", "STATE", "STATUS", "ROLE", "PARENT", "LOCK", "OBLG", "INBOX", "LAST SEEN"];
+  const headers = [
+    "ID",
+    "STATE",
+    "STATUS",
+    "ROLE",
+    "PARENT",
+    "LOCK",
+    "OBLG",
+    "OWED",
+    "BARR",
+    "SCHED",
+    "INBOX",
+    "LAST SEEN",
+  ];
   const data = rows.map(r => [
     r.id,
     r.state,
@@ -215,6 +249,9 @@ function renderTable(rows) {
     r.parent,
     r.lock,
     String(r.obligations),
+    String(r.owed),
+    String(r.barriers),
+    String(r.schedules),
     String(r.inbox),
     relTime(r.lastSeen),
   ]);
@@ -245,6 +282,86 @@ function cmdList(args) {
     return 0;
   }
   process.stdout.write(renderTable(rows));
+  return 0;
+}
+
+function cmdStatus(args) {
+  const [id] = args._;
+  if (!id) {
+    process.stderr.write("usage: thread-cli.mjs status <id>\n");
+    return 1;
+  }
+  const state = loadThreadState(args.dir, id);
+  if (!state) {
+    process.stderr.write(`error: thread "${id}" not found\n`);
+    return 2;
+  }
+  const pending = readInboxMessages(path.join(threadsDir(args.dir), id, "inbox"));
+  if (args.json) {
+    process.stdout.write(JSON.stringify({ ...state, inboxPending: pending }, null, 2) + "\n");
+    return 0;
+  }
+
+  const lines = [];
+  lines.push(
+    `Id: ${id}  State: ${state.state ?? "unknown"}  Status: ${effectiveStatus(state)}  Role: ${state.role ?? "-"}  Parent: ${state.parent ?? "-"}`,
+  );
+  lines.push(
+    `Lock: ${state.lockEventId ?? "-"}${state.lockType ? ` (${state.lockType}${state.lockPartner ? `, with ${state.lockPartner}` : ""})` : ""}  Hold: ${state.holdReason ?? "-"}`,
+  );
+  lines.push(
+    `Last seen: ${relTime(state.lastSeen)}  Started: ${relTime(state.startedAt)}  PID: ${state.pid ?? "-"}`,
+  );
+
+  const section = (title, items, render) => {
+    lines.push("", `${title} (${items.length}):`);
+    if (items.length === 0) lines.push("  (none)");
+    for (const it of items) lines.push("  " + render(it));
+  };
+  section(
+    "Obligations (replies owed TO this thread)",
+    state.obligations ?? [],
+    o =>
+      `${o.type} to ${o.to} #${o.requestId} "${o.summary ?? ""}" (${relTime(o.sentAt)}${o.deadline ? `, due ${dueIn(o.deadline)}` : ""}${o.nudged ? ", reminded" : ""})`,
+  );
+  section(
+    "Owed replies (this thread OWES)",
+    state.owed ?? [],
+    o =>
+      `${o.type === "Brief" ? "Result" : "Answer"} to ${o.from} for their ${o.type} #${o.requestId} "${o.summary ?? ""}" (${relTime(o.receivedAt)})`,
+  );
+  section(
+    "Barriers",
+    state.barriers ?? [],
+    b =>
+      `${b.id} (${b.mode}) pending: ${(b.pending ?? []).join(", ")} (${relTime(b.createdAt)}${b.deadline ? `, due ${dueIn(b.deadline)}` : ""})`,
+  );
+  section(
+    "Scheduled wakes",
+    state.schedules ?? [],
+    w => `${w.id} fires ${dueIn(w.fireAt)}: "${w.reason ?? ""}"${w.nudged ? " (fired)" : ""}`,
+  );
+  section(
+    "Subscriptions",
+    state.subscriptions ?? [],
+    s => `"${s.eventId}" → "${truncate(s.message ?? "", 60)}" (${s.delivery})`,
+  );
+  section("Inbox pending", pending, m => formatMsgLine(m, 80));
+
+  try {
+    const journal = fs
+      .readFileSync(path.join(threadsDir(args.dir), id, "journal.md"), "utf8")
+      .trim();
+    const entries = journal.split(/\n(?=<!--)/).filter(Boolean);
+    const last = entries[entries.length - 1];
+    if (last) {
+      lines.push("", "Last journal entry:");
+      for (const l of last.trim().split("\n")) lines.push("  " + l);
+    }
+  } catch {
+    // no journal yet
+  }
+  process.stdout.write(lines.join("\n") + "\n");
   return 0;
 }
 
@@ -345,7 +462,9 @@ function readInboxMessages(inboxDir) {
 }
 
 function formatMsgLine(m, bodyLen) {
-  const body = bodyLen ? truncate(m.body ?? "", bodyLen) : (m.body ?? "");
+  // One message per line: multi-line bodies collapse to single-spaced text.
+  const flat = (m.body ?? "").replace(/\s+/g, " ").trim();
+  const body = bodyLen ? truncate(flat, bodyLen) : flat;
   return `[${m.type} ${m.from}→${m.to} #${m.requestId}] ${body} (${m.sentAt ?? "?"})`;
 }
 
@@ -428,6 +547,19 @@ async function cmdTail(args) {
             `lock: ${lastState.lockEventId ?? "-"} → ${state.lockEventId ?? "-"} (partner: ${state.lockPartner ?? "-"})\n`,
           );
         }
+        const diffIds = (label, prev, next, idOf) => {
+          const p = new Set((prev ?? []).map(idOf));
+          const n = new Set((next ?? []).map(idOf));
+          const changes = [
+            ...[...n].filter(x => !p.has(x)).map(x => `+${x}`),
+            ...[...p].filter(x => !n.has(x)).map(x => `-${x}`),
+          ];
+          if (changes.length) process.stdout.write(`${label}: ${changes.join(" ")}\n`);
+        };
+        diffIds("obligations", lastState.obligations, state.obligations, o => o.requestId);
+        diffIds("owed", lastState.owed, state.owed, o => o.requestId);
+        diffIds("barriers", lastState.barriers, state.barriers, b => b.id);
+        diffIds("schedules", lastState.schedules, state.schedules, w => w.id);
       }
       lastState = state;
     }
@@ -484,14 +616,53 @@ async function cmdWatch(args) {
     const rows = collectThreads(args.dir);
     let out = "\x1b[2J\x1b[H";
     out += rows.length ? renderTable(rows) : "No threads found.\n";
+
+    const owed = [];
+    const barriers = [];
+    const schedules = [];
+    const queued = [];
+    for (const r of rows) {
+      for (const o of r.raw.owed ?? []) owed.push({ owner: r.id, ...o });
+      for (const b of r.raw.barriers ?? []) barriers.push({ owner: r.id, ...b });
+      for (const w of r.raw.schedules ?? []) schedules.push({ owner: r.id, ...w });
+      if (r.inbox > 0) {
+        for (const m of readInboxMessages(path.join(threadsDir(args.dir), r.id, "inbox"))) {
+          queued.push(m);
+        }
+      }
+    }
+
     out += "\nOpen obligations:\n";
     const obligations = collectObligations(args.dir);
     if (obligations.length === 0) {
       out += "  (none)\n";
     } else {
       for (const o of obligations) {
-        const age = relTime(o.sentAt);
-        out += `  ${o.owner} → ${o.to} : ${o.type} "${o.summary ?? ""}" (${age})\n`;
+        out += `  ${o.owner} → ${o.to} : ${o.type} #${o.requestId} "${o.summary ?? ""}" (${relTime(o.sentAt)}${o.deadline ? `, due ${dueIn(o.deadline)}` : ""})\n`;
+      }
+    }
+    if (owed.length) {
+      out += "Owed replies:\n";
+      for (const o of owed) {
+        out += `  ${o.owner} owes ${o.from} : ${o.type === "Brief" ? "Result" : "Answer"} for ${o.type} #${o.requestId} "${o.summary ?? ""}" (${relTime(o.receivedAt)})\n`;
+      }
+    }
+    if (barriers.length) {
+      out += "Barriers:\n";
+      for (const b of barriers) {
+        out += `  ${b.owner} waits (${b.mode}) on: ${(b.pending ?? []).join(", ")} (${relTime(b.createdAt)}${b.deadline ? `, due ${dueIn(b.deadline)}` : ""})\n`;
+      }
+    }
+    if (schedules.length) {
+      out += "Scheduled wakes:\n";
+      for (const w of schedules) {
+        out += `  ${w.owner} fires ${dueIn(w.fireAt)}: "${w.reason ?? ""}"${w.nudged ? " (fired)" : ""}\n`;
+      }
+    }
+    if (queued.length) {
+      out += "Queued inbox:\n";
+      for (const m of queued) {
+        out += `  ${formatMsgLine(m, 60)}\n`;
       }
     }
     process.stdout.write(out);
@@ -564,6 +735,8 @@ async function main() {
   switch (command) {
     case "list":
       return cmdList(args);
+    case "status":
+      return cmdStatus(args);
     case "send":
       return cmdSend(args);
     case "inbox":
