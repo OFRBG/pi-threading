@@ -86,7 +86,8 @@ export function registerSyncTools(pi: ExtensionAPI, store: ThreadStore, inbox: I
       const partner = store.lockPartner;
       store.obligations = store.obligations.filter(o => o.requestId !== released);
       await releaseLock(store, ctx);
-      const n = await inbox.fireSubscribers(released);
+      const { notified, parts } = await inbox.fireSubscribers(released);
+      inbox.inject(parts, ctx);
       if (partner) {
         await inbox.sendCrossThread(partner, "Answer", "sync closed", {
           requestId: released,
@@ -96,10 +97,10 @@ export function registerSyncTools(pi: ExtensionAPI, store: ThreadStore, inbox: I
         content: [
           {
             type: "text" as const,
-            text: `Sync closed. Released "${released}". ${n} local waiter(s) notified.${partner ? ` Notified partner ${partner}.` : ""}`,
+            text: `Sync closed. Released "${released}". ${notified} local waiter(s) notified.${partner ? ` Notified partner ${partner}.` : ""}`,
           },
         ],
-        details: { ok: true, released, waitersNotified: n },
+        details: { ok: true, released, waitersNotified: notified },
       };
     },
   });

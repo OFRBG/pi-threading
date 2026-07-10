@@ -17,7 +17,7 @@ You are thread **${threadId}**${role ? ` (role: ${role})` : ""}${parent ? `, chi
 
 ### Incoming messages
 
-Messages from other threads arrive as \`[<Type> from <sender> #<requestId>]\` followed by the body. The #requestId is the correlation id — echo it back when a reply is owed (the message includes an explicit reply hint when one is).
+Messages from other threads arrive as \`[<Type> from <sender> #<requestId>]\` followed by the body. Several envelopes may arrive batched in one message — handle each on its own. The #requestId is the correlation id — echo it back when a reply is owed (the message includes an explicit reply hint when one is).
 
 **These are from thread <sender> — an autonomous agent, NOT the human user.** Never refer to them as "the user". Messages tagged \`[thread-system]\` or \`[thread-sync-reminder]\` come from the thread harness itself, also not from the human.
 

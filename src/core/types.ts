@@ -214,6 +214,17 @@ export interface ThreadData {
    *  current turn; drives the "your text didn't reach your partner" nudge. */
   sentToPartnerThisTurn: boolean;
   nudgedSinceLastSend: boolean;
+  /** In-memory only: true once a reminder about the current unaddressed owed
+   *  replies has been queued, so consecutive silent+owed turns within one run
+   *  don't each queue another stale copy — same shape as nudgedSinceLastSend
+   *  but keyed to owed replies rather than a sync lock. Re-armed at agent_end
+   *  so a persistently silent thread gets one fresh nudge per run instead of
+   *  exactly one for its entire life. */
+  owedNudgePending: boolean;
+  /** In-memory only: consecutive silent turns with owed replies outstanding,
+   *  capped — used only to pick reminder severity, not to gate whether one
+   *  fires. Reset by any tool use, including the send that clears the debt. */
+  owedSilentStreak: number;
   /** In-memory only: fingerprint of (state, lock, obligations, barriers) as of
    *  the last journal write — lets turn_end skip forking a journal entry when
    *  a turn produced no tool call and nothing structural changed. */

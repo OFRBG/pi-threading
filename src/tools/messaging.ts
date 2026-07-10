@@ -108,6 +108,23 @@ export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inb
       if (targets.length === 0) {
         return err(`No matching targets for "${toSpec}" (self-sends are excluded).`);
       }
+
+      // Soft warning, not a hard failure: a Sync's closing Answer never
+      // creates an OwedReply in the first place (Sync is excluded from
+      // OwedType — its reply is produced by thread_sync_close via the lock),
+      // so a hard check here would misfire on a legitimate sync-close Answer
+      // sent this way instead. This is the send-side half of the owed-reply
+      // nudge in lifecycle.ts's turn_end: without it, a misdirected Answer/
+      // Result still silently clears store.owed as if it had been correct.
+      let targetWarning = "";
+      if (type === "Answer" || type === "Result") {
+        const owedMatch = store.owed.find(o => o.requestId === params.requestId);
+        if (!owedMatch) {
+          targetWarning = `Warning: no owed reply matches requestId "${params.requestId}" — check thread_status before sending, in case this reply is misdirected or stale.`;
+        } else if (!targets.includes(owedMatch.from)) {
+          targetWarning = `Warning: requestId "${params.requestId}" is owed to ${owedMatch.from}, not "${toSpec}" — double check the target.`;
+        }
+      }
       const locking = type === "Question" || type === "Blocker" || type === "Sync";
       if (locking && targets.length > 1) {
         return err(
@@ -149,6 +166,7 @@ export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inb
       const lines = sent.map(
         s => `${type} sent to ${s.to}. requestId=${s.requestId} (${s.delivered}).`,
       );
+      if (targetWarning) lines.push(targetWarning);
       if (missing.length) {
         lines.push(
           `(note: ${missing.join(", ")} ${missing.length === 1 ? "has" : "have"} never been seen in this workspace — the message is queued durably and delivers if a thread with that id starts. If this was a typo, check thread_list.)`,
@@ -269,16 +287,17 @@ export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inb
     parameters: Type.Object({
       eventId: Type.String({ description: "Event name to emit" }),
     }),
-    async execute(_id, params) {
-      const n = await inbox.fireSubscribers(params.eventId);
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const { notified, parts } = await inbox.fireSubscribers(params.eventId);
+      inbox.inject(parts, ctx);
       return {
         content: [
           {
             type: "text" as const,
-            text: `Event "${params.eventId}" fired. ${n} subscriber(s) notified.`,
+            text: `Event "${params.eventId}" fired. ${notified} subscriber(s) notified.`,
           },
         ],
-        details: { eventId: params.eventId, notified: n },
+        details: { eventId: params.eventId, notified },
       };
     },
   });

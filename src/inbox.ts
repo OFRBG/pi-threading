@@ -9,6 +9,19 @@ import { acquireLock, releaseLock } from "./core/thread-ops";
  *  (obligations, owed replies), delivery of incoming envelopes with barrier
  *  and lock resolution, and the heartbeat's deadline/schedule checks. */
 
+/** How long after an idle-time injection we assume pi's prompt preflight is
+ *  still running (it ends at turn_start, which clears the hold early). */
+export const INJECTION_GRACE_MS = 3_000;
+/** How long a compaction may hold the inbox shut before we assume its end
+ *  event was swallowed (compaction failures emit no extension event). */
+export const COMPACTION_HOLD_MAX_MS = 180_000;
+
+/** One unit of text bound for this thread's own session. */
+export interface Injection {
+  text: string;
+  delivery: Delivery;
+}
+
 export interface SendResult {
   requestId: string;
   delivered: "queued" | "live";
@@ -38,19 +51,75 @@ export interface Inbox {
   resolveTargets(to: string): Promise<string[]>;
   /** Which of these ids have never run in this workspace (likely typos). */
   findMissingTargets(targets: string[]): Promise<string[]>;
-  deliver(msg: InboxMessage, ctx: ExtensionContext): Promise<void>;
+  /** Bookkeeping for one envelope (locks, owed, barriers) — returns the
+   *  injection parts; the caller batches them into one inject(). */
+  deliver(msg: InboxMessage, ctx: ExtensionContext): Promise<Injection[]>;
   drainInbox(ctx: ExtensionContext): Promise<void>;
   isTargetLive(to: string): Promise<boolean>;
-  fireSubscribers(eventId: string): Promise<number>;
+  fireSubscribers(eventId: string): Promise<{ notified: number; parts: Injection[] }>;
   /** Called from the heartbeat: injects a one-time reminder per overdue obligation. */
-  checkDeadlines(): Promise<void>;
+  checkDeadlines(ctx: ExtensionContext): Promise<void>;
   /** Called from the heartbeat: fires any scheduled wake whose time has come.
    *  Local-fs backend only — the Restate backend fires independently via
    *  the companion service's own durable timer + runner. */
-  checkSchedules(): Promise<void>;
+  checkSchedules(ctx: ExtensionContext): Promise<void>;
+  /** Push parts into this session as ONE user message (steer if any part is). */
+  inject(parts: Injection[], ctx: ExtensionContext): void;
+  /** False while an idle-time injection is in preflight or a compaction is
+   *  running — drains and nudges wait (messages stay durable on disk). */
+  canInject(): boolean;
+  noteCompactionStart(): void;
+  noteCompactionEnd(): void;
+  /** A turn started: pi is streaming, so injections queue safely again. */
+  noteRunStarted(): void;
 }
 
 export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
+  // --- injection gate ----------------------------------------------------
+  // pi.sendUserMessage during a run queues safely (pi drains its queues at
+  // turn boundaries and after agent_end handlers). While idle it starts a
+  // new run after an async preflight, and two of those in flight race — the
+  // loser throws "Agent is already processing" and its message is dropped.
+  // Worse, during auto-compaction the agent *looks* idle, so an injection
+  // starts a run that races the compaction's context rewrite. The gate
+  // serializes idle injections and holds the drain shut during compaction;
+  // gated messages stay durable on disk and are retried from the watcher,
+  // turn boundaries, and the heartbeat.
+  let inFlightSince: number | null = null;
+  let compactingSince: number | null = null;
+
+  function canInject(): boolean {
+    const now = Date.now();
+    if (compactingSince !== null && now - compactingSince < COMPACTION_HOLD_MAX_MS) return false;
+    if (inFlightSince !== null && now - inFlightSince < INJECTION_GRACE_MS) return false;
+    return true;
+  }
+
+  function inject(parts: Injection[], ctx: ExtensionContext): void {
+    if (parts.length === 0) return;
+    // One coalesced message per batch: a steer anywhere makes the whole
+    // batch urgent; follow-up parts just arrive a little earlier than they
+    // had to, which is harmless.
+    const steer = parts.some(p => p.delivery === "steer");
+    if (ctx.isIdle?.() ?? false) inFlightSince = Date.now();
+    pi.sendUserMessage(parts.map(p => p.text).join("\n\n"), {
+      deliverAs: steer ? "steer" : "followUp",
+    });
+  }
+
+  function noteCompactionStart(): void {
+    compactingSince = Date.now();
+  }
+
+  function noteCompactionEnd(): void {
+    compactingSince = null;
+  }
+
+  function noteRunStarted(): void {
+    inFlightSince = null;
+    compactingSince = null;
+  }
+
   async function isTargetLive(to: string): Promise<boolean> {
     const s = await store.adapter.loadState(to);
     if (!s) return false;
@@ -145,16 +214,17 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     return missing;
   }
 
-  async function fireSubscribers(eventId: string): Promise<number> {
+  async function fireSubscribers(
+    eventId: string,
+  ): Promise<{ notified: number; parts: Injection[] }> {
     const fired = store.subscriptions.filter(s => s.eventId === eventId);
-    for (const sub of fired) {
-      pi.sendUserMessage(sub.message, {
-        deliverAs: sub.delivery === "steer" ? "steer" : "followUp",
-      });
-    }
+    if (fired.length === 0) return { notified: 0, parts: [] };
     store.subscriptions = store.subscriptions.filter(s => s.eventId !== eventId);
     await store.persist();
-    return fired.length;
+    return {
+      notified: fired.length,
+      parts: fired.map(s => ({ text: s.message, delivery: s.delivery })),
+    };
   }
 
   /** Resolve any barriers waiting on this requestId. Returns "resolved"
@@ -198,7 +268,8 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     return `${header}\n${msg.body}${hint}`;
   }
 
-  async function deliver(msg: InboxMessage, ctx: ExtensionContext): Promise<void> {
+  async function deliver(msg: InboxMessage, ctx: ExtensionContext): Promise<Injection[]> {
+    const parts: Injection[] = [];
     let barrierNotes: string[] = [];
     if (msg.type === "Answer" || msg.type === "Result") {
       store.obligations = store.obligations.filter(o => o.requestId !== msg.requestId);
@@ -208,7 +279,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       if (store.lockEventId === msg.requestId) {
         await releaseLock(store, ctx);
       }
-      await fireSubscribers(msg.requestId);
+      parts.push(...(await fireSubscribers(msg.requestId)).parts);
       barrierNotes = resolveBarriers(msg.requestId);
     }
 
@@ -241,52 +312,56 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
           { requestId: msg.requestId },
         );
         await store.persist();
-        return;
+        return [];
       }
       await acquireLock(store, msg.requestId, msg.from, "sync", ctx);
     }
 
     const extra = barrierNotes.length ? "\n\n" + barrierNotes.join("\n") : "";
-    pi.sendUserMessage(renderEnvelope(msg) + extra, {
-      deliverAs: msg.delivery === "steer" ? "steer" : "followUp",
-    });
+    parts.push({ text: renderEnvelope(msg) + extra, delivery: msg.delivery });
     await store.persist();
+    return parts;
   }
 
   async function drainInbox(ctx: ExtensionContext): Promise<void> {
     // On Hold means "don't wake me": messages stay queued until resume.
     if (store.state === "on-hold") return;
+    if (!canInject()) return; // stays on disk; watcher/turn-end/heartbeat retry
     const messages = await store.adapter.drainInbox(store.threadId);
+    const parts: Injection[] = [];
     for (const msg of messages) {
-      await deliver(msg, ctx);
+      parts.push(...(await deliver(msg, ctx)));
     }
+    inject(parts, ctx);
   }
 
-  async function checkDeadlines(): Promise<void> {
+  async function checkDeadlines(ctx: ExtensionContext): Promise<void> {
+    if (!canInject()) return; // nudges re-arm on a later heartbeat tick
     const now = Date.now();
-    let changed = false;
+    const parts: Injection[] = [];
     for (const ob of store.obligations) {
       if (!ob.deadline || ob.nudged || new Date(ob.deadline).getTime() > now) continue;
       ob.nudged = true;
-      changed = true;
-      pi.sendUserMessage(
-        `[obligation overdue #${ob.requestId}]: your ${ob.type} to ${ob.to} ("${ob.summary}") passed its deadline with no reply. Follow up with ${ob.to}${store.parent ? `, or escalate a Blocker to ${store.parent}` : ""}.`,
-        { deliverAs: "steer" },
-      );
+      parts.push({
+        text: `[obligation overdue #${ob.requestId}]: your ${ob.type} to ${ob.to} ("${ob.summary}") passed its deadline with no reply. Follow up with ${ob.to}${store.parent ? `, or escalate a Blocker to ${store.parent}` : ""}.`,
+        delivery: "steer",
+      });
     }
     for (const b of store.barriers) {
       if (!b.deadline || b.nudged || new Date(b.deadline).getTime() > now) continue;
       b.nudged = true;
-      changed = true;
-      pi.sendUserMessage(
-        `[barrier overdue "${b.id}"]: still waiting on ${b.mode} of ${b.pending.length} repl${b.pending.length === 1 ? "y" : "ies"} (${b.pending.join(", ")}) — none arrived by the deadline. Check in with the target thread(s), or the barrier will keep waiting silently.`,
-        { deliverAs: "steer" },
-      );
+      parts.push({
+        text: `[barrier overdue "${b.id}"]: still waiting on ${b.mode} of ${b.pending.length} repl${b.pending.length === 1 ? "y" : "ies"} (${b.pending.join(", ")}) — none arrived by the deadline. Check in with the target thread(s), or the barrier will keep waiting silently.`,
+        delivery: "steer",
+      });
     }
-    if (changed) await store.persist();
+    if (parts.length === 0) return;
+    await store.persist();
+    inject(parts, ctx);
   }
 
-  async function checkSchedules(): Promise<void> {
+  async function checkSchedules(ctx: ExtensionContext): Promise<void> {
+    if (!canInject()) return; // wakes stay armed; next heartbeat retries
     const now = Date.now();
     // Fired wakes are pruned, not kept — otherwise thread_status accumulates
     // "(fired)" entries forever. Already-nudged entries (the Restate service
@@ -296,10 +371,11 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     const keep = store.schedules.filter(w => !w.nudged && new Date(w.fireAt).getTime() > now);
     if (keep.length === store.schedules.length) return;
     store.schedules = keep;
-    for (const w of due) {
-      pi.sendUserMessage(`[scheduled wake #${w.id}]: ${w.reason}`, { deliverAs: "steer" });
-    }
     await store.persist();
+    inject(
+      due.map(w => ({ text: `[scheduled wake #${w.id}]: ${w.reason}`, delivery: "steer" })),
+      ctx,
+    );
   }
 
   return {
@@ -313,5 +389,10 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     fireSubscribers,
     checkDeadlines,
     checkSchedules,
+    inject,
+    canInject,
+    noteCompactionStart,
+    noteCompactionEnd,
+    noteRunStarted,
   };
 }

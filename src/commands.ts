@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ThreadStore, MessageType } from "./core/types";
 import { formatThreadLine } from "./core/format";
 import { resumeThread, suspendThread } from "./core/thread-ops";
@@ -7,10 +7,23 @@ import type { Inbox } from "./inbox";
 /** Slash commands: the human operator's view of the same operations the
  *  thread_* tools give the model. */
 
+const NOT_ACTIVE =
+  "This session hasn't opted into pi-threading — restart pi with --thread-id <id> to activate.";
+
+/** store.threadId is only ever set by state.ts's init(), which lifecycle.ts
+ *  skips entirely when the opt-in gate is closed — so an empty id means this
+ *  session never activated, not just "hasn't picked a name yet". */
+function checkActive(store: ThreadStore, ctx: ExtensionCommandContext): boolean {
+  if (store.threadId) return true;
+  ctx.ui.notify(NOT_ACTIVE, "warning");
+  return false;
+}
+
 export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox) {
   pi.registerCommand("/thread-status", {
     description: "Show this thread's own state and latest journal entry",
     async handler(_args, ctx) {
+      if (!checkActive(store, ctx)) return;
       await ctx.waitForIdle();
       const journal = await store.readJournal(store.threadId);
       const lines = journal ? journal.split("\n").slice(-12).join("\n") : "(no journal yet)";
@@ -25,19 +38,22 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
   pi.registerCommand("/thread-emit", {
     description: "Emit a named event: /thread-emit <eventId>",
     async handler(args, ctx) {
+      if (!checkActive(store, ctx)) return;
       const eventId = args.trim();
       if (!eventId) {
         ctx.ui.notify("Usage: /thread-emit <eventId>", "warning");
         return;
       }
-      const n = await inbox.fireSubscribers(eventId);
-      ctx.ui.notify(`Event "${eventId}" fired. ${n} subscriber(s) notified.`, "info");
+      const { notified, parts } = await inbox.fireSubscribers(eventId);
+      inbox.inject(parts, ctx);
+      ctx.ui.notify(`Event "${eventId}" fired. ${notified} subscriber(s) notified.`, "info");
     },
   });
 
   pi.registerCommand("/thread-list", {
     description: "List all known threads sharing this workspace",
     async handler(_args, ctx) {
+      if (!checkActive(store, ctx)) return;
       const threads = await store.listThreads();
       if (!threads.length) {
         ctx.ui.notify("(no other threads found)", "info");
@@ -50,6 +66,7 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
   pi.registerCommand("/thread-send", {
     description: "Send a message to another thread: /thread-send <to> <type> <body...>",
     async handler(args, ctx) {
+      if (!checkActive(store, ctx)) return;
       const parts = args.trim().split(/\s+/);
       const [to, type, ...bodyParts] = parts;
       const body = bodyParts.join(" ");
@@ -95,6 +112,7 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
   pi.registerCommand("/thread-suspend", {
     description: "Mark this thread On Hold: /thread-suspend [reason]",
     async handler(args, ctx) {
+      if (!checkActive(store, ctx)) return;
       await suspendThread(store, args.trim() || null, ctx);
       ctx.ui.notify(
         `Thread suspended (On Hold)${store.holdReason ? `: ${store.holdReason}` : ""}. Inbox queues until resume.`,
@@ -106,6 +124,7 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
   pi.registerCommand("/thread-resume", {
     description: "Resume this thread from On Hold back to Open",
     async handler(_args, ctx) {
+      if (!checkActive(store, ctx)) return;
       if (!(await resumeThread(store, () => inbox.drainInbox(ctx), ctx))) {
         ctx.ui.notify(`Not on hold (state is ${store.state}).`, "warning");
         return;

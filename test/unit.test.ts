@@ -31,6 +31,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { createThreadStore } from "../src/state";
 import { createInbox } from "../src/inbox";
+import { registerLifecycle } from "../src/lifecycle";
 import { registerTools } from "../src/tools/index";
 import { registerCommands } from "../src/commands";
 import {
@@ -105,15 +106,35 @@ function makeHarness(dir: string, id = "t1") {
   // though the returned promise itself settles a microtask later.
   void store.persist();
 
+  // Mutable so gate tests can flip between "agent idle" (injections start a
+  // run) and "agent streaming" (injections queue). Default mirrors mid-run.
+  const agent = { idle: false };
+
   const ctx = {
     ui: {
       setStatus: () => {},
       notify: (text: string, level?: string) => notifications.push({ text, level }),
     },
+    isIdle: () => agent.idle,
     waitForIdle: async () => {},
   } as unknown as ExtensionCommandContext;
 
-  return { store, inbox, tools, commands, ctx, calls, notifications, dir };
+  return {
+    store,
+    inbox,
+    tools,
+    commands,
+    ctx,
+    calls,
+    notifications,
+    dir,
+    get idle() {
+      return agent.idle;
+    },
+    set idle(v: boolean) {
+      agent.idle = v;
+    },
+  };
 }
 
 type Harness = ReturnType<typeof makeHarness>;
@@ -199,6 +220,90 @@ function writeJournal(h: Harness, id: string, content: string) {
   writeFileSync(join(dir, "journal.md"), content.trim() + "\n");
 }
 
+// A second harness, separate from makeHarness above: that one sets
+// store.threadId directly and never touches lifecycle.ts, so it can't
+// exercise the opt-in gate that lives in registerLifecycle's session_start
+// handler. This one goes through the real pi.on(...) wiring instead.
+type CustomEntry = { type: "custom"; customType: string; data?: unknown };
+
+type SentMessage = { customType: string; content: string };
+
+function makeLifecycleHarness(dir: string) {
+  const handlers: Record<string, (event: unknown, ctx: unknown) => unknown> = {};
+  const setActiveToolsCalls: string[][] = [];
+  const sentMessages: SentMessage[] = [];
+  const registeredThreadTools = [
+    "thread_status",
+    "thread_list",
+    "thread_journal",
+    "thread_send",
+    "thread_await",
+    "thread_subscribe",
+    "thread_emit",
+    "thread_sync_request",
+    "thread_sync_close",
+    "thread_suspend",
+    "thread_resume",
+    "thread_schedule",
+    "thread_schedule_cancel",
+  ];
+  let activeTools = [...registeredThreadTools, "bash", "read_file"]; // some unrelated tool too
+
+  const flags: Record<string, string | boolean | undefined> = {};
+
+  const stubPi = {
+    on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
+      handlers[event] = handler;
+    },
+    getFlag: (name: string) => flags[name],
+    getActiveTools: () => activeTools,
+    setActiveTools: (names: string[]) => {
+      setActiveToolsCalls.push(names);
+      activeTools = names;
+    },
+    sendMessage: (msg: SentMessage) => {
+      sentMessages.push({ customType: msg.customType, content: msg.content });
+    },
+    sendUserMessage: () => {},
+    appendEntry: () => {},
+  } as unknown as ExtensionAPI;
+
+  const store = createThreadStore(stubPi);
+  const inbox = createInbox(store, stubPi);
+  registerLifecycle(stubPi, store, inbox);
+
+  function makeCtx(entries: CustomEntry[] = []) {
+    return {
+      cwd: dir,
+      ui: { setStatus: () => {}, notify: () => {} },
+      sessionManager: {
+        getEntries: () => entries,
+        getSessionFile: () => undefined,
+      },
+      isIdle: () => true,
+    } as unknown as ExtensionContext;
+  }
+
+  return {
+    store,
+    inbox,
+    dir,
+    setFlag(name: string, value: string) {
+      flags[name] = value;
+    },
+    fire(event: string, ctx: unknown, payload: unknown = {}) {
+      return handlers[event]?.(payload, ctx);
+    },
+    makeCtx,
+    setActiveToolsCalls,
+    sentMessages,
+    get activeTools() {
+      return activeTools;
+    },
+    registeredThreadTools,
+  };
+}
+
 let tmpDir: string;
 
 beforeEach(() => {
@@ -260,6 +365,58 @@ describe("tools: thread_send", () => {
     const h = makeHarness(tmpDir);
     const r = await callTool(h, "thread_send", { to: "alice", type: "Answer", body: "ok" });
     assert.strictEqual(r.details.ok, false);
+  });
+
+  it("Answer/Result with a requestId not in store.owed gets a soft warning, not a failure", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    const r = await callTool(h, "thread_send", {
+      to: "alice",
+      type: "Answer",
+      body: "ok",
+      requestId: "q.999",
+    });
+    assert.strictEqual(r.details.ok, true);
+    assert.match(r.content[0].text, /no owed reply matches requestId "q\.999"/);
+  });
+
+  it("Answer/Result to the wrong thread for a real owed requestId warns with the correct target", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    seedRemoteThread(h, "bob");
+    h.store.owed.push({
+      requestId: "q.1",
+      type: "Question",
+      from: "alice",
+      summary: "?",
+      receivedAt: new Date().toISOString(),
+    });
+    const r = await callTool(h, "thread_send", {
+      to: "bob",
+      type: "Answer",
+      body: "ok",
+      requestId: "q.1",
+    });
+    assert.match(r.content[0].text, /is owed to alice, not "bob"/);
+  });
+
+  it("a correctly targeted Answer/Result carries no target warning", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    h.store.owed.push({
+      requestId: "q.1",
+      type: "Question",
+      from: "alice",
+      summary: "?",
+      receivedAt: new Date().toISOString(),
+    });
+    const r = await callTool(h, "thread_send", {
+      to: "alice",
+      type: "Answer",
+      body: "ok",
+      requestId: "q.1",
+    });
+    assert.doesNotMatch(r.content[0].text, /Warning:/);
   });
 
   it("Blocker with no `to` defaults to the parent", async () => {
@@ -645,16 +802,19 @@ describe("inbox: deliver", () => {
       createdAt: new Date().toISOString(),
     });
 
-    await h.inbox.deliver(
-      {
-        from: "alice",
-        to: "t1",
-        type: "Result",
-        body: "done",
-        requestId: "brief.t1.1",
-        delivery: "follow-up",
-        sentAt: new Date().toISOString(),
-      },
+    h.inbox.inject(
+      await h.inbox.deliver(
+        {
+          from: "alice",
+          to: "t1",
+          type: "Result",
+          body: "done",
+          requestId: "brief.t1.1",
+          delivery: "follow-up",
+          sentAt: new Date().toISOString(),
+        },
+        h.ctx,
+      ),
       h.ctx,
     );
 
@@ -772,16 +932,19 @@ describe("inbox: deliver", () => {
       mode: "any",
       createdAt: new Date().toISOString(),
     });
-    await h.inbox.deliver(
-      {
-        from: "alice",
-        to: "t1",
-        type: "Result",
-        body: "done",
-        requestId: "a.1",
-        delivery: "follow-up",
-        sentAt: new Date().toISOString(),
-      },
+    h.inbox.inject(
+      await h.inbox.deliver(
+        {
+          from: "alice",
+          to: "t1",
+          type: "Result",
+          body: "done",
+          requestId: "a.1",
+          delivery: "follow-up",
+          sentAt: new Date().toISOString(),
+        },
+        h.ctx,
+      ),
       h.ctx,
     );
     assert.strictEqual(h.store.barriers.length, 0);
@@ -796,16 +959,19 @@ describe("inbox: deliver", () => {
       mode: "all",
       createdAt: new Date().toISOString(),
     });
-    await h.inbox.deliver(
-      {
-        from: "alice",
-        to: "t1",
-        type: "Result",
-        body: "done",
-        requestId: "a.1",
-        delivery: "follow-up",
-        sentAt: new Date().toISOString(),
-      },
+    h.inbox.inject(
+      await h.inbox.deliver(
+        {
+          from: "alice",
+          to: "t1",
+          type: "Result",
+          body: "done",
+          requestId: "a.1",
+          delivery: "follow-up",
+          sentAt: new Date().toISOString(),
+        },
+        h.ctx,
+      ),
       h.ctx,
     );
     assert.strictEqual(h.store.barriers.length, 1);
@@ -819,16 +985,19 @@ describe("inbox: deliver", () => {
       { id: "b.1", pending: ["a.1"], mode: "all", createdAt: new Date().toISOString() },
       { id: "b.2", pending: ["a.1", "a.2"], mode: "any", createdAt: new Date().toISOString() },
     );
-    await h.inbox.deliver(
-      {
-        from: "alice",
-        to: "t1",
-        type: "Result",
-        body: "done",
-        requestId: "a.1",
-        delivery: "follow-up",
-        sentAt: new Date().toISOString(),
-      },
+    h.inbox.inject(
+      await h.inbox.deliver(
+        {
+          from: "alice",
+          to: "t1",
+          type: "Result",
+          body: "done",
+          requestId: "a.1",
+          delivery: "follow-up",
+          sentAt: new Date().toISOString(),
+        },
+        h.ctx,
+      ),
       h.ctx,
     );
     assert.strictEqual(h.calls.length, 1);
@@ -919,7 +1088,7 @@ describe("inbox: drainInbox", () => {
     assert.ok(existsSync(join(inboxDir, "1-bad.json"))); // left in place, not moved
   });
 
-  it("processes files in FIFO filename order", async () => {
+  it("coalesces one drain into one message, envelopes in FIFO filename order", async () => {
     const h = makeHarness(tmpDir);
     const inboxDir = join(h.store.threadDir, "inbox");
     const msg = (body: string, requestId: string) =>
@@ -935,9 +1104,106 @@ describe("inbox: drainInbox", () => {
     writeFileSync(join(inboxDir, "1-first.json"), msg("first", "n.1"));
     writeFileSync(join(inboxDir, "2-second.json"), msg("second", "n.2"));
     await h.inbox.drainInbox(h.ctx);
+    // One sendUserMessage per drain: parallel per-envelope prompts race in
+    // pi's preflight when the agent is idle, and the loser is dropped.
+    assert.strictEqual(h.calls.length, 1);
+    assert.match(h.calls[0].content, /first[\s\S]*second/);
+    assert.strictEqual(h.calls[0].options?.deliverAs, "steer");
+  });
+
+  it("a batch with any steer part delivers as steer, all follow-up as followUp", async () => {
+    const h = makeHarness(tmpDir);
+    const inboxDir = join(h.store.threadDir, "inbox");
+    const msg = (type: string, delivery: string, requestId: string) =>
+      JSON.stringify({
+        from: "alice",
+        to: "t1",
+        type,
+        body: "x",
+        requestId,
+        delivery,
+        sentAt: new Date().toISOString(),
+      });
+    writeFileSync(join(inboxDir, "1-r.json"), msg("Result", "follow-up", "r.1"));
+    writeFileSync(join(inboxDir, "2-u.json"), msg("Update", "follow-up", "u.1"));
+    await h.inbox.drainInbox(h.ctx);
+    assert.strictEqual(h.calls.length, 1);
+    assert.strictEqual(h.calls[0].options?.deliverAs, "followUp");
+
+    writeFileSync(join(inboxDir, "3-r.json"), msg("Result", "follow-up", "r.2"));
+    writeFileSync(join(inboxDir, "4-n.json"), msg("Note", "steer", "n.1"));
+    await h.inbox.drainInbox(h.ctx);
     assert.strictEqual(h.calls.length, 2);
-    assert.match(h.calls[0].content, /first/);
-    assert.match(h.calls[1].content, /second/);
+    assert.strictEqual(h.calls[1].options?.deliverAs, "steer");
+  });
+});
+
+describe("inbox: injection gate", () => {
+  it("holds the drain shut during compaction and flushes after it ends", async () => {
+    const h = makeHarness(tmpDir);
+    seedInboxMessage(h, "t1", {
+      from: "alice",
+      type: "Note",
+      body: "mid-compaction",
+      requestId: "n.1",
+    });
+    h.inbox.noteCompactionStart();
+    assert.strictEqual(h.inbox.canInject(), false);
+    await h.inbox.drainInbox(h.ctx);
+    assert.strictEqual(h.calls.length, 0);
+    assert.strictEqual(inboxFileCount(h, "t1"), 1); // still durable on disk
+    h.inbox.noteCompactionEnd();
+    await h.inbox.drainInbox(h.ctx);
+    assert.strictEqual(h.calls.length, 1);
+    assert.match(h.calls[0].content, /mid-compaction/);
+  });
+
+  it("an idle-time injection blocks further drains until a turn starts", async () => {
+    const h = makeHarness(tmpDir);
+    h.idle = true;
+    seedInboxMessage(h, "t1", { from: "alice", type: "Note", body: "one", requestId: "n.1" });
+    await h.inbox.drainInbox(h.ctx);
+    assert.strictEqual(h.calls.length, 1);
+    // The injected prompt is now in pi's async preflight — a second drain
+    // in that window must not race it with another prompt.
+    seedInboxMessage(h, "t1", { from: "alice", type: "Note", body: "two", requestId: "n.2" });
+    await h.inbox.drainInbox(h.ctx);
+    assert.strictEqual(h.calls.length, 1);
+    assert.strictEqual(inboxFileCount(h, "t1"), 1);
+    h.inbox.noteRunStarted(); // the injected run reached turn_start
+    await h.inbox.drainInbox(h.ctx);
+    assert.strictEqual(h.calls.length, 2);
+    assert.match(h.calls[1].content, /two/);
+  });
+
+  it("mid-run injections never arm the preflight hold", async () => {
+    const h = makeHarness(tmpDir);
+    h.idle = false; // agent streaming: steers just queue, no race window
+    seedInboxMessage(h, "t1", { from: "alice", type: "Note", body: "one", requestId: "n.1" });
+    await h.inbox.drainInbox(h.ctx);
+    seedInboxMessage(h, "t1", { from: "alice", type: "Note", body: "two", requestId: "n.2" });
+    await h.inbox.drainInbox(h.ctx);
+    assert.strictEqual(h.calls.length, 2);
+  });
+
+  it("deadline nudges wait out the gate instead of being lost", async () => {
+    const h = makeHarness(tmpDir);
+    h.store.obligations.push({
+      requestId: "brief.t1.1",
+      type: "Brief",
+      to: "alice",
+      summary: "task",
+      sentAt: new Date().toISOString(),
+      deadline: new Date(Date.now() - 1000).toISOString(),
+    });
+    h.inbox.noteCompactionStart();
+    await h.inbox.checkDeadlines(h.ctx);
+    assert.strictEqual(h.calls.length, 0);
+    assert.notStrictEqual(h.store.obligations[0].nudged, true); // still armed
+    h.inbox.noteCompactionEnd();
+    await h.inbox.checkDeadlines(h.ctx);
+    assert.strictEqual(h.calls.length, 1);
+    assert.strictEqual(h.store.obligations[0].nudged, true);
   });
 });
 
@@ -952,11 +1218,11 @@ describe("inbox: checkDeadlines", () => {
       sentAt: new Date().toISOString(),
       deadline: new Date(Date.now() - 1000).toISOString(),
     });
-    await h.inbox.checkDeadlines();
+    await h.inbox.checkDeadlines(h.ctx);
     assert.strictEqual(h.calls.length, 1);
     assert.match(h.calls[0].content, /obligation overdue #brief\.t1\.1/);
     assert.strictEqual(h.store.obligations[0].nudged, true);
-    await h.inbox.checkDeadlines();
+    await h.inbox.checkDeadlines(h.ctx);
     assert.strictEqual(h.calls.length, 1);
   });
 
@@ -969,11 +1235,11 @@ describe("inbox: checkDeadlines", () => {
       createdAt: new Date().toISOString(),
       deadline: new Date(Date.now() - 1000).toISOString(),
     });
-    await h.inbox.checkDeadlines();
+    await h.inbox.checkDeadlines(h.ctx);
     assert.strictEqual(h.calls.length, 1);
     assert.match(h.calls[0].content, /barrier overdue "barrier\.t1\.1"/);
     assert.strictEqual(h.store.barriers[0].nudged, true);
-    await h.inbox.checkDeadlines();
+    await h.inbox.checkDeadlines(h.ctx);
     assert.strictEqual(h.calls.length, 1);
   });
 
@@ -987,7 +1253,7 @@ describe("inbox: checkDeadlines", () => {
       sentAt: new Date().toISOString(),
       deadline: new Date(Date.now() + 60_000).toISOString(),
     });
-    await h.inbox.checkDeadlines();
+    await h.inbox.checkDeadlines(h.ctx);
     assert.strictEqual(h.calls.length, 0);
   });
 });
@@ -1000,13 +1266,13 @@ describe("inbox: checkSchedules", () => {
       fireAt: new Date(Date.now() - 1000).toISOString(),
       reason: "check in on the auth task",
     });
-    await h.inbox.checkSchedules();
+    await h.inbox.checkSchedules(h.ctx);
     assert.strictEqual(h.calls.length, 1);
     assert.match(h.calls[0].content, /scheduled wake #wake\.t1\.1.*check in on the auth task/);
     assert.strictEqual(h.store.schedules.length, 0);
     const persisted = await h.store.adapter.loadState("t1");
     assert.strictEqual(persisted?.schedules.length, 0);
-    await h.inbox.checkSchedules();
+    await h.inbox.checkSchedules(h.ctx);
     assert.strictEqual(h.calls.length, 1);
   });
 
@@ -1018,7 +1284,7 @@ describe("inbox: checkSchedules", () => {
       reason: "already delivered by the restate runner",
       nudged: true,
     });
-    await h.inbox.checkSchedules();
+    await h.inbox.checkSchedules(h.ctx);
     assert.strictEqual(h.calls.length, 0);
     assert.strictEqual(h.store.schedules.length, 0);
   });
@@ -1030,7 +1296,7 @@ describe("inbox: checkSchedules", () => {
       fireAt: new Date(Date.now() + 60_000).toISOString(),
       reason: "too early",
     });
-    await h.inbox.checkSchedules();
+    await h.inbox.checkSchedules(h.ctx);
     assert.strictEqual(h.calls.length, 0);
   });
 });
@@ -1191,7 +1457,204 @@ describe("lifecycle: journalSignature / shouldJournal", () => {
   });
 });
 
+describe("lifecycle: opt-in gate", () => {
+  it("no --thread-id and no prior identity: stays inactive, never touches disk, hides thread_* tools", async () => {
+    const h = makeLifecycleHarness(tmpDir);
+    await h.fire("session_start", h.makeCtx([]));
+
+    assert.strictEqual(h.store.threadId, ""); // init() never ran
+    assert.strictEqual(existsSync(join(tmpDir, ".thread")), false);
+
+    assert.strictEqual(h.setActiveToolsCalls.length, 1);
+    const kept = h.setActiveToolsCalls[0];
+    assert.ok(kept.includes("bash")); // unrelated tools untouched
+    for (const name of h.registeredThreadTools) assert.ok(!kept.includes(name));
+  });
+
+  it("--thread-id passed: activates, creates .thread/, leaves the tool list alone", async () => {
+    const h = makeLifecycleHarness(tmpDir);
+    h.setFlag("thread-id", "worker-a");
+    await h.fire("session_start", h.makeCtx([]));
+
+    assert.strictEqual(h.store.threadId, "worker-a");
+    assert.strictEqual(existsSync(join(tmpDir, ".thread", "threads")), true);
+    assert.strictEqual(h.setActiveToolsCalls.length, 0);
+  });
+
+  it("no flag but a prior thread-identity entry: stays active on a session resume", async () => {
+    const h = makeLifecycleHarness(tmpDir);
+    const priorEntries: CustomEntry[] = [
+      { type: "custom", customType: "thread-identity", data: { id: "worker-a" } },
+    ];
+    await h.fire("session_start", h.makeCtx(priorEntries));
+
+    assert.strictEqual(h.store.threadId, "worker-a");
+    assert.strictEqual(existsSync(join(tmpDir, ".thread", "threads")), true);
+    assert.strictEqual(h.setActiveToolsCalls.length, 0);
+  });
+
+  it("while inactive, every other lifecycle handler no-ops instead of touching an uninitialized store", async () => {
+    const h = makeLifecycleHarness(tmpDir);
+    const ctx = h.makeCtx([]);
+    await h.fire("session_start", ctx);
+    assert.strictEqual(h.store.threadId, "");
+
+    await h.fire("turn_start", ctx);
+    assert.strictEqual(h.store.state, "idle"); // never transitioned to "thinking"
+
+    await h.fire("tool_execution_start", ctx);
+    assert.strictEqual(h.store.state, "idle"); // never transitioned to "working"
+
+    await h.fire("turn_end", ctx);
+    await h.fire("agent_end", ctx);
+    assert.strictEqual(h.store.state, "idle"); // restingState() never ran
+
+    const result = await h.fire("before_agent_start", ctx, { systemPrompt: "BASE" });
+    assert.strictEqual(result, undefined); // system prompt left untouched, not appended to
+  });
+});
+
+describe("lifecycle: owed-reply nudge", () => {
+  function activated(dir: string) {
+    const h = makeLifecycleHarness(dir);
+    h.setFlag("thread-id", "worker-a");
+    return h;
+  }
+  function owe(h: ReturnType<typeof activated>, from = "coordinator", requestId = "brief.1") {
+    h.store.owed.push({
+      requestId,
+      type: "Brief",
+      from,
+      summary: "do the thing",
+      receivedAt: new Date().toISOString(),
+    });
+  }
+  function reminders(h: ReturnType<typeof activated>) {
+    return h.sentMessages.filter(m => m.customType === "thread-owed-reminder");
+  }
+
+  it("fires once on the first silent turn with an owed reply outstanding", async () => {
+    const h = activated(tmpDir);
+    const ctx = h.makeCtx([]);
+    await h.fire("session_start", ctx);
+    owe(h);
+
+    await h.fire("turn_start", ctx);
+    await h.fire("turn_end", ctx);
+
+    assert.strictEqual(reminders(h).length, 1);
+    assert.match(reminders(h)[0].content, /coordinator \(Result #brief\.1\)/);
+    assert.strictEqual(h.store.owedSilentStreak, 1);
+    assert.strictEqual(h.store.owedNudgePending, true);
+  });
+
+  it("does not fire again on a second consecutive silent turn within the same run", async () => {
+    const h = activated(tmpDir);
+    const ctx = h.makeCtx([]);
+    await h.fire("session_start", ctx);
+    owe(h);
+
+    await h.fire("turn_start", ctx);
+    await h.fire("turn_end", ctx);
+    await h.fire("turn_start", ctx);
+    await h.fire("turn_end", ctx);
+
+    assert.strictEqual(reminders(h).length, 1); // gate held
+    assert.strictEqual(h.store.owedSilentStreak, 2); // streak still climbs
+  });
+
+  it("a tool-using turn resets streak and gate; the next silent turn fires again", async () => {
+    const h = activated(tmpDir);
+    const ctx = h.makeCtx([]);
+    await h.fire("session_start", ctx);
+    owe(h);
+
+    await h.fire("turn_start", ctx);
+    await h.fire("turn_end", ctx); // 1st nudge
+
+    await h.fire("turn_start", ctx);
+    await h.fire("tool_execution_start", ctx);
+    await h.fire("turn_end", ctx); // tool used — resets
+    assert.strictEqual(h.store.owedSilentStreak, 0);
+    assert.strictEqual(h.store.owedNudgePending, false);
+
+    await h.fire("turn_start", ctx);
+    await h.fire("turn_end", ctx); // silent again — should re-fire
+
+    assert.strictEqual(reminders(h).length, 2);
+  });
+
+  it("escalates at streak >= 2 once agent_end re-arms the gate across a second silent run", async () => {
+    const h = activated(tmpDir);
+    const ctx = h.makeCtx([]);
+    await h.fire("session_start", ctx);
+    owe(h);
+
+    await h.fire("turn_start", ctx);
+    await h.fire("turn_end", ctx); // run 1: streak 1, nudge fires
+    await h.fire("agent_end", ctx); // re-arms the gate; streak untouched
+
+    await h.fire("turn_start", ctx);
+    await h.fire("turn_end", ctx); // run 2, still silent: streak 2, gate re-armed so this fires
+
+    assert.strictEqual(reminders(h).length, 2);
+    assert.strictEqual(h.store.owedSilentStreak, 2);
+    assert.match(reminders(h)[1].content, /turn 2 with no reply/);
+  });
+
+  it("streak caps at 3 across repeated silent runs", async () => {
+    const h = activated(tmpDir);
+    const ctx = h.makeCtx([]);
+    await h.fire("session_start", ctx);
+    owe(h);
+
+    for (let i = 0; i < 5; i++) {
+      await h.fire("turn_start", ctx);
+      await h.fire("turn_end", ctx);
+      await h.fire("agent_end", ctx);
+    }
+
+    assert.strictEqual(h.store.owedSilentStreak, 3);
+  });
+
+  it("does not fire while a lock is held, even with owed replies outstanding", async () => {
+    const h = activated(tmpDir);
+    const ctx = h.makeCtx([]);
+    await h.fire("session_start", ctx);
+    owe(h);
+    h.store.lockEventId = "sync.x";
+    h.store.lockType = "sync";
+    h.store.lockPartner = "worker-b";
+
+    await h.fire("turn_start", ctx);
+    await h.fire("turn_end", ctx);
+
+    assert.strictEqual(reminders(h).length, 0);
+    assert.strictEqual(h.store.owedSilentStreak, 0); // condition never entered at all
+  });
+
+  it("never fires when the thread never activated", async () => {
+    const h = makeLifecycleHarness(tmpDir); // no --thread-id
+    const ctx = h.makeCtx([]);
+    await h.fire("session_start", ctx);
+    assert.strictEqual(h.store.threadId, "");
+
+    await h.fire("turn_start", ctx);
+    await h.fire("turn_end", ctx);
+
+    assert.strictEqual(reminders(h).length, 0);
+  });
+});
+
 describe("commands: slash commands", () => {
+  it("refuses to run when the thread never activated (opt-in gate never ran)", async () => {
+    const h = makeHarness(tmpDir);
+    h.store.threadId = ""; // simulates a session lifecycle.ts never activated
+    await callCommand(h, "/thread-status", "");
+    assert.match(h.notifications[0].text, /opted into pi-threading/);
+    assert.strictEqual(h.notifications[0].level, "warning");
+  });
+
   it("/thread-status notification includes the barrier count", async () => {
     const h = makeHarness(tmpDir);
     h.store.barriers.push({

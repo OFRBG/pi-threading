@@ -42,6 +42,8 @@ export function createThreadStore(
     schedules: [],
     sentToPartnerThisTurn: false,
     nudgedSinceLastSend: false,
+    owedNudgePending: false,
+    owedSilentStreak: 0,
     lastJournalSignature: null,
     lastJournalAt: 0,
     journalDebt: false,

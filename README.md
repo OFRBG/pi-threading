@@ -6,6 +6,8 @@ Cross-thread communication extension for [pi coding agent](https://github.com/ea
 
 Each `pi` process becomes a **thread** with a stable identity. Threads communicate through a shared inbox — one thread writes a message, the target drains it on startup or via live updates. By default this inbox is local files (no central broker, no external dependencies); a pluggable `StorageAdapter` means the same tools/commands also work against a durable backend (Restate) that can wake a stopped thread — see [Running with the Restate adapter](#running-with-the-restate-adapter).
 
+The extension is opt-in: it only activates for a session launched with `--thread-id <id>` (or resuming one that was). Without that flag, loading this extension has no effect at all — no `.thread/` directory, no `thread_*` tools, no system-prompt changes.
+
 Read the full design in [THREAD-MODEL.md](THREAD-MODEL.md).
 
 ## Install
@@ -85,7 +87,7 @@ Messages arrive as `[<Type> from <sender> #<requestId>]` with an explicit reply 
 
 ## Flags
 
-- `--thread-id <id>` — stable identity for this thread (e.g., `coordinator`, `worker-a`)
+- `--thread-id <id>` — stable identity for this thread (e.g., `coordinator`, `worker-a`); also the opt-in trigger — omit it and the extension does nothing
 - `--thread-parent <id>` — parent thread for Blocker escalation
 - `--thread-role <role>` — role label, targetable via `thread_send to="role:<role>"`
 - `--thread-journal <turn|done|off>` — journal cadence (default `turn`; each entry is one forked model call, rate-limited to one entry per ~2 minutes of same-task tool turns, plus a wrap-up entry when a run ends with unjournaled work; structural changes — new obligations, locks, barriers — always journal immediately)
