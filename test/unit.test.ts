@@ -31,6 +31,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { createThreadStore } from "../src/state";
 import { createInbox } from "../src/inbox";
+import type { Injection } from "../src/inbox";
 import { registerLifecycle } from "../src/lifecycle";
 import { registerTools } from "../src/tools/index";
 import { registerCommands } from "../src/commands";
@@ -502,6 +503,130 @@ describe("tools: thread_send", () => {
     seedRemoteThread(h, "alice");
     const r = await callTool(h, "thread_send", { to: "alice", type: "Brief", body: "task" });
     assert.doesNotMatch(r.content[0].text, /never been seen/);
+  });
+});
+
+// Make a seeded remote thread appear already Listening on a reply from `partner`.
+function lockRemoteOnReply(h: Harness, id: string, partner: string) {
+  const p = join(h.store.threadsRootDir, id, "state.json");
+  const s = JSON.parse(readFileSync(p, "utf8"));
+  s.lockEventId = `q.${id}.1`;
+  s.lockPartner = partner;
+  s.lockType = "reply";
+  writeFileSync(p, JSON.stringify(s));
+}
+
+describe("Finding 1: misdirected Answer/Result does not discharge the owed ledger", () => {
+  it("an Answer sent to the wrong thread leaves the owed record intact", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    seedRemoteThread(h, "bob");
+    h.store.owed.push({
+      requestId: "q.1",
+      type: "Question",
+      from: "alice",
+      summary: "?",
+      receivedAt: new Date().toISOString(),
+    });
+    await h.store.persist(); // durable seed, as deliver() would have made it
+    // Reply carries the right requestId but goes to bob, not the owed thread alice.
+    await h.inbox.sendCrossThread("bob", "Answer", "ok", { requestId: "q.1" });
+    assert.strictEqual(h.store.owed.length, 1);
+    assert.strictEqual(h.store.owed[0].from, "alice");
+    // ...and the durable record on disk is untouched too.
+    const onDisk: StateFile = JSON.parse(
+      readFileSync(join(h.store.threadDir, "state.json"), "utf8"),
+    );
+    assert.strictEqual(onDisk.owed.length, 1);
+  });
+
+  it("a Result reaching the correct owed thread still discharges it", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    h.store.owed.push({
+      requestId: "brief.1",
+      type: "Brief",
+      from: "alice",
+      summary: "task",
+      receivedAt: new Date().toISOString(),
+    });
+    await h.inbox.sendCrossThread("alice", "Result", "done", { requestId: "brief.1" });
+    assert.strictEqual(h.store.owed.length, 0);
+  });
+});
+
+describe("Finding 2: lock liveness for Question/Blocker cycles", () => {
+  it("2a: a Question with no deadlineSeconds gets a default deadline", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    await callTool(h, "thread_send", { to: "alice", type: "Question", body: "?" });
+    assert.strictEqual(h.store.obligations.length, 1);
+    const dl = h.store.obligations[0].deadline;
+    assert.ok(dl, "expected a fallback deadline");
+    // The 15-minute default lands well beyond a minute out.
+    assert.ok(new Date(dl!).getTime() > Date.now() + 60_000);
+  });
+
+  it("2a: a Blocker with no deadlineSeconds also gets a default deadline", async () => {
+    const h = makeHarness(tmpDir);
+    h.store.parent = "boss";
+    seedRemoteThread(h, "boss");
+    await callTool(h, "thread_send", { type: "Blocker", body: "stuck" });
+    assert.strictEqual(h.store.obligations.length, 1);
+    assert.ok(h.store.obligations[0].deadline);
+  });
+
+  it("2a: an explicit deadlineSeconds overrides the default", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    await callTool(h, "thread_send", {
+      to: "alice",
+      type: "Question",
+      body: "?",
+      deadlineSeconds: 5,
+    });
+    const dl = h.store.obligations[0].deadline!;
+    // 5s, not the 15-minute default.
+    assert.ok(new Date(dl).getTime() < Date.now() + 60_000);
+  });
+
+  it("2a: a non-locking Brief still gets no deadline by default", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    await callTool(h, "thread_send", { to: "alice", type: "Brief", body: "task" });
+    assert.strictEqual(h.store.obligations.length, 1);
+    assert.strictEqual(h.store.obligations[0].deadline, undefined);
+  });
+
+  it("2b: a Question that would form an immediate 2-cycle is rejected before sending", async () => {
+    const h = makeHarness(tmpDir); // this thread is t1
+    seedRemoteThread(h, "bob");
+    lockRemoteOnReply(h, "bob", "t1"); // bob is already Listening on a reply from t1
+    const r = await callTool(h, "thread_send", { to: "bob", type: "Question", body: "?" });
+    assert.strictEqual(r.details.ok, false);
+    assert.match(r.content[0].text, /would deadlock both threads/);
+    // No lock committed, no message sent.
+    assert.strictEqual(h.store.lockEventId, null);
+    assert.strictEqual(h.store.state, "idle");
+    assert.strictEqual(inboxFileCount(h, "bob"), 0);
+  });
+
+  it("2b: a Blocker that would form an immediate 2-cycle is rejected", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "bob");
+    lockRemoteOnReply(h, "bob", "t1");
+    const r = await callTool(h, "thread_send", { to: "bob", type: "Blocker", body: "stuck" });
+    assert.strictEqual(r.details.ok, false);
+    assert.match(r.content[0].text, /would deadlock both threads/);
+  });
+
+  it("2b: a Question to a target locked on a DIFFERENT thread is allowed", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "bob");
+    lockRemoteOnReply(h, "bob", "carol"); // bob waits on carol, not us — no cycle
+    const r = await callTool(h, "thread_send", { to: "bob", type: "Question", body: "?" });
+    assert.strictEqual(r.details.ok, true);
+    assert.strictEqual(h.store.lockPartner, "bob");
   });
 });
 
@@ -1298,6 +1423,80 @@ describe("inbox: checkSchedules", () => {
     });
     await h.inbox.checkSchedules(h.ctx);
     assert.strictEqual(h.calls.length, 0);
+  });
+});
+
+describe("Finding 3: heartbeat coalesces its three sources into one inject", () => {
+  function seedAllThree(h: Harness) {
+    seedInboxMessage(h, "t1", { from: "alice", type: "Note", body: "inbox msg", requestId: "n.1" });
+    h.store.obligations.push({
+      requestId: "brief.t1.1",
+      type: "Brief",
+      to: "alice",
+      summary: "task",
+      sentAt: new Date().toISOString(),
+      deadline: new Date(Date.now() - 1000).toISOString(),
+    });
+    h.store.schedules.push({
+      id: "wake.t1.1",
+      fireAt: new Date(Date.now() - 1000).toISOString(),
+      reason: "wake up",
+    });
+  }
+
+  it("the shared-array batch ships all three in a single user message when idle", async () => {
+    const h = makeHarness(tmpDir);
+    h.idle = true; // idle: the first standalone inject would arm the preflight hold
+    seedAllThree(h);
+
+    // Exactly what lifecycle.ts's heartbeat callback does.
+    const parts: Injection[] = [];
+    await h.inbox.drainInbox(h.ctx, parts);
+    await h.inbox.checkDeadlines(h.ctx, parts);
+    await h.inbox.checkSchedules(h.ctx, parts);
+    h.inbox.inject(parts, h.ctx);
+
+    assert.strictEqual(h.calls.length, 1);
+    assert.match(h.calls[0].content, /inbox msg/);
+    assert.match(h.calls[0].content, /obligation overdue #brief\.t1\.1/);
+    assert.match(h.calls[0].content, /scheduled wake #wake\.t1\.1/);
+    // Side-effecting bookkeeping still ran during gather.
+    assert.strictEqual(h.store.obligations[0].nudged, true);
+    assert.strictEqual(h.store.schedules.length, 0);
+    assert.strictEqual(inboxFileCount(h, "t1"), 0);
+  });
+
+  it("standalone idle calls still self-serialize — the tax the batch avoids", async () => {
+    const h = makeHarness(tmpDir);
+    h.idle = true;
+    seedAllThree(h);
+
+    // The pre-Finding-3 behavior: each source injects on its own. The first
+    // inject arms inFlightSince, gating the next two for a full heartbeat.
+    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.checkDeadlines(h.ctx);
+    await h.inbox.checkSchedules(h.ctx);
+
+    assert.strictEqual(h.calls.length, 1);
+    assert.match(h.calls[0].content, /inbox msg/);
+    // Deadline + schedule were gated out, their durable records left for retry.
+    assert.notStrictEqual(h.store.obligations[0].nudged, true);
+    assert.strictEqual(h.store.schedules.length, 1);
+  });
+
+  it("standalone (no shared array) still injects its own batch — unchanged callers", async () => {
+    const h = makeHarness(tmpDir);
+    h.store.obligations.push({
+      requestId: "brief.t1.1",
+      type: "Brief",
+      to: "alice",
+      summary: "task",
+      sentAt: new Date().toISOString(),
+      deadline: new Date(Date.now() - 1000).toISOString(),
+    });
+    await h.inbox.checkDeadlines(h.ctx);
+    assert.strictEqual(h.calls.length, 1);
+    assert.match(h.calls[0].content, /obligation overdue/);
   });
 });
 

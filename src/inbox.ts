@@ -54,15 +54,20 @@ export interface Inbox {
   /** Bookkeeping for one envelope (locks, owed, barriers) — returns the
    *  injection parts; the caller batches them into one inject(). */
   deliver(msg: InboxMessage, ctx: ExtensionContext): Promise<Injection[]>;
-  drainInbox(ctx: ExtensionContext): Promise<void>;
+  /** Drain queued envelopes. Standalone (no `collect`) it injects its own
+   *  batch; when the heartbeat passes a shared `collect` array it pushes its
+   *  parts there instead, so all three heartbeat sources ship in one inject(). */
+  drainInbox(ctx: ExtensionContext, collect?: Injection[]): Promise<void>;
   isTargetLive(to: string): Promise<boolean>;
   fireSubscribers(eventId: string): Promise<{ notified: number; parts: Injection[] }>;
-  /** Called from the heartbeat: injects a one-time reminder per overdue obligation. */
-  checkDeadlines(ctx: ExtensionContext): Promise<void>;
+  /** Called from the heartbeat: a one-time reminder per overdue obligation.
+   *  With `collect`, pushes parts into the shared batch instead of injecting. */
+  checkDeadlines(ctx: ExtensionContext, collect?: Injection[]): Promise<void>;
   /** Called from the heartbeat: fires any scheduled wake whose time has come.
    *  Local-fs backend only — the Restate backend fires independently via
-   *  the companion service's own durable timer + runner. */
-  checkSchedules(ctx: ExtensionContext): Promise<void>;
+   *  the companion service's own durable timer + runner. With `collect`,
+   *  pushes parts into the shared batch instead of injecting. */
+  checkSchedules(ctx: ExtensionContext, collect?: Injection[]): Promise<void>;
   /** Push parts into this session as ONE user message (steer if any part is). */
   inject(parts: Injection[], ctx: ExtensionContext): void;
   /** False while an idle-time injection is in preflight or a compaction is
@@ -173,10 +178,19 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
 
     if (type === "Answer" || type === "Result") {
       // Sending the reply settles the durable owed-reply record made when the
-      // Brief/Question/Blocker was delivered (see deliver()).
-      const before = store.owed.length;
-      store.owed = store.owed.filter(o => o.requestId !== requestId);
-      if (store.owed.length !== before) await store.persist();
+      // Brief/Question/Blocker was delivered (see deliver()) — but ONLY when it
+      // actually reaches the thread the debt is owed to. A misdirected or stale
+      // reply whose requestId merely collides with an unrelated owed entry must
+      // not discharge it: the conservation law (§2) would be violated — b's
+      // ledger would say the debt is gone while a never received the reply. The
+      // owed record stays put so thread_status and the owed-reply nudge keep
+      // surfacing it. (thread_send layers a soft warning on top; this is the
+      // real gate.) Sync is excluded from OwedType, so it never appears here.
+      const owedMatch = store.owed.find(o => o.requestId === requestId);
+      if (owedMatch && owedMatch.from === to) {
+        store.owed = store.owed.filter(o => o.requestId !== requestId);
+        await store.persist();
+      }
     }
 
     if (isObligationType(type)) {
@@ -323,7 +337,15 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     return parts;
   }
 
-  async function drainInbox(ctx: ExtensionContext): Promise<void> {
+  /** Ship a gathered batch: push into the heartbeat's shared array when one is
+   *  given (so the three sources coalesce into a single inject() per tick),
+   *  otherwise inject it now (the standalone watcher/turn/command call sites). */
+  function emit(parts: Injection[], ctx: ExtensionContext, collect?: Injection[]): void {
+    if (collect) collect.push(...parts);
+    else inject(parts, ctx);
+  }
+
+  async function drainInbox(ctx: ExtensionContext, collect?: Injection[]): Promise<void> {
     // On Hold means "don't wake me": messages stay queued until resume.
     if (store.state === "on-hold") return;
     if (!canInject()) return; // stays on disk; watcher/turn-end/heartbeat retry
@@ -332,10 +354,10 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     for (const msg of messages) {
       parts.push(...(await deliver(msg, ctx)));
     }
-    inject(parts, ctx);
+    emit(parts, ctx, collect);
   }
 
-  async function checkDeadlines(ctx: ExtensionContext): Promise<void> {
+  async function checkDeadlines(ctx: ExtensionContext, collect?: Injection[]): Promise<void> {
     if (!canInject()) return; // nudges re-arm on a later heartbeat tick
     const now = Date.now();
     const parts: Injection[] = [];
@@ -357,10 +379,10 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     }
     if (parts.length === 0) return;
     await store.persist();
-    inject(parts, ctx);
+    emit(parts, ctx, collect);
   }
 
-  async function checkSchedules(ctx: ExtensionContext): Promise<void> {
+  async function checkSchedules(ctx: ExtensionContext, collect?: Injection[]): Promise<void> {
     if (!canInject()) return; // wakes stay armed; next heartbeat retries
     const now = Date.now();
     // Fired wakes are pruned, not kept — otherwise thread_status accumulates
@@ -372,9 +394,13 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     if (keep.length === store.schedules.length) return;
     store.schedules = keep;
     await store.persist();
-    inject(
-      due.map(w => ({ text: `[scheduled wake #${w.id}]: ${w.reason}`, delivery: "steer" })),
+    emit(
+      due.map(w => ({
+        text: `[scheduled wake #${w.id}]: ${w.reason}`,
+        delivery: "steer" as const,
+      })),
       ctx,
+      collect,
     );
   }
 

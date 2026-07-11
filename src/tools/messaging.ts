@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Barrier, Delivery, MessageType, ThreadStore } from "../core/types";
+import { DEFAULT_LOCK_DEADLINE_MS } from "../core/types";
 import { mintId } from "../core/ids";
 import { deadlineFromSeconds, nowIso } from "../core/time";
 import { acquireLock } from "../core/thread-ops";
@@ -144,7 +145,37 @@ export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inb
         );
       }
 
-      const deadline = deadlineFromSeconds(params.deadlineSeconds);
+      // Synchronous 2-cycle guard for reply locks: if the single target is
+      // already Listening on a reply from THIS thread, committing our own lock
+      // onto it forms an immediate a→b→a deadlock. Unlike Sync (which has a
+      // receiver-side rejection path), Question/Blocker locks are inert — nothing
+      // observes the cycle — so reject the straight-line case up front, before a
+      // message is even sent (§3, Finding 2b). This does NOT close the TOCTOU
+      // window where both sides lock concurrently — that's unfixable without a
+      // real distributed lock — only the case where the target is *already*
+      // provably locked back onto us at send time.
+      if (type === "Question" || type === "Blocker") {
+        const targetState = await store.adapter.loadState(targets[0]);
+        if (
+          targetState &&
+          targetState.lockType === "reply" &&
+          targetState.lockPartner === store.threadId
+        ) {
+          return err(
+            `${targets[0]} is already Listening on a reply from you (#${targetState.lockEventId}) — a ${type} back to it would deadlock both threads. Answer their pending request first, or coordinate through a third thread.`,
+          );
+        }
+      }
+
+      // Locking replies (Question/Blocker) fall back to a default deadline when
+      // the caller omits one, so a forgotten deadlineSeconds can't leave a true
+      // 2-cycle with zero automatic recovery (§3, Finding 2a). Sync is excluded:
+      // it flows through thread_sync_request and self-heals via its receiver-side
+      // rejection Answer, so it needs no obligation-timer fallback.
+      const isReplyLock = type === "Question" || type === "Blocker";
+      const deadline =
+        deadlineFromSeconds(params.deadlineSeconds) ??
+        (isReplyLock ? new Date(Date.now() + DEFAULT_LOCK_DEADLINE_MS).toISOString() : undefined);
 
       let sent: Awaited<ReturnType<Inbox["sendToMany"]>>;
       try {

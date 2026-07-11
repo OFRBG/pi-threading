@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ThreadStore, ThreadState } from "./core/types";
-import type { Inbox } from "./inbox";
+import type { Inbox, Injection } from "./inbox";
 import { threadModelPrompt } from "./core/system-prompt";
 import { journalMode, shouldJournal } from "./journal";
 
@@ -60,9 +60,16 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
     // The heartbeat also re-attempts the drain: it is the retry path for
     // messages the injection gate left on disk (compaction, idle preflight).
     store.startHeartbeat(async () => {
-      await inbox.drainInbox(ctx);
-      await inbox.checkDeadlines(ctx);
-      await inbox.checkSchedules(ctx);
+      // Coalesce all three heartbeat-driven sources into ONE inject() per tick:
+      // if drainInbox injected on its own here, its idle-time inFlightSince
+      // write would gate out the deadline/schedule checks for a full heartbeat
+      // interval (§4, Finding 3). Sharing one parts array collapses that
+      // self-inflicted latency into a single coalesced user message.
+      const parts: Injection[] = [];
+      await inbox.drainInbox(ctx, parts);
+      await inbox.checkDeadlines(ctx, parts);
+      await inbox.checkSchedules(ctx, parts);
+      inbox.inject(parts, ctx);
     });
   });
 
