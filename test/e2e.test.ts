@@ -115,12 +115,9 @@ function seedThread(dir: string, id: string, opts: { stale?: boolean } = {}) {
       sessionFile: null,
       state: "open",
       status: "running",
-      lockEventId: null,
-      lockPartner: null,
-      lockType: null,
       holdReason: null,
-      subscriptions: [],
       obligations: [],
+      owed: [],
       barriers: [],
       startedAt: now,
       lastSeen: now,
@@ -129,21 +126,23 @@ function seedThread(dir: string, id: string, opts: { stale?: boolean } = {}) {
   );
 }
 
-function seedResult(dir: string, ownerThreadId: string, from: string, requestId: string) {
+/** Drop an envelope file into a thread's inbox the way a C1 actor would. */
+function seedEnvelope(
+  dir: string,
+  ownerThreadId: string,
+  msg: { from: string; body: string; id?: string; re?: string; expects?: true; urgency?: "high" },
+  name = `${Date.now()}-seed.json`,
+) {
   const inboxDir = join(dir, ".thread", "threads", ownerThreadId, "inbox");
   mkdirSync(inboxDir, { recursive: true });
-  writeFileSync(
-    join(inboxDir, `${Date.now()}-${requestId}.json`),
-    JSON.stringify({
-      from,
-      to: ownerThreadId,
-      type: "Result",
-      body: "done",
-      requestId,
-      delivery: "follow-up",
-      sentAt: new Date().toISOString(),
-    }),
-  );
+  const envelope = {
+    id: msg.id ?? `${msg.from}/${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+    to: ownerThreadId,
+    sentAt: new Date().toISOString(),
+    ...msg,
+  };
+  writeFileSync(join(inboxDir, name), JSON.stringify(envelope));
+  return envelope;
 }
 
 let tmpDir: string;
@@ -157,14 +156,13 @@ afterEach(() => {
 });
 
 describe("lifecycle", () => {
-  it("a run with no tool calls ends at done with no lock held", { timeout: TIMEOUT }, () => {
+  it("a run with no tool calls ends at done", { timeout: TIMEOUT }, () => {
     const r = runPi("Say the word 'hello' and nothing else.", tmpDir, { threadId: "t1" });
     assert.ok(r.ok);
 
     const s = readState(tmpDir, "t1");
     assert.ok(s !== null);
     assert.strictEqual(s.state, "done");
-    assert.strictEqual(s.lockEventId ?? null, null);
   });
 });
 
@@ -190,20 +188,7 @@ describe("cross-process durability", () => {
     "a message written before the target ever starts is drained on its first session_start",
     { timeout: TIMEOUT },
     () => {
-      const inboxDir = join(tmpDir, ".thread", "threads", "thread-a", "inbox");
-      mkdirSync(inboxDir, { recursive: true });
-      writeFileSync(
-        join(inboxDir, "1-manual.json"),
-        JSON.stringify({
-          from: "outside",
-          to: "thread-a",
-          type: "Update",
-          body: "seeded before start",
-          requestId: "update.outside.1",
-          delivery: "follow-up",
-          sentAt: new Date().toISOString(),
-        }),
-      );
+      seedEnvelope(tmpDir, "thread-a", { from: "outside", body: "seeded before start" });
 
       const r = runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
       assert.ok(r.ok);
@@ -235,11 +220,11 @@ describe("cross-process durability", () => {
       const delivered = JSON.parse(
         readFileSync(join(tmpDir, ".thread", "threads", "thread-a", "inbox", files[0]), "utf8"),
       );
-      // The model chooses the message type — Note/Update/Brief are all
-      // defensible for "let them know"; assert the reasonable set, not one
-      // hardcoded answer (that's what the unit layer is for).
-      assert.ok(["Note", "Update", "Brief"].includes(delivered.type));
+      // "Let them know" is a note or a request — either is defensible; what
+      // matters is the envelope is well-formed and correctly attributed.
       assert.strictEqual(delivered.from, "thread-b");
+      assert.match(delivered.id, /^thread-b\//);
+      assert.ok(!delivered.re, "an unprompted notification is not a reply");
 
       const r2 = runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
       assert.ok(r2.ok);
@@ -251,37 +236,12 @@ describe("cross-process durability", () => {
 
 describe("delegation", () => {
   it(
-    "a natural request to delegate work creates an obligation a matching Result clears",
-    { timeout: TIMEOUT * 2 },
-    () => {
-      seedThread(tmpDir, "thread-b");
-      const r = runPi("Ask thread-b to implement the login form. Then say done.", tmpDir, {
-        threadId: "thread-a",
-      });
-      assert.ok(r.ok);
-
-      let s = readState(tmpDir, "thread-a");
-      assert.strictEqual(s?.obligations?.length, 1);
-      assert.strictEqual(s.obligations[0].type, "Brief");
-      const requestId = s.obligations[0].requestId;
-
-      seedResult(tmpDir, "thread-a", "thread-b", requestId);
-      runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
-
-      s = readState(tmpDir, "thread-a");
-      assert.strictEqual(s?.obligations?.length ?? 0, 0);
-    },
-  );
-});
-
-describe("query", () => {
-  it(
-    "a natural question enters Listening until a matching Answer clears it",
+    "a natural request to delegate work creates an obligation a matching reply clears",
     { timeout: TIMEOUT * 2 },
     () => {
       seedThread(tmpDir, "thread-b");
       const r = runPi(
-        "Ask thread-b what the current status of the migration is. Then say done.",
+        "Ask thread-b to implement the login form and make sure you'll hear back when it's done. Then say done.",
         tmpDir,
         { threadId: "thread-a" },
       );
@@ -289,107 +249,54 @@ describe("query", () => {
 
       let s = readState(tmpDir, "thread-a");
       assert.strictEqual(s?.obligations?.length, 1);
-      assert.strictEqual(s.obligations[0].type, "Question");
-      assert.strictEqual(s.state, "listening");
-      const requestId = s.obligations[0].requestId;
+      const id = s.obligations[0].id;
+      assert.match(id, /^thread-a\//);
 
-      const inboxDir = join(tmpDir, ".thread", "threads", "thread-a", "inbox");
-      mkdirSync(inboxDir, { recursive: true });
-      writeFileSync(
-        join(inboxDir, "1-answer.json"),
-        JSON.stringify({
-          from: "thread-b",
-          to: "thread-a",
-          type: "Answer",
-          body: "60% done",
-          requestId,
-          delivery: "steer",
-          sentAt: new Date().toISOString(),
-        }),
-      );
+      seedEnvelope(tmpDir, "thread-a", { from: "thread-b", body: "done", re: id });
       runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
 
       s = readState(tmpDir, "thread-a");
       assert.strictEqual(s?.obligations?.length ?? 0, 0);
-      assert.strictEqual(s?.lockEventId ?? null, null);
     },
   );
 });
 
 describe("escalation", () => {
-  it("a natural 'I'm stuck' escalates to the parent as a Blocker", { timeout: TIMEOUT }, () => {
-    seedThread(tmpDir, "boss");
-    const r = runPi(
-      "You're stuck and can't proceed without a decision. Let your parent know. Then say done.",
-      tmpDir,
-      { threadId: "t1", parent: "boss" },
-    );
-    assert.ok(r.ok);
-
-    const s = readState(tmpDir, "t1");
-    assert.strictEqual(s?.obligations?.length, 1);
-    assert.strictEqual(s.obligations[0].type, "Blocker");
-    assert.strictEqual(s.obligations[0].to, "boss");
-    assert.strictEqual(s.state, "listening");
-    assert.strictEqual(s.lockPartner, "boss");
-  });
-});
-
-describe("sync rendezvous", () => {
   it(
-    "request lands as a lock on the partner across two real processes; close unwinds both",
-    { timeout: TIMEOUT * 4 },
+    "a natural 'I'm stuck' escalates to the parent as a tracked request",
+    { timeout: TIMEOUT },
     () => {
-      seedThread(tmpDir, "thread-b"); // sync to a never-seen id is now refused
-      const requestPrompt = `Call thread_sync_request with partner="thread-b". Then say done.`;
-      runPi(requestPrompt, tmpDir, { threadId: "thread-a" });
+      seedThread(tmpDir, "boss");
+      const r = runPi(
+        "You're stuck and can't proceed without a decision. Let your parent know you need one. Then say done.",
+        tmpDir,
+        { threadId: "t1", parent: "boss" },
+      );
+      assert.ok(r.ok);
 
-      const a1 = readState(tmpDir, "thread-a");
-      assert.match(a1?.lockEventId ?? "", /^sync\.thread-b\./);
-      const requestId = a1!.lockEventId;
-
-      // thread-b starts, drains the Sync message, and should end up locked with thread-a.
-      runPi("Say 'ok'.", tmpDir, { threadId: "thread-b" });
-      const b1 = readState(tmpDir, "thread-b");
-      assert.strictEqual(b1?.lockEventId, requestId);
-      assert.strictEqual(b1?.lockPartner, "thread-a");
-
-      // thread-b closes the sync — this notifies thread-a via an Answer.
-      runPi("Call thread_sync_close. Then say done.", tmpDir, { threadId: "thread-b" });
-      const b2 = readState(tmpDir, "thread-b");
-      assert.strictEqual(b2?.lockEventId ?? null, null);
-
-      // thread-a needs to run again to drain the close notice.
-      runPi("Say 'ok'.", tmpDir, { threadId: "thread-a" });
-      const a2 = readState(tmpDir, "thread-a");
-      assert.strictEqual(a2?.lockEventId ?? null, null);
+      const s = readState(tmpDir, "t1");
+      assert.strictEqual(s?.obligations?.length, 1);
+      assert.strictEqual(s.obligations[0].to, "boss");
     },
   );
 });
 
 describe("envelope comprehension", () => {
   it(
-    "a received Question carries its requestId so the model can correctly echo it back",
+    "a received request carries its id so the model can correctly echo it back as re",
     { timeout: TIMEOUT },
     () => {
       seedThread(tmpDir, "boss");
-      const inboxDir = join(tmpDir, ".thread", "threads", "t1", "inbox");
-      mkdirSync(inboxDir, { recursive: true });
-      writeFileSync(
-        join(inboxDir, "1-q.json"),
-        JSON.stringify({
-          from: "boss",
-          to: "t1",
-          type: "Question",
-          body: "What is 2+2? Reply with just the number.",
-          requestId: "question.boss.42",
-          delivery: "steer",
-          sentAt: new Date().toISOString(),
-        }),
-      );
+      seedEnvelope(tmpDir, "t1", {
+        from: "boss",
+        id: "boss/QTEST42",
+        body: "What is 2+2? Reply with just the number.",
+        expects: true,
+        urgency: "high",
+      });
 
       const r = runPi(
-        "If you received a question from another thread, answer it via the tool indicated in the message. Then say done.",
+        "If you received a request from another thread, answer it via the tool indicated in the message. Then say done.",
         tmpDir,
         { threadId: "t1" },
       );
@@ -400,9 +307,12 @@ describe("envelope comprehension", () => {
       const reply = JSON.parse(
         readFileSync(join(tmpDir, ".thread", "threads", "boss", "inbox", bossInbox[0]), "utf8"),
       );
-      assert.strictEqual(reply.type, "Answer");
-      assert.strictEqual(reply.requestId, "question.boss.42");
+      assert.strictEqual(reply.re, "boss/QTEST42");
       assert.strictEqual(reply.from, "t1");
+
+      // The owed record must be settled by the reply.
+      const s = readState(tmpDir, "t1");
+      assert.strictEqual(s?.owed?.length ?? 0, 0);
     },
   );
 });
@@ -432,7 +342,7 @@ describe("fan-out and wait", () => {
       seedThread(tmpDir, "bob");
 
       const r1 = runPi(
-        `Send a Brief to alice and a separate Brief to bob asking them to review the PR. Note the requestId each reply gives you, then call thread_await waiting on both of those requestIds together (mode="all"). Then say done.`,
+        `Send a tracked request (expects=true) to alice and a separate one to bob asking them to review the PR. Note the id each send returns, then call thread_wait waiting on both of those ids together (mode="all"). Then say done.`,
         tmpDir,
         { threadId: "t1" },
       );
@@ -442,16 +352,21 @@ describe("fan-out and wait", () => {
       assert.strictEqual(s?.obligations?.length, 2);
       assert.strictEqual(s?.barriers?.length, 1);
 
-      // Seed a Result per unique id across obligations and the barrier — the
-      // model occasionally mistranscribes an id into thread_await, and this
+      // Seed a reply per unique id across obligations and the barrier — the
+      // model occasionally mistranscribes an id into thread_wait, and this
       // test is about the resolution mechanics, not model copying accuracy.
       const ids = new Set<string>([
-        ...s.obligations.map((o: { requestId: string }) => o.requestId),
+        ...s.obligations.map((o: { id: string }) => o.id),
         ...s.barriers[0].pending,
       ]);
       let i = 0;
-      for (const requestId of ids) {
-        seedResult(tmpDir, "t1", ++i === 1 ? "alice" : "bob", requestId);
+      for (const id of ids) {
+        seedEnvelope(
+          tmpDir,
+          "t1",
+          { from: ++i === 1 ? "alice" : "bob", body: "done", re: id },
+          `${i}-reply.json`,
+        );
       }
 
       const r2 = runPi("Say 'ok'.", tmpDir, { threadId: "t1" });
@@ -464,20 +379,32 @@ describe("fan-out and wait", () => {
   );
 });
 
-describe("subscribe and emit", () => {
+describe("scheduled self-wake", () => {
   it(
-    "a self-triggered event delivers the subscribed message and clears the subscription",
-    { timeout: TIMEOUT },
+    "a natural 'remind yourself shortly' becomes a deliverAfter self-send that arrives once due",
+    { timeout: TIMEOUT * 2 },
     () => {
       const r = runPi(
-        `Subscribe a message to fire when the event "ready" happens, then trigger that event yourself. Then say done.`,
+        "Schedule a reminder to yourself for 2 seconds from now saying 'check the build'. Then say done.",
         tmpDir,
         { threadId: "t1" },
       );
       assert.ok(r.ok);
 
-      const s = readState(tmpDir, "t1");
-      assert.strictEqual(s?.subscriptions?.length ?? 0, 0);
+      // The wake is a durable self-addressed envelope, held until due.
+      const pending = inboxFiles(tmpDir, "t1");
+      assert.strictEqual(pending.length, 1);
+      const msg = JSON.parse(
+        readFileSync(join(tmpDir, ".thread", "threads", "t1", "inbox", pending[0]), "utf8"),
+      );
+      assert.strictEqual(msg.to, "t1");
+      assert.strictEqual(msg.from, "t1");
+      assert.ok(msg.deliverAfter);
+
+      // By the next run it's due — boot drain delivers and clears it.
+      const r2 = runPi("Say 'ok'.", tmpDir, { threadId: "t1" });
+      assert.ok(r2.ok);
+      assert.strictEqual(inboxFiles(tmpDir, "t1").length, 0);
     },
   );
 });

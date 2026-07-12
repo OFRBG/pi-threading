@@ -1,7 +1,7 @@
-import { connect, rpc } from "@restatedev/restate-sdk-clients";
-import type { StateFile, InboxMessage, ThreadSummary, ScheduledWake } from "../core/types";
+import { connect } from "@restatedev/restate-sdk-clients";
+import type { StateFile, Envelope, ThreadSummary } from "../core/types";
 import { toSummary } from "../core/types";
-import type { StorageAdapter } from "../adapter/types";
+import type { StorageAdapter, JournalAdapter } from "../adapter/types";
 import type { ThreadObjectApi, ThreadRegistryApi } from "./service";
 
 const ThreadObjectRef = { name: "Thread" } as ThreadObjectApi;
@@ -13,8 +13,12 @@ const POLL_MS = 2000;
  *  a hosted handler. All storage/mailbox operations become RPCs into the
  *  `Thread`/`ThreadRegistry` virtual objects defined in ./service.ts (run
  *  separately via `npm run restate:serve`, registered with a self-hosted
- *  `restate-server`). See README.md "Running with the Restate adapter". */
-export function createRestateAdapter(opts: { url?: string }): StorageAdapter {
+ *  `restate-server`). See README.md "Running with the Restate adapter".
+ *
+ *  deliverAfter needs no client-side machinery here: the service holds
+ *  future envelopes out of drainInbox until due, and its own durable delayed
+ *  self-invocation revives a stopped thread when one comes due. */
+export function createRestateAdapter(opts: { url?: string }): StorageAdapter & JournalAdapter {
   const ingress = connect({ url: opts.url ?? "http://localhost:8080" });
   const thread = (id: string) => ingress.objectClient(ThreadObjectRef, id);
 
@@ -54,11 +58,11 @@ export function createRestateAdapter(opts: { url?: string }): StorageAdapter {
       return (await thread(threadId).loadState()) != null;
     },
 
-    async enqueueMessage(targetId: string, message: InboxMessage) {
-      await thread(targetId).enqueueMessage(message);
+    async enqueueMessage(message: Envelope) {
+      await thread(message.to).enqueueMessage(message);
     },
 
-    async drainInbox(threadId: string): Promise<InboxMessage[]> {
+    async drainInbox(threadId: string): Promise<Envelope[]> {
       return thread(threadId).drainInbox();
     },
 
@@ -69,31 +73,6 @@ export function createRestateAdapter(opts: { url?: string }): StorageAdapter {
       // delivery, same as the local backend).
       const timer = setInterval(cb, POLL_MS);
       return () => clearInterval(timer);
-    },
-
-    async scheduleWake(threadId: string, wake: ScheduledWake) {
-      // Persist first — mirrors LocalFsAdapter.scheduleWake's read-modify-
-      // write, so thread_status sees it immediately regardless of backend —
-      // then arm the durable delayed invocation that actually fires it.
-      const s = await thread(threadId).loadState();
-      if (s) {
-        s.schedules = [...s.schedules, wake];
-        await thread(threadId).saveState(s);
-      }
-      const delayMs = Math.max(0, new Date(wake.fireAt).getTime() - Date.now());
-      await ingress
-        .objectSendClient(ThreadObjectRef, threadId)
-        .fireWake(wake, rpc.sendOpts({ delay: delayMs }));
-    },
-
-    async cancelWake(threadId: string, id: string) {
-      // Restate's client API can't cancel an already-armed delayed send —
-      // fireWake() re-checks the persisted schedules list at fire time and
-      // no-ops if it's gone, so removing it from state here is sufficient.
-      const s = await thread(threadId).loadState();
-      if (!s) return;
-      s.schedules = s.schedules.filter(w => w.id !== id);
-      await thread(threadId).saveState(s);
     },
   };
 }

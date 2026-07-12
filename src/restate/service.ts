@@ -1,7 +1,7 @@
 import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk";
 import { spawn } from "node:child_process";
-import type { StateFile, InboxMessage, ScheduledWake } from "../core/types";
+import type { StateFile, Envelope } from "../core/types";
 import { STALE_MS } from "../core/types";
 import { buildWakeLaunch } from "./wake-launch";
 
@@ -29,7 +29,11 @@ export const ThreadRegistry = restate.object({
 
 /**
  * One durable instance per thread id, holding that thread's state/journal/
- * inbox in Restate's per-key state instead of files on disk.
+ * inbox in Restate's per-key state instead of files on disk. This is the
+ * Restate binding of the Rev-8 store contract: the mailbox holds envelopes,
+ * `deliverAfter` envelopes stay queued until due (drain filters them), and a
+ * durable delayed self-invocation revives a stopped thread when one comes
+ * due — the one thing the local-fs backend can never do.
  */
 export const ThreadObject = restate.object({
   name: "Thread",
@@ -59,48 +63,60 @@ export const ThreadObject = restate.object({
       return (await ctx.get<string>("journal")) ?? null;
     }),
 
-    enqueueMessage: async (ctx: ObjectContext, message: InboxMessage) => {
-      const inbox = (await ctx.get<InboxMessage[]>("inbox")) ?? [];
-      inbox.push(message);
-      ctx.set("inbox", inbox);
+    enqueueMessage: async (ctx: ObjectContext, message: Envelope) => {
+      const inbox = (await ctx.get<Envelope[]>("inbox")) ?? [];
+      // Enqueue idempotence (§7.6): a retry with the same id replaces its
+      // own envelope instead of duplicating it.
+      const next = inbox.filter(m => m.id !== message.id);
+      next.push(message);
+      ctx.set("inbox", next);
+      // A future-dated envelope arms a durable delayed self-check: when it
+      // comes due, deliverDue revives the thread if no live process would
+      // otherwise drain it.
+      if (message.deliverAfter) {
+        const delayMs = new Date(message.deliverAfter).getTime() - Date.now();
+        if (delayMs > 0) {
+          ctx
+            .objectSendClient(ThreadObject, ctx.key)
+            .deliverDue(message.id, restate.rpc.sendOpts({ delay: delayMs }));
+        }
+      }
     },
 
-    drainInbox: async (ctx: ObjectContext): Promise<InboxMessage[]> => {
-      const inbox = (await ctx.get<InboxMessage[]>("inbox")) ?? [];
-      ctx.set("inbox", []);
-      return inbox;
+    drainInbox: async (ctx: ObjectContext): Promise<Envelope[]> => {
+      const inbox = (await ctx.get<Envelope[]>("inbox")) ?? [];
+      const now = Date.now();
+      const due = inbox.filter(m => !m.deliverAfter || new Date(m.deliverAfter).getTime() <= now);
+      const held = inbox.filter(m => m.deliverAfter && new Date(m.deliverAfter).getTime() > now);
+      ctx.set("inbox", held);
+      return due;
     },
 
     /**
-     * Invoked by Restate's own durable delayed-send (armed via
-     * RestateAdapter.scheduleWake's `rpc.sendOpts({ delay })`) — this is the
-     * one thing the local-fs backend can never do: fire even if the `pi`
-     * process that armed it has since exited. Spawns `pi` to actually wake
-     * the thread if it isn't currently live.
-     *
-     * Cancellation caveat: Restate's public client API has no "cancel a
-     * delayed send" call, so a cancelled wake still fires this handler at
-     * the original time — it re-checks the *current* persisted schedules
-     * list and no-ops if the wake was removed (RestateAdapter.cancelWake
-     * strips it from state) or already nudged.
+     * Fired by the durable delayed send armed in enqueueMessage when a
+     * deliverAfter envelope comes due. If the thread is live, its own
+     * heartbeat drain picks the envelope up — no-op. If it's stopped, spawn
+     * `pi` to revive it; the revived process drains the due envelope at boot.
      */
-    fireWake: async (ctx: ObjectContext, wake: ScheduledWake) => {
+    deliverDue: async (ctx: ObjectContext, envelopeId: string) => {
+      const inbox = (await ctx.get<Envelope[]>("inbox")) ?? [];
+      const msg = inbox.find(m => m.id === envelopeId);
+      if (!msg) return; // already drained (or cancelled by draining) — nothing to do
       const state = await ctx.get<StateFile>("state");
       if (!state) return;
-      const current = state.schedules.find(w => w.id === wake.id);
-      if (!current || current.nudged) return;
-      current.nudged = true;
-      ctx.set("state", state);
-
       const isLive =
         state.status === "running" && Date.now() - new Date(state.lastSeen).getTime() < STALE_MS;
-      if (isLive) return; // the running process's own heartbeat/checkSchedules already covers this
-      await ctx.run("spawn pi to wake stopped thread", async () => {
+      if (isLive) return; // the running process's own heartbeat drain covers this
+      await ctx.run("spawn pi to deliver due envelope", async () => {
         // state.cwd is the workspace the thread ran in — reviving it anywhere
         // else would put its work (and any .thread/ artifacts) in the wrong
         // place. stdio "ignore" attaches /dev/null, which `pi --print` needs:
         // it reads stdin to EOF and hangs forever on an open pipe.
-        const launch = buildWakeLaunch(ctx.key, wake, state.cwd);
+        const launch = buildWakeLaunch(
+          ctx.key,
+          `[delayed envelope due #${msg.id}] — drain your inbox.`,
+          state.cwd,
+        );
         const proc = spawn(launch.cmd, launch.args, {
           cwd: launch.cwd,
           detached: true,

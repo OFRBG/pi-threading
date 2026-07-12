@@ -66,9 +66,8 @@ export function journalMode(pi: ExtensionAPI): "turn" | "done" | "off" {
 export function journalSignature(store: ThreadStore): string {
   return [
     store.state,
-    store.lockEventId ?? "",
     store.obligations
-      .map(o => o.requestId)
+      .map(o => o.id)
       .sort()
       .join(","),
     store.barriers
@@ -170,6 +169,10 @@ export function journalForkArgs(sessionFile: string, sessionDir: string, model?:
  *  Fire-and-forget: runs in the background after turn_end/agent_end, the
  *  main thread never pauses on it. */
 export function forkJournalEntry(store: ThreadStore, sessionFile: string, model?: string): void {
+  // The journal channel is an optional backend extension (PROTOCOL-FORMALISM
+  // §5) — on a backend without it there is nowhere to append, so don't pay
+  // for the forked model call either.
+  if (!store.adapter.appendJournal) return;
   const tmpSes = fs.mkdtempSync(path.join(os.tmpdir(), "pi-journal-"));
   let out = "";
   let errOut = "";
@@ -200,10 +203,10 @@ export function forkJournalEntry(store: ThreadStore, sessionFile: string, model?
         );
         return;
       }
-      const existing = await store.adapter.readJournal(store.threadId);
+      const existing = await store.adapter.readJournal?.(store.threadId);
       if (isDuplicateOfLastEntry(existing, entry)) return;
       const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
-      await store.adapter.appendJournal(store.threadId, `\n<!-- ${ts} -->\n${entry}\n`);
+      await store.adapter.appendJournal?.(store.threadId, `\n<!-- ${ts} -->\n${entry}\n`);
     })();
   });
 }

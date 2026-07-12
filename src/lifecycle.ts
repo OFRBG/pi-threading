@@ -5,15 +5,14 @@ import { threadModelPrompt } from "./core/system-prompt";
 import { journalMode, shouldJournal } from "./journal";
 
 /** Wiring into pi's event stream: state transitions across the turn cycle,
- *  the sync-channel confusion nudge, journal cadence triggers, and the
- *  thread-model system prompt. */
+ *  the silent-debtor nudge, journal cadence triggers, and the thread-model
+ *  system prompt. */
 
-/** Where a thread settles between turns: waiting states and On Hold must
- *  survive the turn boundary instead of being stomped to open/done. */
-function restingState(store: ThreadStore, whenUnlocked: ThreadState): ThreadState {
+/** Where a thread settles between turns: On Hold must survive the turn
+ *  boundary instead of being stomped to open/done (§11.1). */
+function restingState(store: ThreadStore, whenFree: ThreadState): ThreadState {
   if (store.state === "on-hold") return "on-hold";
-  if (store.lockEventId) return store.lockType === "sync" ? "in-sync" : "listening";
-  return whenUnlocked;
+  return whenFree;
 }
 
 /** True once this session has stamped its own thread-identity entry — the
@@ -32,12 +31,13 @@ function hasThreadIdentity(ctx: ExtensionContext): boolean {
 
 export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox) {
   let toolUsedThisTurn = false;
-  // Opt-in gate: this extension only turns a directory into a pi-threading
-  // workspace when explicitly asked — --thread-id on this launch, or a
-  // thread-identity entry already stamped into this session's own history
-  // from an earlier one. Every handler below no-ops while this is false, so
-  // an unrelated session never gets a .thread/ dir, a random identity, the
-  // thread_* tools, or the thread-model system prompt it never asked for.
+  // Opt-in gate (§2.3 — participation is opt-in): this extension only turns
+  // a directory into a pi-threading workspace when explicitly asked —
+  // --thread-id on this launch, or a thread-identity entry already stamped
+  // into this session's own history from an earlier one. Every handler below
+  // no-ops while this is false, so an unrelated session (including forked
+  // children, which never inherit participation) never gets a .thread/ dir,
+  // a random identity, the thread_* tools, or the thread-model system prompt.
   let active = false;
 
   pi.on("session_start", async (_event, ctx) => {
@@ -58,17 +58,16 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
     setImmediate(() => void inbox.drainInbox(ctx));
     store.startWatcher(inbox.drainInbox, ctx);
     // The heartbeat also re-attempts the drain: it is the retry path for
-    // messages the injection gate left on disk (compaction, idle preflight).
+    // messages the injection gate left on disk (compaction, idle preflight)
+    // and for deliverAfter envelopes that have come due.
     store.startHeartbeat(async () => {
-      // Coalesce all three heartbeat-driven sources into ONE inject() per tick:
-      // if drainInbox injected on its own here, its idle-time inFlightSince
-      // write would gate out the deadline/schedule checks for a full heartbeat
-      // interval (§4, Finding 3). Sharing one parts array collapses that
-      // self-inflicted latency into a single coalesced user message.
+      // Coalesce both heartbeat-driven sources into ONE inject() per tick
+      // (§7.5, Errata 3): if drainInbox injected on its own here, its
+      // idle-time inFlightSince write would gate out the deadline check for
+      // a full heartbeat interval.
       const parts: Injection[] = [];
       await inbox.drainInbox(ctx, parts);
       await inbox.checkDeadlines(ctx, parts);
-      await inbox.checkSchedules(ctx, parts);
       inbox.inject(parts, ctx);
     });
   });
@@ -95,7 +94,6 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
     if (!active) return;
     inbox.noteRunStarted();
     const wasOnHold = store.state === "on-hold";
-    store.sentToPartnerThisTurn = false;
     toolUsedThisTurn = false;
     await store.transition("thinking", ctx);
     if (wasOnHold) {
@@ -116,48 +114,24 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
     if (!active) return;
     await store.transition(restingState(store, "open"), ctx);
 
-    // Channel-confusion guard: a pure-text turn while In Sync is the classic
-    // failure — the model "talks" to its partner but only the user sees it.
-    // Inject a passive reminder (no turn trigger — a forced turn here goads
-    // the model into acting, e.g. closing the sync just to have something to
-    // do). It surfaces at the next natural turn; once per silence.
-    if (
-      store.lockType === "sync" &&
-      store.lockPartner &&
-      !toolUsedThisTurn &&
-      !store.sentToPartnerThisTurn &&
-      !store.nudgedSinceLastSend
-    ) {
-      store.nudgedSinceLastSend = true;
-      pi.sendMessage(
-        {
-          customType: "thread-sync-reminder",
-          content: `[thread-system] Automated reminder (not from the human): your last plain-text message reached only the human user — not your sync partner ${store.lockPartner}. If it was meant for them, resend it via thread_send to="${store.lockPartner}" type="Note". If you were just waiting for them, no action is needed.`,
-          display: true,
-        },
-        { triggerTurn: false, deliverAs: "nextTurn" },
-      );
-    }
-
-    // Owed-reply channel-confusion guard: the general case of the guard
-    // above — a thread holding a Brief/Question/Blocker's owed reply that
-    // ends a pure-text turn instead of answering via thread_send. Excludes
-    // any locked state (the sync case above already covers it; a thread
-    // Listening on its own sub-Question while also owing a reply is expected
-    // to go quiet for a turn). Gated by owedNudgePending so a long run of
-    // consecutive silent+owed turns queues exactly one reminder, not one per
-    // turn; agent_end re-arms the gate so a persistently silent thread still
-    // gets one fresh, escalating nudge per run rather than exactly one ever.
+    // Silent-debtor nudge (§9.4): a thread holding owed replies that ends a
+    // pure-text turn instead of replying via thread_send — the classic
+    // channel confusion, where the model "answers" but only the human sees
+    // it. Inject a passive reminder (no turn trigger — a forced turn goads
+    // the model into acting just to have something to do). Gated by
+    // owedNudgePending so a long run of consecutive silent+owed turns queues
+    // exactly one reminder, not one per turn; agent_end re-arms the gate so
+    // a persistently silent thread still gets one fresh, escalating nudge
+    // per run rather than exactly one ever. The reminder solicits the
+    // "Standing by" canary — an acknowledged hold is conforming (§9.4/§9.5).
     if (toolUsedThisTurn) {
       store.owedSilentStreak = 0;
       store.owedNudgePending = false;
-    } else if (!store.lockEventId && store.owed.length > 0) {
+    } else if (store.owed.length > 0) {
       store.owedSilentStreak = Math.min(store.owedSilentStreak + 1, 3);
       if (!store.owedNudgePending) {
         store.owedNudgePending = true;
-        const items = store.owed
-          .map(o => `${o.from} (${o.type === "Brief" ? "Result" : "Answer"} #${o.requestId})`)
-          .join(", ");
+        const items = store.owed.map(o => `${o.from} (re #${o.id})`).join(", ");
         const escalation =
           store.owedSilentStreak >= 2
             ? ` This is turn ${store.owedSilentStreak} with no reply — restating it as plain text is invisible to them.`
@@ -165,7 +139,7 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
         pi.sendMessage(
           {
             customType: "thread-owed-reminder",
-            content: `[thread-system] Automated reminder (not from the human): you still owe a reply to ${items}. Plain text reaches only the human — never them. Reply for real via thread_send.${escalation} Still working on it? No action needed.`,
+            content: `[thread-system] Automated reminder (not from the human): you still owe a reply to ${items}. Plain text reaches only the human — never them. Reply for real via thread_send with the re id.${escalation} Still working on it? Acknowledge with "Standing by". Missing information from the requester? Pass the ball: reply with what you need and expects=true.`,
             display: true,
           },
           { triggerTurn: false, deliverAs: "nextTurn" },
@@ -189,7 +163,7 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
     // Re-arm the owed-reply nudge gate: each new run gets one fresh chance to
     // remind, while owedSilentStreak (untouched here) keeps climbing across
     // consecutive silent runs — that's what makes the streak>=2 escalation
-    // in turn_end's owed-reply guard reachable at all.
+    // in turn_end's guard reachable at all.
     store.owedNudgePending = false;
     const mode = journalMode(pi);
     const write =

@@ -5,16 +5,26 @@ import type { ThreadStore, ThreadState, ThreadSummary, StateFile } from "./core/
 import { HEARTBEAT_MS } from "./core/types";
 import { nowIso } from "./core/time";
 import { forkJournalEntry } from "./journal";
-import type { StorageAdapter } from "./adapter/types";
+import type { ThreadAdapter } from "./adapter/types";
 import { createLocalFsAdapter } from "./adapter/local-fs";
 
 /** The ThreadStore: this thread's identity and mutable coordination state,
  *  restored from the storage adapter at init, persisted on every change, kept
  *  fresh by the heartbeat, and live-drained by the inbox watcher. */
 
+const KNOWN_STATES: readonly ThreadState[] = [
+  "idle",
+  "thinking",
+  "working",
+  "open",
+  "on-hold",
+  "stopped",
+  "done",
+];
+
 export function createThreadStore(
   pi: ExtensionAPI,
-  adapter: StorageAdapter = createLocalFsAdapter(),
+  adapter: ThreadAdapter = createLocalFsAdapter(),
 ): ThreadStore {
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   let stopWatching: (() => void) | null = null;
@@ -31,17 +41,10 @@ export function createThreadStore(
     startedAt: "",
     state: "idle",
     status: "running",
-    lockEventId: null,
-    lockPartner: null,
-    lockType: null,
     holdReason: null,
-    subscriptions: [],
     obligations: [],
     owed: [],
     barriers: [],
-    schedules: [],
-    sentToPartnerThisTurn: false,
-    nudgedSinceLastSend: false,
     owedNudgePending: false,
     owedSilentStreak: 0,
     lastJournalSignature: null,
@@ -67,15 +70,10 @@ export function createThreadStore(
         sessionFile: store.sessionFile,
         state: store.state,
         status: store.status,
-        lockEventId: store.lockEventId,
-        lockPartner: store.lockPartner,
-        lockType: store.lockType,
         holdReason: store.holdReason,
-        subscriptions: store.subscriptions,
         obligations: store.obligations,
         owed: store.owed,
         barriers: store.barriers,
-        schedules: store.schedules,
         startedAt: store.startedAt,
         lastSeen: nowIso(),
         updatedAt: nowIso(),
@@ -115,34 +113,23 @@ export function createThreadStore(
 
       store.threadDir = path.join(store.threadsRootDir, store.threadId);
 
-      // Restore previous state if present.
+      // Restore previous state if present. Debts and barriers are durable
+      // waits — restored unconditionally (§13.2): a reply may arrive while
+      // we're down, and the id a reply must echo has to survive the session
+      // that received the envelope. No state encodes a wait anymore (§11.2),
+      // so the only boot repair is done/stopped → idle; states this revision
+      // no longer knows (old files) settle to open.
       const s = await store.adapter.loadState(store.threadId);
       if (s) {
-        // Reply locks (Question/Blocker) are durable waits — the Answer may
-        // arrive while we're down, so they survive restarts. Sync locks are
-        // live conversations and don't (legacy files without lockType too).
-        const keepLock = Boolean(s.lockEventId) && s.lockType === "reply";
-        store.lockEventId = keepLock ? s.lockEventId : null;
-        store.lockPartner = keepLock ? (s.lockPartner ?? null) : null;
-        store.lockType = keepLock ? "reply" : null;
-        const stale = keepLock ? null : s.lockEventId;
-        store.subscriptions = (s.subscriptions ?? []).filter(sub => sub.eventId !== stale);
-        store.obligations = (s.obligations ?? []).filter(ob => ob.requestId !== stale);
-        store.barriers = s.barriers ?? [];
-        // Owed replies are debts to *other* threads, not tied to our own lock
-        // — restored unconditionally, same precedent as barriers. This is the
-        // whole point of recording them: the requestId a Result/Answer must
-        // echo has to survive the session that received the envelope.
+        store.obligations = s.obligations ?? [];
         store.owed = s.owed ?? [];
-        // Scheduled wakes are thread-local, not tied to any lock — restored
-        // unconditionally, same precedent as barriers.
-        store.schedules = s.schedules ?? [];
+        store.barriers = s.barriers ?? [];
         store.state =
           s.state === "done" || s.state === "stopped"
             ? "idle"
-            : s.state === "in-sync" || (s.state === "listening" && !keepLock)
-              ? "open"
-              : s.state;
+            : KNOWN_STATES.includes(s.state)
+              ? s.state
+              : "open";
         store.holdReason = store.state === "on-hold" ? (s.holdReason ?? null) : null;
         store.parent = store.parent ?? s.parent ?? null;
         store.role = store.role ?? s.role ?? null;
@@ -163,9 +150,9 @@ export function createThreadStore(
       store.stopHeartbeat();
       store.stopWatcher();
       if (reason === "quit") {
-        // Deliberate waiting states survive a clean exit (the reply arrives in
+        // Deliberate resting states survive a clean exit (replies arrive in
         // the durable inbox); only interrupted work reads as "stopped".
-        const preserved = new Set(["done", "listening", "on-hold"]);
+        const preserved = new Set(["done", "on-hold"]);
         if (!preserved.has(store.state)) store.state = "stopped";
         store.status = "stopped";
         await store.persist();
@@ -181,7 +168,9 @@ export function createThreadStore(
     },
 
     async readJournal(threadId: string): Promise<string | undefined> {
-      return store.adapter.readJournal(threadId);
+      // The journal channel is an optional backend extension (§5) —
+      // undefined on backends without it.
+      return store.adapter.readJournal?.(threadId);
     },
 
     forkJournal(sessionFile: string) {
@@ -192,7 +181,7 @@ export function createThreadStore(
     startHeartbeat(onTick?: () => void | Promise<void>) {
       // session_start can fire more than once in a process lifetime (e.g. a
       // session reload) — dispose the previous interval or it leaks and
-      // double-fires every deadline/schedule check.
+      // double-fires every deadline check.
       if (heartbeat) clearInterval(heartbeat);
       heartbeat = setInterval(() => {
         void (async () => {

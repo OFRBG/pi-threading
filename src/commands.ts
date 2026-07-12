@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import type { ThreadStore, MessageType } from "./core/types";
+import type { ThreadStore } from "./core/types";
 import { formatThreadLine } from "./core/format";
 import { resumeThread, suspendThread } from "./core/thread-ops";
 import type { Inbox } from "./inbox";
@@ -27,26 +27,10 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
       await ctx.waitForIdle();
       const journal = await store.readJournal(store.threadId);
       const lines = journal ? journal.split("\n").slice(-12).join("\n") : "(no journal yet)";
-      const lockDesc = `${store.lockEventId ?? "none"}${store.lockPartner ? ` (with ${store.lockPartner})` : ""}`;
       ctx.ui.notify(
-        `Id: ${store.threadId} | State: ${store.state} | Status: ${store.status} | Lock: ${lockDesc} | Subs: ${store.subscriptions.length} | Obligations: ${store.obligations.length} | Owed: ${store.owed.length} | Barriers: ${store.barriers.length} | Schedules: ${store.schedules.length}\n\n${lines}`,
+        `Id: ${store.threadId} | State: ${store.state} | Status: ${store.status} | Obligations: ${store.obligations.length} | Owed: ${store.owed.length} | Barriers: ${store.barriers.length}\n\n${lines}`,
         "info",
       );
-    },
-  });
-
-  pi.registerCommand("/thread-emit", {
-    description: "Emit a named event: /thread-emit <eventId>",
-    async handler(args, ctx) {
-      if (!checkActive(store, ctx)) return;
-      const eventId = args.trim();
-      if (!eventId) {
-        ctx.ui.notify("Usage: /thread-emit <eventId>", "warning");
-        return;
-      }
-      const { notified, parts } = await inbox.fireSubscribers(eventId);
-      inbox.inject(parts, ctx);
-      ctx.ui.notify(`Event "${eventId}" fired. ${notified} subscriber(s) notified.`, "info");
     },
   });
 
@@ -64,24 +48,14 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
   });
 
   pi.registerCommand("/thread-send", {
-    description: "Send a message to another thread: /thread-send <to> <type> <body...>",
+    description: "Send a note to another thread: /thread-send <to> <body...>",
     async handler(args, ctx) {
       if (!checkActive(store, ctx)) return;
       const parts = args.trim().split(/\s+/);
-      const [to, type, ...bodyParts] = parts;
+      const [to, ...bodyParts] = parts;
       const body = bodyParts.join(" ");
-      const validTypes: MessageType[] = [
-        "Brief",
-        "Note",
-        "Question",
-        "Answer",
-        "Update",
-        "Result",
-        "Blocker",
-        "Sync",
-      ];
-      if (!to || !type || !body || !validTypes.includes(type as MessageType)) {
-        ctx.ui.notify(`Usage: /thread-send <to> <${validTypes.join("|")}> <body...>`, "warning");
+      if (!to || !body) {
+        ctx.ui.notify("Usage: /thread-send <to> <body...>", "warning");
         return;
       }
       if (to === store.threadId) {
@@ -95,11 +69,13 @@ export function registerCommands(pi: ExtensionAPI, store: ThreadStore, inbox: In
           return;
         }
         const missing = new Set(await inbox.findMissingTargets(targets));
-        const sent = await inbox.sendToMany(targets, type as MessageType, body);
+        // Operator sends are urgent by default — a human steering a thread
+        // wants it seen at the next opening, not when the target goes idle.
+        const sent = await inbox.sendToMany(targets, body, { urgency: "high" });
         for (const s of sent) {
           const unseen = missing.has(s.to);
           ctx.ui.notify(
-            `${type} sent to ${s.to}. requestId=${s.requestId} (${s.delivered}).${unseen ? ` Warning: "${s.to}" has never been seen in this workspace — delivers only if a thread with that id starts.` : ""}`,
+            `Sent to ${s.to}. id=${s.id} (${s.delivered}).${unseen ? ` Warning: "${s.to}" has never been seen in this workspace — delivers only if a thread with that id starts.` : ""}`,
             unseen ? "warning" : "info",
           );
         }

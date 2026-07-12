@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createLocalFsAdapter } from "./local-fs";
-import type { StorageAdapter } from "./types";
+import type { ThreadAdapter } from "./types";
 import { createRestateAdapter } from "../restate/adapter";
 
 export interface AdapterOptions {
@@ -8,7 +8,7 @@ export interface AdapterOptions {
   url?: string;
 }
 
-export type AdapterFactory = (opts: AdapterOptions) => StorageAdapter;
+export type AdapterFactory = (opts: AdapterOptions) => ThreadAdapter;
 
 /** Backend registry — the pluggability point for pi-threading's storage
  *  layer. Adding a new backend (Temporal, etc.) means writing one factory
@@ -20,7 +20,7 @@ export const adapterRegistry: Record<string, AdapterFactory> = {
 
 /** Resolve the configured backend from CLI flags: `--thread-storage
  *  <name>` (default "local") and `--thread-storage-url <url>`. */
-export function createConfiguredAdapter(pi: ExtensionAPI): StorageAdapter {
+export function createConfiguredAdapter(pi: ExtensionAPI): ThreadAdapter {
   const name = pi.getFlag("thread-storage");
   const backend = typeof name === "string" && name ? name : "local";
   const factory = adapterRegistry[backend];

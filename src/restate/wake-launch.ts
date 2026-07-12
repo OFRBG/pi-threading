@@ -1,8 +1,6 @@
-import type { ScheduledWake } from "../core/types";
-
-/** How the companion service revives a stopped thread when a durable wake
- *  fires. Kept SDK-free and pure so it's unit-testable without a
- *  restate-server.
+/** How the companion service revives a stopped thread when a deliverAfter
+ *  envelope comes due. Kept SDK-free and pure so it's unit-testable without
+ *  a restate-server.
  *
  *  The spawned `pi` must be told where its state lives: without
  *  `--thread-storage restate` it would boot against the local-fs backend and
@@ -22,7 +20,7 @@ import type { ScheduledWake } from "../core/types";
  */
 export function buildWakeLaunch(
   threadId: string,
-  wake: ScheduledWake,
+  prompt: string,
   cwd: string,
   env: Record<string, string | undefined> = process.env,
 ): { cmd: string; args: string[]; cwd: string } {
@@ -35,8 +33,9 @@ export function buildWakeLaunch(
     env.RESTATE_INGRESS_URL ?? "http://localhost:8080",
   ];
   if (env.PI_THREAD_EXTENSION) args.push("--extension", env.PI_THREAD_EXTENSION);
-  // Same envelope shape the live heartbeat's checkSchedules delivers, so a
-  // wake reads identically whether or not the process survived to see it.
-  args.push("--print", `[scheduled wake #${wake.id}]: ${wake.reason}`);
+  // The revived process boots, drains its inbox (which now contains the due
+  // envelope), and sees this prompt — so a wake reads identically whether or
+  // not the process survived to see it.
+  args.push("--print", prompt);
   return { cmd: env.PI_BIN ?? "pi", args, cwd };
 }

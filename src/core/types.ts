@@ -1,82 +1,58 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { StorageAdapter } from "../adapter/types";
+import type { ThreadAdapter } from "../adapter/types";
 
-/** The domain model: thread states, message types, the durable records
- *  (obligations, owed replies, barriers, wakes) and the two shared views of
- *  a thread — its own StateFile and the ThreadSummary others see. */
+/** The domain model per PROTOCOL-FORMALISM.md Rev 8: the wire envelope
+ *  (Layer 1), the durable Layer-2 records (obligations, owed replies,
+ *  barriers) and the two shared views of a thread — its own StateFile
+ *  (presence source) and the ThreadSummary others see. */
 
-export type ThreadState =
-  | "idle"
-  | "thinking"
-  | "working"
-  | "open"
-  | "in-sync"
-  | "listening"
-  | "on-hold"
-  | "stopped"
-  | "done";
+export type ThreadState = "idle" | "thinking" | "working" | "open" | "on-hold" | "stopped" | "done";
 
-export type MessageType =
-  "Brief" | "Note" | "Question" | "Answer" | "Update" | "Result" | "Blocker" | "Sync";
+/** Wire urgency level (§6). Deliberately abstract: this client maps `high`
+ *  to a steering injection and `low` (the default when absent) to delivery
+ *  at idle; other implementations may map levels differently. Receivers
+ *  treat unknown levels as `low` (§6, must-ignore discipline). */
+export type Urgency = "high" | "low";
 
-/** When a message lands: at the target's next Open (steer) or once it's
- *  Done/Idle (follow-up). */
-export type Delivery = "steer" | "follow-up";
-
-/** The types whose send leaves a durable obligation until Answer/Result. */
-export type ObligationType = "Brief" | "Question" | "Sync" | "Blocker";
-
-/** The received counterparts that leave a durable owed reply (Sync excluded —
- *  its reply is produced by thread_sync_close via the lock). */
-export type OwedType = Exclude<ObligationType, "Sync">;
-
-export const DEFAULT_DELIVERY: Record<MessageType, Delivery> = {
-  Brief: "steer",
-  Note: "steer",
-  Question: "steer",
-  Answer: "steer",
-  Update: "follow-up",
-  Result: "follow-up",
-  Blocker: "steer",
-  Sync: "steer",
-};
-
-export const OBLIGATION_TYPES: ReadonlySet<ObligationType> = new Set([
-  "Brief",
-  "Question",
-  "Sync",
-  "Blocker",
-]);
-
-export function isObligationType(type: MessageType): type is ObligationType {
-  return (OBLIGATION_TYPES as ReadonlySet<MessageType>).has(type);
+/** The one wire record (PROTOCOL-FORMALISM.md §6). Self-contained: `to` is
+ *  consumed at enqueue to place the envelope; receivers never branch on it
+ *  (position is authoritative). Kind is structural — `expects` and `re`
+ *  presence — never a tag. */
+export interface Envelope {
+  /** Own identity — always minted, never echoed. Form: `<from>/<ulid>`. */
+  id: string;
+  from: string;
+  to: string;
+  body: string;
+  sentAt: string;
+  /** Reply correlation: discharges the debt keyed by this envelope id. */
+  re?: string;
+  /** The sender tracks a debt; reply with re = this envelope's id. */
+  expects?: true;
+  /** Delivery-priority hint. Absent = "low". */
+  urgency?: Urgency;
+  /** Not drainable before this instant — delayed delivery / self-wakes. */
+  deliverAfter?: string;
 }
 
 export const HEARTBEAT_MS = 20_000;
 export const STALE_MS = 60_000;
 export const PROCESSED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** Fallback obligation deadline for any obligation-creating send
- *  (Brief/Question/Blocker — everything in OwedType) when the caller passes
- *  no explicit deadlineSeconds. Without it, checkDeadlines skips the
- *  obligation forever (it only fires on obligations with a set deadline),
- *  so a forgotten deadline leaves the sender with zero automatic recovery —
- *  originally fixed for Question/Blocker only (PROTOCOL-FORMALISM.md
- *  Errata 2), then generalized here once the same reasoning was checked
- *  against Brief and found to apply identically: a Brief to a thread that
- *  crashes before replying is just as permanently silent, it just doesn't
- *  also deadlock anyone. 15 minutes is a deliberately generous
- *  agent-to-agent reply SLA — long enough not to nag a partner doing real
- *  work, short enough that a stuck obligation gets one nudge before a human
- *  has to notice it. Callers who need longer still pass an explicit
- *  deadlineSeconds; this only flips the default from opt-in to opt-out.
- *  Sync is excluded — it isn't in OwedType (§8.4) and already self-heals via
- *  its receiver-side rejection path. */
+/** Fallback obligation deadline for any `expects` send when the caller
+ *  passes no explicit deadlineSeconds (PROTOCOL-FORMALISM.md §9.2). Without
+ *  it, checkDeadlines skips the obligation forever (it only fires on
+ *  obligations with a set deadline), so a forgotten deadline leaves the
+ *  sender with zero automatic recovery. 15 minutes is a deliberately
+ *  generous agent-to-agent reply SLA — long enough not to nag a partner
+ *  doing real work, short enough that a stuck obligation gets one nudge
+ *  before a human has to notice it. */
 export const DEFAULT_OBLIGATION_DEADLINE_MS = 15 * 60_000;
 
+/** Sender-side debt record: an `expects` envelope this thread sent, keyed
+ *  by that envelope's id (§9). Cleared when a reply with re = id arrives. */
 export interface Obligation {
-  requestId: string;
-  type: ObligationType;
+  id: string;
   to: string;
   summary: string;
   sentAt: string;
@@ -84,19 +60,20 @@ export interface Obligation {
   nudged?: boolean;
 }
 
-/** The receiving side of an Obligation: recorded when a Brief/Question/Blocker
- *  is delivered, cleared when the matching Result/Answer is sent. Durable —
- *  the envelope's requestId otherwise lives only in the session that received
- *  it, so a revived thread would have no way to echo the right id back. */
+/** The receiving side of an Obligation: recorded when an `expects` envelope
+ *  is delivered, cleared when the matching reply is sent. Durable — the
+ *  envelope id the reply must echo otherwise lives only in the session that
+ *  received it, so a revived thread would have no way to reply. */
 export interface OwedReply {
-  requestId: string;
-  type: OwedType;
+  id: string;
   from: string;
   summary: string;
   receivedAt: string;
 }
 
-/** Waiting on multiple obligations: resolves when all (or any) requestIds get a reply. */
+/** Waiting on multiple envelope ids: resolves when all (or any) get a reply.
+ *  An optional `message` payload is injected on resolution — this is what
+ *  subsumed the old local pub/sub subscriptions (§12.1). */
 export interface Barrier {
   id: string;
   pending: string[];
@@ -104,21 +81,7 @@ export interface Barrier {
   createdAt: string;
   deadline?: string;
   nudged?: boolean;
-}
-
-export interface Subscription {
-  eventId: string;
-  message: string;
-  delivery: Delivery;
-}
-
-/** A future wake-up this thread armed for itself. Fires exactly once, same
- *  `nudged` guard pattern as Obligation/Barrier deadlines. */
-export interface ScheduledWake {
-  id: string;
-  fireAt: string;
-  reason: string;
-  nudged?: boolean;
+  message?: string;
 }
 
 export interface StateFile {
@@ -130,28 +93,13 @@ export interface StateFile {
   sessionFile: string | null;
   state: ThreadState;
   status: "running" | "stopped";
-  lockEventId: string | null;
-  lockPartner: string | null;
-  lockType: "sync" | "reply" | null;
   holdReason: string | null;
-  subscriptions: Subscription[];
   obligations: Obligation[];
   owed: OwedReply[];
   barriers: Barrier[];
-  schedules: ScheduledWake[];
   startedAt: string;
   lastSeen: string;
   updatedAt: string;
-}
-
-export interface InboxMessage {
-  from: string;
-  to: string;
-  type: MessageType;
-  body: string;
-  requestId: string;
-  delivery: Delivery;
-  sentAt: string;
 }
 
 export interface ThreadSummary {
@@ -166,15 +114,13 @@ export interface ThreadSummary {
   obligations: number;
   /** ...received-side debts... */
   owed: number;
-  /** ...armed reply barriers... */
+  /** ...and armed reply barriers. */
   barriers: number;
-  /** ...and pending scheduled wakes. */
-  schedules: number;
 }
 
 /** How every reader classifies another thread: a stale lastSeen overrides the
  *  stored status, so hard-killed processes (no session_shutdown) read as
- *  stopped. Shared by all storage backends' listThreads. */
+ *  stopped (§8.2 — the one presence rule normative for every reader). */
 export function toSummary(s: StateFile): ThreadSummary {
   const stale = Date.now() - new Date(s.lastSeen).getTime() > STALE_MS;
   return {
@@ -187,18 +133,18 @@ export function toSummary(s: StateFile): ThreadSummary {
     obligations: s.obligations?.length ?? 0,
     owed: s.owed?.length ?? 0,
     barriers: s.barriers?.length ?? 0,
-    schedules: s.schedules?.length ?? 0,
   };
 }
 
 export interface ThreadStore extends ThreadData {
-  adapter: StorageAdapter;
+  adapter: ThreadAdapter;
   transition: (next: ThreadState, ctx?: ExtensionContext) => Promise<void>;
   /** Persist the current in-memory state through the storage adapter. */
   persist: () => Promise<void>;
   init: (cwd: string, ctx: ExtensionContext) => Promise<void>;
   shutdown: (reason: string) => Promise<void>;
   listThreads: () => Promise<ThreadSummary[]>;
+  /** Undefined on backends without the JournalAdapter extension. */
   readJournal: (threadId: string) => Promise<string | undefined>;
   threadExists: (threadId: string) => Promise<boolean>;
   forkJournal: (sessionFile: string) => void;
@@ -219,31 +165,21 @@ export interface ThreadData {
   startedAt: string;
   state: ThreadState;
   status: "running" | "stopped";
-  lockEventId: string | null;
-  lockPartner: string | null;
-  lockType: "sync" | "reply" | null;
   holdReason: string | null;
-  subscriptions: Subscription[];
   obligations: Obligation[];
   owed: OwedReply[];
   barriers: Barrier[];
-  schedules: ScheduledWake[];
-  /** In-memory only: set when this thread sends to its lock partner during the
-   *  current turn; drives the "your text didn't reach your partner" nudge. */
-  sentToPartnerThisTurn: boolean;
-  nudgedSinceLastSend: boolean;
   /** In-memory only: true once a reminder about the current unaddressed owed
    *  replies has been queued, so consecutive silent+owed turns within one run
-   *  don't each queue another stale copy — same shape as nudgedSinceLastSend
-   *  but keyed to owed replies rather than a sync lock. Re-armed at agent_end
-   *  so a persistently silent thread gets one fresh nudge per run instead of
+   *  don't each queue another stale copy. Re-armed at agent_end so a
+   *  persistently silent thread gets one fresh nudge per run instead of
    *  exactly one for its entire life. */
   owedNudgePending: boolean;
   /** In-memory only: consecutive silent turns with owed replies outstanding,
    *  capped — used only to pick reminder severity, not to gate whether one
    *  fires. Reset by any tool use, including the send that clears the debt. */
   owedSilentStreak: number;
-  /** In-memory only: fingerprint of (state, lock, obligations, barriers) as of
+  /** In-memory only: fingerprint of (state, obligations, barriers) as of
    *  the last journal write — lets turn_end skip forking a journal entry when
    *  a turn produced no tool call and nothing structural changed. */
   lastJournalSignature: string | null;

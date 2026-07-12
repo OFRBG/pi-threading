@@ -2,31 +2,9 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ThreadStore } from "./types";
 
 /** State transitions that always travel as a group — shared by the tools,
- *  the slash commands, and inbox delivery so no call site can set half a
- *  lock or leave a hold reason behind. */
-
-/** Take the mutually-exclusive conversation lock and enter its wait state:
- *  In Sync for a sync lock, Listening for a reply (Question/Blocker) lock. */
-export async function acquireLock(
-  store: ThreadStore,
-  eventId: string,
-  partner: string,
-  type: "sync" | "reply",
-  ctx?: ExtensionContext,
-): Promise<void> {
-  store.lockEventId = eventId;
-  store.lockPartner = partner;
-  store.lockType = type;
-  await store.transition(type === "sync" ? "in-sync" : "listening", ctx);
-}
-
-/** Release whatever lock is held and settle back to Open. */
-export async function releaseLock(store: ThreadStore, ctx?: ExtensionContext): Promise<void> {
-  store.lockEventId = null;
-  store.lockPartner = null;
-  store.lockType = null;
-  await store.transition("open", ctx);
-}
+ *  the slash commands, and lifecycle so no call site can leave a hold
+ *  reason behind. (There is no lock in this protocol — blocking on a reply
+ *  is a barrier plus client policy, PROTOCOL-FORMALISM.md §10/§12.) */
 
 export async function suspendThread(
   store: ThreadStore,

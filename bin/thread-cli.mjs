@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 // thread-cli.mjs — zero-dependency CLI to monitor and steer a multi-agent thread system.
+// A C1 postbox actor (PROTOCOL-FORMALISM.md §2.2): speaks the local-fs
+// binding (Appendix B) directly — no extension required on either side.
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -7,18 +9,6 @@ import process from "node:process";
 import { setTimeout } from "node:timers";
 
 const STALE_MS = 60000;
-const MSG_TYPES = ["Brief", "Note", "Question", "Answer", "Update", "Result", "Blocker", "Sync"];
-const DELIVERIES = ["steer", "follow-up"];
-const DEFAULT_DELIVERY = {
-  Brief: "steer",
-  Note: "steer",
-  Question: "steer",
-  Answer: "steer",
-  Update: "follow-up",
-  Result: "follow-up",
-  Blocker: "steer",
-  Sync: "steer",
-};
 
 function usage() {
   return `thread-cli.mjs — monitor and steer a multi-agent thread system
@@ -31,14 +21,16 @@ Commands:
     --json                     Print raw JSON array instead of a table
 
   status <id>                Full coordination state of one thread: obligations,
-                             owed replies, barriers, schedules, subscriptions,
-                             pending inbox, last journal entry
+                             owed replies, barriers, pending inbox, last journal entry
     --json                     Print raw state.json + pending inbox as JSON
 
-  send <to> <type> <body...>  Send a message into a thread's inbox
+  send <to> <body...>        Send an envelope into a thread's inbox
     --from <id>                 Sender id (default: "user")
-    --request-id <id>            Request id (default: "<type>.<from>.<timestamp>")
-    --delivery <steer|follow-up> Delivery mode (default depends on type)
+    --re <envelopeId>           Reply correlation: settles the debt on that id
+    --expects                   Ask for a reply (the receiver records an owed reply)
+    --urgency <high|low>        Delivery priority (default: high — operator sends
+                                should be seen at the target's next opening)
+    --deliver-after <seconds>   Hold the envelope for N seconds before delivery
     Use "<to>" = "*" to fan out to every thread except --from.
 
   inbox <id>                 Show pending and recent processed messages for a thread
@@ -46,8 +38,7 @@ Commands:
   tail <id>                  Follow a thread's state/journal/inbox changes live (Ctrl-C to stop)
 
   watch                      Live coordination board: thread table, obligations,
-                             owed replies, barriers, schedules, queued inbox
-                             (Ctrl-C to stop)
+                             owed replies, barriers, queued inbox (Ctrl-C to stop)
 
   delete <id...>             Delete one or more threads (removes .thread/threads/<id>)
     --all                       Delete every thread (requires --yes)
@@ -62,7 +53,9 @@ Global flags:
 Examples:
   thread-cli.mjs list --dir /path/to/workspace
   thread-cli.mjs status link
-  thread-cli.mjs send link Note "please pause" --from user
+  thread-cli.mjs send link "please pause" --from user
+  thread-cli.mjs send link "what's your ETA?" --expects
+  thread-cli.mjs send link "here you go" --re link/01ABC...
   thread-cli.mjs inbox link
   thread-cli.mjs tail link
   thread-cli.mjs watch
@@ -81,10 +74,14 @@ function parseArgs(argv) {
       args.json = true;
     } else if (a === "--from") {
       args.from = argv[++i];
-    } else if (a === "--request-id") {
-      args.requestId = argv[++i];
-    } else if (a === "--delivery") {
-      args.delivery = argv[++i];
+    } else if (a === "--re") {
+      args.re = argv[++i];
+    } else if (a === "--expects") {
+      args.expects = true;
+    } else if (a === "--urgency") {
+      args.urgency = argv[++i];
+    } else if (a === "--deliver-after") {
+      args.deliverAfter = Number(argv[++i]);
     } else if (a === "--help" || a === "-h") {
       args.help = true;
     } else if (a === "--all") {
@@ -147,8 +144,7 @@ function loadThreadState(dir, id) {
 function countInboxPending(dir, id) {
   const inboxDir = path.join(threadsDir(dir), id, "inbox");
   try {
-    return fs.readdirSync(inboxDir).filter(f => f.endsWith(".json") && !f.startsWith(".tmp-"))
-      .length;
+    return fs.readdirSync(inboxDir).filter(f => f.endsWith(".json")).length;
   } catch {
     return 0;
   }
@@ -175,7 +171,7 @@ function relTime(iso) {
   return `${d}d ago`;
 }
 
-/** For deadlines/fireAt: "in 30s" while pending, "5m overdue" once passed. */
+/** For deadlines/deliverAfter: "in 30s" while pending, "5m overdue" once passed. */
 function dueIn(iso) {
   if (!iso) return "-";
   const ms = Date.parse(iso) - Date.now();
@@ -199,20 +195,15 @@ function collectThreads(dir) {
       warn(`skipping thread "${id}": missing or corrupt state.json`);
       continue;
     }
-    const lockStr = state.lockEventId
-      ? `${truncate(state.lockEventId, 24)}${state.lockPartner ? "/" + state.lockPartner : ""}`
-      : "-";
     rows.push({
       id,
       state: state.state ?? "unknown",
       status: effectiveStatus(state),
       role: state.role ?? "-",
       parent: state.parent ?? "-",
-      lock: lockStr,
       obligations: Array.isArray(state.obligations) ? state.obligations.length : 0,
       owed: Array.isArray(state.owed) ? state.owed.length : 0,
       barriers: Array.isArray(state.barriers) ? state.barriers.length : 0,
-      schedules: Array.isArray(state.schedules) ? state.schedules.length : 0,
       inbox: countInboxPending(dir, id),
       lastSeen: state.lastSeen ?? null,
       raw: state,
@@ -233,11 +224,9 @@ function renderTable(rows) {
     "STATUS",
     "ROLE",
     "PARENT",
-    "LOCK",
     "OBLG",
     "OWED",
     "BARR",
-    "SCHED",
     "INBOX",
     "LAST SEEN",
   ];
@@ -247,11 +236,9 @@ function renderTable(rows) {
     r.status,
     r.role,
     r.parent,
-    r.lock,
     String(r.obligations),
     String(r.owed),
     String(r.barriers),
-    String(r.schedules),
     String(r.inbox),
     relTime(r.lastSeen),
   ]);
@@ -307,10 +294,7 @@ function cmdStatus(args) {
     `Id: ${id}  State: ${state.state ?? "unknown"}  Status: ${effectiveStatus(state)}  Role: ${state.role ?? "-"}  Parent: ${state.parent ?? "-"}`,
   );
   lines.push(
-    `Lock: ${state.lockEventId ?? "-"}${state.lockType ? ` (${state.lockType}${state.lockPartner ? `, with ${state.lockPartner}` : ""})` : ""}  Hold: ${state.holdReason ?? "-"}`,
-  );
-  lines.push(
-    `Last seen: ${relTime(state.lastSeen)}  Started: ${relTime(state.startedAt)}  PID: ${state.pid ?? "-"}`,
+    `Hold: ${state.holdReason ?? "-"}  Last seen: ${relTime(state.lastSeen)}  Started: ${relTime(state.startedAt)}  PID: ${state.pid ?? "-"}`,
   );
 
   const section = (title, items, render) => {
@@ -322,29 +306,18 @@ function cmdStatus(args) {
     "Obligations (replies owed TO this thread)",
     state.obligations ?? [],
     o =>
-      `${o.type} to ${o.to} #${o.requestId} "${o.summary ?? ""}" (${relTime(o.sentAt)}${o.deadline ? `, due ${dueIn(o.deadline)}` : ""}${o.nudged ? ", reminded" : ""})`,
+      `request to ${o.to} #${o.id} "${o.summary ?? ""}" (${relTime(o.sentAt)}${o.deadline ? `, due ${dueIn(o.deadline)}` : ""}${o.nudged ? ", reminded" : ""})`,
   );
   section(
     "Owed replies (this thread OWES)",
     state.owed ?? [],
-    o =>
-      `${o.type === "Brief" ? "Result" : "Answer"} to ${o.from} for their ${o.type} #${o.requestId} "${o.summary ?? ""}" (${relTime(o.receivedAt)})`,
+    o => `reply to ${o.from} for #${o.id} "${o.summary ?? ""}" (${relTime(o.receivedAt)})`,
   );
   section(
     "Barriers",
     state.barriers ?? [],
     b =>
       `${b.id} (${b.mode}) pending: ${(b.pending ?? []).join(", ")} (${relTime(b.createdAt)}${b.deadline ? `, due ${dueIn(b.deadline)}` : ""})`,
-  );
-  section(
-    "Scheduled wakes",
-    state.schedules ?? [],
-    w => `${w.id} fires ${dueIn(w.fireAt)}: "${w.reason ?? ""}"${w.nudged ? " (fired)" : ""}`,
-  );
-  section(
-    "Subscriptions",
-    state.subscriptions ?? [],
-    s => `"${s.eventId}" → "${truncate(s.message ?? "", 60)}" (${s.delivery})`,
   );
   section("Inbox pending", pending, m => formatMsgLine(m, 80));
 
@@ -365,18 +338,33 @@ function cmdStatus(args) {
   return 0;
 }
 
-function validateType(type) {
-  return MSG_TYPES.includes(type);
+// --- ULID (Appendix B: envelope filenames sort into FIFO order) ------------
+const B32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+function ulid(now = Date.now()) {
+  let t = "";
+  let ms = now;
+  for (let i = 0; i < 10; i++) {
+    t = B32[ms % 32] + t;
+    ms = Math.floor(ms / 32);
+  }
+  const rand = Array.from(crypto.randomBytes(16))
+    .map(b => B32[b & 31])
+    .join("");
+  return t + rand;
 }
 
-function validateDelivery(delivery) {
-  return DELIVERIES.includes(delivery);
-}
-
-function writeMessageAtomic(inboxDir, message) {
+/** Appendix B enqueue: write to inbox.tmp/ staging, rename into inbox/ —
+ *  atomic on POSIX, so a reader never sees a partial envelope. */
+function writeMessageAtomic(threadDir, message) {
+  const inboxDir = path.join(threadDir, "inbox");
+  const staging = path.join(threadDir, "inbox.tmp");
   fs.mkdirSync(inboxDir, { recursive: true });
-  const name = `${Date.now()}-${crypto.randomUUID()}.json`;
-  const tmp = path.join(inboxDir, `.tmp-${name}`);
+  fs.mkdirSync(staging, { recursive: true });
+  const tail = message.id.includes("/")
+    ? message.id.slice(message.id.lastIndexOf("/") + 1)
+    : message.id;
+  const name = `${tail.replace(/[^A-Za-z0-9._-]/g, "_")}.json`;
+  const tmp = path.join(staging, name);
   const final = path.join(inboxDir, name);
   fs.writeFileSync(tmp, JSON.stringify(message, null, 2));
   fs.renameSync(tmp, final);
@@ -384,28 +372,25 @@ function writeMessageAtomic(inboxDir, message) {
 }
 
 function cmdSend(args) {
-  const [to, type, ...bodyParts] = args._;
-  if (!to || !type || bodyParts.length === 0) {
-    process.stderr.write("usage: thread-cli.mjs send <to> <type> <body...>\n");
+  const [to, ...bodyParts] = args._;
+  if (!to || bodyParts.length === 0) {
+    process.stderr.write("usage: thread-cli.mjs send <to> <body...>\n");
     return 1;
   }
-  if (!validateType(type)) {
-    process.stderr.write(
-      `error: unknown message type "${type}". Valid types: ${MSG_TYPES.join(", ")}\n`,
-    );
-    return 1;
-  }
-  const delivery = args.delivery ?? DEFAULT_DELIVERY[type];
-  if (!validateDelivery(delivery)) {
-    process.stderr.write(
-      `error: unknown delivery "${delivery}". Valid delivery: ${DELIVERIES.join(", ")}\n`,
-    );
+  if (args.urgency && args.urgency !== "high" && args.urgency !== "low") {
+    process.stderr.write(`error: unknown urgency "${args.urgency}". Valid: high, low\n`);
     return 1;
   }
   const from = args.from ?? "user";
   const body = bodyParts.join(" ");
   const sentAt = new Date().toISOString();
-  const baseRequestId = args.requestId ?? `${type.toLowerCase()}.${from}.${Date.now()}`;
+  // Operator sends default to high urgency: a human steering a thread wants
+  // it seen at the target's next opening, not when it goes idle.
+  const urgency = args.urgency ?? "high";
+  const deliverAfter =
+    Number.isFinite(args.deliverAfter) && args.deliverAfter > 0
+      ? new Date(Date.now() + args.deliverAfter * 1000).toISOString()
+      : undefined;
 
   const base = threadsDir(args.dir);
   let targets;
@@ -434,12 +419,20 @@ function cmdSend(args) {
     if (!fs.existsSync(stateFile)) {
       warn(`thread "${targetId}" has no state.json (unknown thread), sending anyway`);
     }
-    const requestId = to === "*" ? `${baseRequestId}.${targetId}` : baseRequestId;
-    const message = { from, to: targetId, type, body, requestId, delivery, sentAt };
-    const inboxDir = path.join(threadDir, "inbox");
-    const file = writeMessageAtomic(inboxDir, message);
+    const message = {
+      id: `${from}/${ulid()}`,
+      from,
+      to: targetId,
+      body,
+      sentAt,
+      ...(args.re ? { re: args.re } : {}),
+      ...(args.expects ? { expects: true } : {}),
+      ...(urgency === "high" ? { urgency } : {}),
+      ...(deliverAfter ? { deliverAfter } : {}),
+    };
+    const file = writeMessageAtomic(threadDir, message);
     process.stdout.write(
-      `sent ${type} (${delivery}) from ${from} to ${targetId} [#${requestId}] -> ${file}\n`,
+      `sent from ${from} to ${targetId} [#${message.id}]${args.re ? ` re #${args.re}` : ""}${args.expects ? " (expects reply)" : ""}${deliverAfter ? ` (holds until ${deliverAfter})` : ""} -> ${file}\n`,
     );
   }
   return 0;
@@ -448,7 +441,7 @@ function cmdSend(args) {
 function readInboxMessages(inboxDir) {
   let files;
   try {
-    files = fs.readdirSync(inboxDir).filter(f => f.endsWith(".json") && !f.startsWith(".tmp-"));
+    files = fs.readdirSync(inboxDir).filter(f => f.endsWith(".json"));
   } catch {
     return [];
   }
@@ -465,7 +458,9 @@ function formatMsgLine(m, bodyLen) {
   // One message per line: multi-line bodies collapse to single-spaced text.
   const flat = (m.body ?? "").replace(/\s+/g, " ").trim();
   const body = bodyLen ? truncate(flat, bodyLen) : flat;
-  return `[${m.type} ${m.from}→${m.to} #${m.requestId}] ${body} (${m.sentAt ?? "?"})`;
+  const kind =
+    m.expects && m.re ? "reply+request" : m.expects ? "request" : m.re ? "reply" : "note";
+  return `[${kind} ${m.from}→${m.to} #${m.id}${m.re ? ` re #${m.re}` : ""}] ${body} (${m.sentAt ?? "?"})`;
 }
 
 function cmdInbox(args) {
@@ -539,14 +534,6 @@ async function cmdTail(args) {
         if (state.status !== lastState.status) {
           process.stdout.write(`status: ${lastState.status} → ${state.status}\n`);
         }
-        if (
-          state.lockEventId !== lastState.lockEventId ||
-          state.lockPartner !== lastState.lockPartner
-        ) {
-          process.stdout.write(
-            `lock: ${lastState.lockEventId ?? "-"} → ${state.lockEventId ?? "-"} (partner: ${state.lockPartner ?? "-"})\n`,
-          );
-        }
         const diffIds = (label, prev, next, idOf) => {
           const p = new Set((prev ?? []).map(idOf));
           const n = new Set((next ?? []).map(idOf));
@@ -556,10 +543,9 @@ async function cmdTail(args) {
           ];
           if (changes.length) process.stdout.write(`${label}: ${changes.join(" ")}\n`);
         };
-        diffIds("obligations", lastState.obligations, state.obligations, o => o.requestId);
-        diffIds("owed", lastState.owed, state.owed, o => o.requestId);
+        diffIds("obligations", lastState.obligations, state.obligations, o => o.id);
+        diffIds("owed", lastState.owed, state.owed, o => o.id);
         diffIds("barriers", lastState.barriers, state.barriers, b => b.id);
-        diffIds("schedules", lastState.schedules, state.schedules, w => w.id);
       }
       lastState = state;
     }
@@ -580,7 +566,7 @@ async function cmdTail(args) {
       const dirPath = path.join(threadDir, sub);
       let files;
       try {
-        files = fs.readdirSync(dirPath).filter(f => f.endsWith(".json") && !f.startsWith(".tmp-"));
+        files = fs.readdirSync(dirPath).filter(f => f.endsWith(".json"));
       } catch {
         continue;
       }
@@ -619,12 +605,10 @@ async function cmdWatch(args) {
 
     const owed = [];
     const barriers = [];
-    const schedules = [];
     const queued = [];
     for (const r of rows) {
       for (const o of r.raw.owed ?? []) owed.push({ owner: r.id, ...o });
       for (const b of r.raw.barriers ?? []) barriers.push({ owner: r.id, ...b });
-      for (const w of r.raw.schedules ?? []) schedules.push({ owner: r.id, ...w });
       if (r.inbox > 0) {
         for (const m of readInboxMessages(path.join(threadsDir(args.dir), r.id, "inbox"))) {
           queued.push(m);
@@ -638,25 +622,19 @@ async function cmdWatch(args) {
       out += "  (none)\n";
     } else {
       for (const o of obligations) {
-        out += `  ${o.owner} → ${o.to} : ${o.type} #${o.requestId} "${o.summary ?? ""}" (${relTime(o.sentAt)}${o.deadline ? `, due ${dueIn(o.deadline)}` : ""})\n`;
+        out += `  ${o.owner} → ${o.to} : #${o.id} "${o.summary ?? ""}" (${relTime(o.sentAt)}${o.deadline ? `, due ${dueIn(o.deadline)}` : ""})\n`;
       }
     }
     if (owed.length) {
       out += "Owed replies:\n";
       for (const o of owed) {
-        out += `  ${o.owner} owes ${o.from} : ${o.type === "Brief" ? "Result" : "Answer"} for ${o.type} #${o.requestId} "${o.summary ?? ""}" (${relTime(o.receivedAt)})\n`;
+        out += `  ${o.owner} owes ${o.from} : reply for #${o.id} "${o.summary ?? ""}" (${relTime(o.receivedAt)})\n`;
       }
     }
     if (barriers.length) {
       out += "Barriers:\n";
       for (const b of barriers) {
         out += `  ${b.owner} waits (${b.mode}) on: ${(b.pending ?? []).join(", ")} (${relTime(b.createdAt)}${b.deadline ? `, due ${dueIn(b.deadline)}` : ""})\n`;
-      }
-    }
-    if (schedules.length) {
-      out += "Scheduled wakes:\n";
-      for (const w of schedules) {
-        out += `  ${w.owner} fires ${dueIn(w.fireAt)}: "${w.reason ?? ""}"${w.nudged ? " (fired)" : ""}\n`;
       }
     }
     if (queued.length) {

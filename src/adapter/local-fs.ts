@@ -1,10 +1,9 @@
-import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { StateFile, InboxMessage, ThreadSummary, ScheduledWake } from "../core/types";
+import type { StateFile, Envelope, ThreadSummary } from "../core/types";
 import { PROCESSED_TTL_MS, toSummary } from "../core/types";
-import { nowIso } from "../core/time";
-import type { StorageAdapter } from "./types";
+import { ulid } from "../core/ids";
+import type { StorageAdapter, JournalAdapter } from "./types";
 
 /** Keep processed/ from growing forever — messages are audit trail, not archive. */
 function pruneProcessed(dir: string) {
@@ -16,24 +15,38 @@ function pruneProcessed(dir: string) {
   }
   const cutoff = Date.now() - PROCESSED_TTL_MS;
   for (const f of files) {
-    // Filenames start with the epoch-millis send time; fall back to mtime.
-    const ts = Number(f.split("-")[0]);
     try {
-      const age = Number.isFinite(ts) && ts > 0 ? ts : fs.statSync(path.join(dir, f)).mtimeMs;
-      if (age < cutoff) fs.rmSync(path.join(dir, f), { force: true });
+      if (fs.statSync(path.join(dir, f)).mtimeMs < cutoff) {
+        fs.rmSync(path.join(dir, f), { force: true });
+      }
     } catch {
       // ignore — GC is best-effort
     }
   }
 }
 
-/** 1:1 async wrapper around the original raw node:fs implementation — same
- *  atomic write-temp-then-rename delivery, same processed/ GC, same
- *  "malformed inbox JSON is left in place, never silently dropped" behavior.
- *  No internal awaits: every method runs its fs calls synchronously before
- *  returning, so this backend never introduces cross-message-tick surprises
- *  beyond the microtask hop `await` itself always incurs. */
-export function createLocalFsAdapter(): StorageAdapter {
+/** Envelope ids are `<from>/<ulid>` (§6.2); the filename is the ULID tail —
+ *  time-sortable, so a sorted readdir IS FIFO order (Appendix B). Ids in a
+ *  different (conforming) form are sanitized whole. */
+function envelopeFileName(id: string): string {
+  const tail = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+  const safe = tail.replace(/[^A-Za-z0-9._-]/g, "_");
+  return `${safe || ulid()}.json`;
+}
+
+/** The local-fs binding (PROTOCOL-FORMALISM.md Appendix B):
+ *
+ *  .thread/threads/<threadId>/
+ *    state.json        presence + client state
+ *    journal.md        journal stream (JournalAdapter extension)
+ *    inbox/            one envelope per file, filename = sortable id
+ *    inbox.tmp/        enqueue staging (same filesystem)
+ *
+ *  Enqueue is write-to-staging + rename — atomic on POSIX, so a reader never
+ *  sees a partial envelope. Drain is sorted readdir → filter due → rename to
+ *  processed/ → return. No internal awaits: every method runs its fs calls
+ *  synchronously before returning. */
+export function createLocalFsAdapter(): StorageAdapter & JournalAdapter {
   let root = "";
   const pruned = new Set<string>();
 
@@ -49,32 +62,14 @@ export function createLocalFsAdapter(): StorageAdapter {
   function inboxDir(id: string): string {
     return path.join(threadDir(id), "inbox");
   }
+  function stagingDir(id: string): string {
+    return path.join(threadDir(id), "inbox.tmp");
+  }
 
   return {
     async configure(baseDir: string) {
-      const base = path.join(baseDir, ".thread");
-      root = path.join(base, "threads");
+      root = path.join(baseDir, ".thread", "threads");
       fs.mkdirSync(root, { recursive: true });
-
-      // Migrate flat .thread/state.json → .thread/threads/<id>/state.json.
-      const oldStateFile = path.join(base, "state.json");
-      if (fs.existsSync(oldStateFile) && !fs.existsSync(path.join(root, ".migrated"))) {
-        try {
-          const old = JSON.parse(fs.readFileSync(oldStateFile, "utf8"));
-          const migratedDir = path.join(root, "thread-legacy");
-          fs.mkdirSync(migratedDir, { recursive: true });
-          if (!fs.existsSync(path.join(migratedDir, "state.json"))) {
-            fs.writeFileSync(path.join(migratedDir, "state.json"), JSON.stringify(old, null, 2));
-          }
-          const oldJournal = path.join(base, "journal.md");
-          if (fs.existsSync(oldJournal) && !fs.existsSync(path.join(migratedDir, "journal.md"))) {
-            fs.copyFileSync(oldJournal, path.join(migratedDir, "journal.md"));
-          }
-          fs.writeFileSync(path.join(root, ".migrated"), nowIso());
-        } catch (err) {
-          console.error("[thread] failed to migrate legacy state.json:", err);
-        }
-      }
     },
 
     async loadState(threadId: string): Promise<StateFile | undefined> {
@@ -90,10 +85,14 @@ export function createLocalFsAdapter(): StorageAdapter {
 
     async saveState(threadId: string, state: StateFile) {
       fs.mkdirSync(threadDir(threadId), { recursive: true });
-      fs.writeFileSync(statePath(threadId), JSON.stringify(state, null, 2));
+      // Write-temp + rename: presence readers (§8.1) never see a torn file.
+      const tmp = statePath(threadId) + ".tmp";
+      fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+      fs.renameSync(tmp, statePath(threadId));
     },
 
     async appendJournal(threadId: string, entry: string) {
+      fs.mkdirSync(threadDir(threadId), { recursive: true });
       fs.appendFileSync(journalPath(threadId), entry);
     },
 
@@ -128,17 +127,21 @@ export function createLocalFsAdapter(): StorageAdapter {
       return fs.existsSync(statePath(threadId));
     },
 
-    async enqueueMessage(targetId: string, message: InboxMessage) {
-      const dir = inboxDir(targetId);
+    async enqueueMessage(message: Envelope) {
+      const dir = inboxDir(message.to);
+      const staging = stagingDir(message.to);
       fs.mkdirSync(dir, { recursive: true });
-      const fname = `${Date.now()}-${crypto.randomUUID()}.json`;
-      const tmp = path.join(dir, `.tmp-${fname}`);
-      const final = path.join(dir, fname);
+      fs.mkdirSync(staging, { recursive: true });
+      // Filename = the id's ULID tail: unique per sender by construction,
+      // and a retry with the same id overwrites its own file — enqueue
+      // idempotence (§7.6) for free.
+      const fname = envelopeFileName(message.id);
+      const tmp = path.join(staging, fname);
       fs.writeFileSync(tmp, JSON.stringify(message, null, 2));
-      fs.renameSync(tmp, final);
+      fs.renameSync(tmp, path.join(dir, fname));
     },
 
-    async drainInbox(threadId: string): Promise<InboxMessage[]> {
+    async drainInbox(threadId: string): Promise<Envelope[]> {
       const dir = inboxDir(threadId);
       const processedDir = path.join(dir, "processed");
       let files: string[];
@@ -152,24 +155,24 @@ export function createLocalFsAdapter(): StorageAdapter {
       }
       fs.mkdirSync(processedDir, { recursive: true });
       // Best-effort GC of the pre-existing backlog, once per thread per
-      // process lifetime, done *before* anything from this drain is moved
-      // in — pruneProcessed's filename-prefix age heuristic must never see
-      // a message this same call is about to deliver (it would misjudge a
-      // small hand-authored filename as an ancient epoch timestamp and
-      // delete a message that was never actually processed before now).
+      // process lifetime, done *before* anything from this drain is moved in.
       if (!pruned.has(threadId)) {
         pruned.add(threadId);
         pruneProcessed(processedDir);
       }
-      const claimed: InboxMessage[] = [];
+      const now = Date.now();
+      const claimed: Envelope[] = [];
       for (const f of files) {
         const full = path.join(dir, f);
-        let msg: InboxMessage;
+        let msg: Envelope;
         try {
           msg = JSON.parse(fs.readFileSync(full, "utf8"));
         } catch {
           continue; // malformed — left in place, retried every drain, never dropped
         }
+        // Not due yet (§6 deliverAfter): stays queued; a later drain
+        // (heartbeat, boot) picks it up once the instant passes.
+        if (msg.deliverAfter && new Date(msg.deliverAfter).getTime() > now) continue;
         // Rename before returning it as claimed: if the caller throws after
         // this, the message is already moved and won't be redelivered.
         try {
@@ -195,20 +198,6 @@ export function createLocalFsAdapter(): StorageAdapter {
         console.error("[thread] failed to watch inbox:", err);
         return () => {};
       }
-    },
-
-    async scheduleWake(threadId: string, wake: ScheduledWake) {
-      const s = await this.loadState(threadId);
-      if (!s) return;
-      s.schedules = [...(s.schedules ?? []), wake];
-      await this.saveState(threadId, s);
-    },
-
-    async cancelWake(threadId: string, id: string) {
-      const s = await this.loadState(threadId);
-      if (!s) return;
-      s.schedules = (s.schedules ?? []).filter(w => w.id !== id);
-      await this.saveState(threadId, s);
     },
   };
 }

@@ -1,13 +1,12 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { ThreadStore, MessageType, InboxMessage, Delivery } from "./core/types";
-import { DEFAULT_DELIVERY, isObligationType, STALE_MS } from "./core/types";
-import { mintId } from "./core/ids";
+import type { ThreadStore, Envelope, Urgency } from "./core/types";
+import { DEFAULT_OBLIGATION_DEADLINE_MS, STALE_MS } from "./core/types";
+import { mintEnvelopeId } from "./core/ids";
 import { nowIso } from "./core/time";
-import { acquireLock, releaseLock } from "./core/thread-ops";
 
-/** The messaging engine: typed cross-thread sends and their bookkeeping
- *  (obligations, owed replies), delivery of incoming envelopes with barrier
- *  and lock resolution, and the heartbeat's deadline/schedule checks. */
+/** The messaging engine (PROTOCOL-FORMALISM.md §§6–9): envelope sends and
+ *  their bookkeeping (obligations, owed replies), delivery of incoming
+ *  envelopes with barrier resolution, and the heartbeat's deadline checks. */
 
 /** How long after an idle-time injection we assume pi's prompt preflight is
  *  still running (it ends at turn_start, which clears the hold early). */
@@ -19,31 +18,34 @@ export const COMPACTION_HOLD_MAX_MS = 180_000;
 /** One unit of text bound for this thread's own session. */
 export interface Injection {
   text: string;
-  delivery: Delivery;
+  urgency: Urgency;
 }
 
 export interface SendResult {
-  requestId: string;
+  id: string;
   delivered: "queued" | "live";
 }
 
 export interface SendOptions {
-  requestId?: string;
-  delivery?: Delivery;
+  /** Reply correlation: discharges the debt on this envelope id (§9.1). */
+  re?: string;
+  /** Track a debt: the receiver owes a reply with re = this send's id. */
+  expects?: boolean;
+  urgency?: Urgency;
+  /** Not deliverable before this instant — a self-addressed deliverAfter
+   *  envelope is the protocol's scheduled wake (§12.2). */
+  deliverAfter?: string;
+  /** Obligation deadline; defaults per §9.2 when expects is set. */
   deadline?: string;
 }
 
 export interface Inbox {
-  sendCrossThread(
-    to: string,
-    type: MessageType,
-    body: string,
-    opts?: SendOptions,
-  ): Promise<SendResult>;
-  /** sendCrossThread over a resolved target list, collecting per-target results. */
+  sendEnvelope(to: string, body: string, opts?: SendOptions): Promise<SendResult>;
+  /** sendEnvelope over a resolved target list, collecting per-target results.
+   *  Each target gets its own minted id, so fan-out replies stay
+   *  individually correlatable. */
   sendToMany(
     targets: string[],
-    type: MessageType,
     body: string,
     opts?: SendOptions,
   ): Promise<(SendResult & { to: string })[]>;
@@ -51,27 +53,24 @@ export interface Inbox {
   resolveTargets(to: string): Promise<string[]>;
   /** Which of these ids have never run in this workspace (likely typos). */
   findMissingTargets(targets: string[]): Promise<string[]>;
-  /** Bookkeeping for one envelope (locks, owed, barriers) — returns the
+  /** Bookkeeping for one envelope (debts, barriers) — returns the
    *  injection parts; the caller batches them into one inject(). */
-  deliver(msg: InboxMessage, ctx: ExtensionContext): Promise<Injection[]>;
+  deliver(msg: Envelope, ctx: ExtensionContext): Promise<Injection[]>;
   /** Drain queued envelopes. Standalone (no `collect`) it injects its own
    *  batch; when the heartbeat passes a shared `collect` array it pushes its
-   *  parts there instead, so all three heartbeat sources ship in one inject(). */
+   *  parts there instead, so both heartbeat sources ship in one inject(). */
   drainInbox(ctx: ExtensionContext, collect?: Injection[]): Promise<void>;
   isTargetLive(to: string): Promise<boolean>;
-  fireSubscribers(eventId: string): Promise<{ notified: number; parts: Injection[] }>;
-  /** Called from the heartbeat: a one-time reminder per overdue obligation.
-   *  With `collect`, pushes parts into the shared batch instead of injecting. */
+  /** Called from the heartbeat: a one-time reminder per overdue obligation
+   *  or barrier. With `collect`, pushes parts into the shared batch. */
   checkDeadlines(ctx: ExtensionContext, collect?: Injection[]): Promise<void>;
-  /** Called from the heartbeat: fires any scheduled wake whose time has come.
-   *  Local-fs backend only — the Restate backend fires independently via
-   *  the companion service's own durable timer + runner. With `collect`,
-   *  pushes parts into the shared batch instead of injecting. */
-  checkSchedules(ctx: ExtensionContext, collect?: Injection[]): Promise<void>;
-  /** Push parts into this session as ONE user message (steer if any part is). */
+  /** Push parts into this session as ONE user message (steer if any part is
+   *  urgency=high). */
   inject(parts: Injection[], ctx: ExtensionContext): void;
   /** False while an idle-time injection is in preflight or a compaction is
-   *  running — drains and nudges wait (messages stay durable on disk). */
+   *  running — drains and nudges wait (messages stay durable on disk). This
+   *  is the §7.7 declare-and-shrink gate: we only claim envelopes when we
+   *  can deliver them in the same tick. */
   canInject(): boolean;
   noteCompactionStart(): void;
   noteCompactionEnd(): void;
@@ -102,10 +101,10 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
 
   function inject(parts: Injection[], ctx: ExtensionContext): void {
     if (parts.length === 0) return;
-    // One coalesced message per batch: a steer anywhere makes the whole
-    // batch urgent; follow-up parts just arrive a little earlier than they
-    // had to, which is harmless.
-    const steer = parts.some(p => p.delivery === "steer");
+    // One coalesced message per batch (§7.5): a high-urgency part anywhere
+    // makes the whole batch steer; low parts just arrive a little earlier
+    // than they had to, which is harmless.
+    const steer = parts.some(p => p.urgency === "high");
     if (ctx.isIdle?.() ?? false) inFlightSince = Date.now();
     pi.sendUserMessage(parts.map(p => p.text).join("\n\n"), {
       deliverAs: steer ? "steer" : "followUp",
@@ -145,9 +144,8 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       .filter(s => s && s !== store.threadId);
   }
 
-  async function sendCrossThread(
+  async function sendEnvelope(
     to: string,
-    type: MessageType,
     body: string,
     opts: SendOptions = {},
   ): Promise<SendResult> {
@@ -156,66 +154,65 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       // nothing ever drains (observed in the wild as <cwd>/<to>/inbox/).
       throw new Error("Thread system not initialized yet — cannot send.");
     }
-    const requestId = opts.requestId ?? mintId(`${type.toLowerCase()}.${store.threadId}`);
-    const delivery = opts.delivery ?? DEFAULT_DELIVERY[type];
-    const msg: InboxMessage = {
+    const id = mintEnvelopeId(store.threadId);
+    const msg: Envelope = {
+      id,
       from: store.threadId,
       to,
-      type,
       body,
-      requestId,
-      delivery,
       sentAt: nowIso(),
+      ...(opts.re ? { re: opts.re } : {}),
+      ...(opts.expects ? { expects: true as const } : {}),
+      // Absence means "low" on the wire (§6) — only high is written.
+      ...(opts.urgency === "high" ? { urgency: "high" as const } : {}),
+      ...(opts.deliverAfter ? { deliverAfter: opts.deliverAfter } : {}),
     };
 
     const delivered = (await isTargetLive(to)) ? "live" : "queued";
-    await store.adapter.enqueueMessage(to, msg);
+    await store.adapter.enqueueMessage(msg);
 
-    if (to === store.lockPartner) {
-      store.sentToPartnerThisTurn = true;
-      store.nudgedSinceLastSend = false;
-    }
-
-    if (type === "Answer" || type === "Result") {
+    if (opts.re) {
       // Sending the reply settles the durable owed-reply record made when the
-      // Brief/Question/Blocker was delivered (see deliver()) — but ONLY when it
-      // actually reaches the thread the debt is owed to. A misdirected or stale
-      // reply whose requestId merely collides with an unrelated owed entry must
-      // not discharge it: the conservation law (§2) would be violated — b's
-      // ledger would say the debt is gone while a never received the reply. The
-      // owed record stays put so thread_status and the owed-reply nudge keep
-      // surfacing it. (thread_send layers a soft warning on top; this is the
-      // real gate.) Sync is excluded from OwedType, so it never appears here.
-      const owedMatch = store.owed.find(o => o.requestId === requestId);
+      // expects envelope was delivered (see deliver()) — but ONLY when it
+      // actually reaches the thread the debt is owed to (§9.1, Errata 1). A
+      // misdirected or stale reply whose `re` merely collides with an
+      // unrelated owed entry must not discharge it: the owed record stays put
+      // so thread_status and the owed-reply nudge keep surfacing it.
+      // (thread_send layers a soft warning on top; this is the real gate.)
+      const owedMatch = store.owed.find(o => o.id === opts.re);
       if (owedMatch && owedMatch.from === to) {
-        store.owed = store.owed.filter(o => o.requestId !== requestId);
+        store.owed = store.owed.filter(o => o.id !== opts.re);
         await store.persist();
       }
     }
 
-    if (isObligationType(type)) {
+    if (opts.expects) {
+      // Every expects send SHOULD carry a deadline; when the caller omits
+      // one the client MUST apply the fallback (§9.2) — without it,
+      // checkDeadlines never fires and a silent counterparty means zero
+      // automatic recovery.
+      const deadline =
+        opts.deadline ?? new Date(Date.now() + DEFAULT_OBLIGATION_DEADLINE_MS).toISOString();
       store.obligations.push({
-        requestId,
-        type,
+        id,
         to,
         summary: body.slice(0, 80),
         sentAt: msg.sentAt,
-        ...(opts.deadline ? { deadline: opts.deadline } : {}),
+        deadline,
       });
       await store.persist();
     }
-    return { requestId, delivered };
+    return { id, delivered };
   }
 
   async function sendToMany(
     targets: string[],
-    type: MessageType,
     body: string,
     opts: SendOptions = {},
   ): Promise<(SendResult & { to: string })[]> {
     const sent: (SendResult & { to: string })[] = [];
     for (const to of targets) {
-      sent.push({ to, ...(await sendCrossThread(to, type, body, opts)) });
+      sent.push({ to, ...(await sendEnvelope(to, body, opts)) });
     }
     return sent;
   }
@@ -228,86 +225,69 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     return missing;
   }
 
-  async function fireSubscribers(
-    eventId: string,
-  ): Promise<{ notified: number; parts: Injection[] }> {
-    const fired = store.subscriptions.filter(s => s.eventId === eventId);
-    if (fired.length === 0) return { notified: 0, parts: [] };
-    store.subscriptions = store.subscriptions.filter(s => s.eventId !== eventId);
-    await store.persist();
-    return {
-      notified: fired.length,
-      parts: fired.map(s => ({ text: s.message, delivery: s.delivery })),
-    };
-  }
-
-  /** Resolve any barriers waiting on this requestId. Returns "resolved"
-   *  notices to fold into the same wake-up message as the envelope, rather
-   *  than firing separate pi.sendUserMessage calls for one event. */
-  function resolveBarriers(requestId: string): string[] {
+  /** Resolve any barriers waiting on this envelope id. Returns "resolved"
+   *  notices (and any barrier payload messages, §12.1) to fold into the same
+   *  wake-up as the envelope, rather than firing separate injections. */
+  function resolveBarriers(re: string): { notes: string[]; payloads: Injection[] } {
     const remaining: typeof store.barriers = [];
     const notes: string[] = [];
+    const payloads: Injection[] = [];
     for (const b of store.barriers) {
-      if (!b.pending.includes(requestId)) {
+      if (!b.pending.includes(re)) {
         remaining.push(b);
         continue;
       }
-      const pending = b.pending.filter(id => id !== requestId);
+      const pending = b.pending.filter(id => id !== re);
       const done = b.mode === "any" || pending.length === 0;
       if (done) {
         notes.push(
-          `[barrier "${b.id}" resolved]: ${b.mode === "any" ? `first reply arrived (${requestId})` : "all awaited replies have arrived"}.`,
+          `[barrier "${b.id}" resolved]: ${b.mode === "any" ? `first reply arrived (${re})` : "all awaited replies have arrived"}.`,
         );
+        if (b.message) payloads.push({ text: b.message, urgency: "high" });
       } else {
         remaining.push({ ...b, pending });
       }
     }
     store.barriers = remaining;
-    return notes;
+    return { notes, payloads };
   }
 
-  /** How the receiving agent sees a message. The requestId and the reply
+  /** How the receiving agent sees an envelope. The id and the reply
    *  affordance must travel with the message — the model has no other way
-   *  to learn the correlation id it must echo back. */
-  function renderEnvelope(msg: InboxMessage): string {
-    const header = `[${msg.type} from ${msg.from} #${msg.requestId}]`;
-    let hint = "";
-    if (msg.type === "Question" || msg.type === "Blocker") {
-      hint = `\n(reply with: thread_send to="${msg.from}" type="Answer" requestId="${msg.requestId}")`;
-    } else if (msg.type === "Brief") {
-      hint = `\n(when done, close with: thread_send to="${msg.from}" type="Result" requestId="${msg.requestId}")`;
-    } else if (msg.type === "Sync") {
-      hint = `\n(you are now In Sync with ${msg.from} — converse via thread_send type="Note", end with thread_sync_close)`;
-    }
+   *  to learn the correlation id it must echo back. Kind is derived from
+   *  field presence (§6.1), never a tag. */
+  function renderEnvelope(msg: Envelope): string {
+    const kind =
+      msg.expects && msg.re ? "reply+request" : msg.expects ? "request" : msg.re ? "reply" : "note";
+    const reTag = msg.re ? ` re #${msg.re}` : "";
+    const header = `[${kind} from ${msg.from} #${msg.id}${reTag}]`;
+    const hint = msg.expects
+      ? `\n(this expects a reply — send it with: thread_send to="${msg.from}" re="${msg.id}")`
+      : "";
     return `${header}\n${msg.body}${hint}`;
   }
 
-  async function deliver(msg: InboxMessage, ctx: ExtensionContext): Promise<Injection[]> {
+  async function deliver(msg: Envelope, _ctx: ExtensionContext): Promise<Injection[]> {
     const parts: Injection[] = [];
     let barrierNotes: string[] = [];
-    if (msg.type === "Answer" || msg.type === "Result") {
-      store.obligations = store.obligations.filter(o => o.requestId !== msg.requestId);
-      // A matching Answer releases the lock no matter which state we're in:
-      // "listening" (Question/Blocker), "in-sync" (partner closed or rejected
-      // the sync), or "open"/"done" (reply landed between turns).
-      if (store.lockEventId === msg.requestId) {
-        await releaseLock(store, ctx);
-      }
-      parts.push(...(await fireSubscribers(msg.requestId)).parts);
-      barrierNotes = resolveBarriers(msg.requestId);
+
+    if (msg.re) {
+      // A reply discharges the sender-side debt keyed by `re` (§9)...
+      store.obligations = store.obligations.filter(o => o.id !== msg.re);
+      // ...and resolves any barriers armed over it (§12.1).
+      const resolved = resolveBarriers(msg.re);
+      barrierNotes = resolved.notes;
+      parts.push(...resolved.payloads);
     }
 
-    if (msg.type === "Brief" || msg.type === "Question" || msg.type === "Blocker") {
-      // Record the reply this thread now owes, durably: the envelope (and its
-      // requestId, which the eventual Result/Answer must echo) exists only in
-      // the receiving session's context — without this record, a thread
-      // revived after a restart has no protocol-level way to recover the id.
-      // Sync is excluded: its reply is produced by thread_sync_close via the
-      // lock, and sync locks are deliberately not durable.
-      if (!store.owed.some(o => o.requestId === msg.requestId)) {
+    if (msg.expects) {
+      // Record the reply this thread now owes, durably: the envelope (and
+      // its id, which the eventual reply must echo) exists only in the
+      // receiving session's context — without this record, a thread revived
+      // after a restart has no protocol-level way to recover the id.
+      if (!store.owed.some(o => o.id === msg.id)) {
         store.owed.push({
-          requestId: msg.requestId,
-          type: msg.type,
+          id: msg.id,
           from: msg.from,
           summary: msg.body.slice(0, 80),
           receivedAt: msg.sentAt,
@@ -315,30 +295,14 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       }
     }
 
-    if (msg.type === "Sync") {
-      if (store.lockEventId) {
-        // Already locked — reject as an Answer so the requester's own lock
-        // (keyed to this requestId) unwinds instead of hanging forever.
-        await sendCrossThread(
-          msg.from,
-          "Answer",
-          `Rejected sync: ${store.threadId} is already in sync with ${store.lockPartner ?? "another thread"}. Try again later or subscribe to my current lock.`,
-          { requestId: msg.requestId },
-        );
-        await store.persist();
-        return [];
-      }
-      await acquireLock(store, msg.requestId, msg.from, "sync", ctx);
-    }
-
     const extra = barrierNotes.length ? "\n\n" + barrierNotes.join("\n") : "";
-    parts.push({ text: renderEnvelope(msg) + extra, delivery: msg.delivery });
+    parts.push({ text: renderEnvelope(msg) + extra, urgency: msg.urgency ?? "low" });
     await store.persist();
     return parts;
   }
 
   /** Ship a gathered batch: push into the heartbeat's shared array when one is
-   *  given (so the three sources coalesce into a single inject() per tick),
+   *  given (so all sources coalesce into a single inject() per tick, §7.5),
    *  otherwise inject it now (the standalone watcher/turn/command call sites). */
   function emit(parts: Injection[], ctx: ExtensionContext, collect?: Injection[]): void {
     if (collect) collect.push(...parts);
@@ -348,7 +312,10 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
   async function drainInbox(ctx: ExtensionContext, collect?: Injection[]): Promise<void> {
     // On Hold means "don't wake me": messages stay queued until resume.
     if (store.state === "on-hold") return;
-    if (!canInject()) return; // stays on disk; watcher/turn-end/heartbeat retry
+    // §7.7 declare-and-shrink: never claim an envelope we can't deliver in
+    // this same tick — while the gate is closed everything stays durable on
+    // disk; watcher/turn-end/heartbeat retry.
+    if (!canInject()) return;
     const messages = await store.adapter.drainInbox(store.threadId);
     const parts: Injection[] = [];
     for (const msg of messages) {
@@ -365,8 +332,8 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       if (!ob.deadline || ob.nudged || new Date(ob.deadline).getTime() > now) continue;
       ob.nudged = true;
       parts.push({
-        text: `[obligation overdue #${ob.requestId}]: your ${ob.type} to ${ob.to} ("${ob.summary}") passed its deadline with no reply. Follow up with ${ob.to}${store.parent ? `, or escalate a Blocker to ${store.parent}` : ""}.`,
-        delivery: "steer",
+        text: `[obligation overdue #${ob.id}]: your request to ${ob.to} ("${ob.summary}") passed its deadline with no reply. Follow up with ${ob.to}${store.parent ? `, or escalate to ${store.parent}` : ""}.`,
+        urgency: "high",
       });
     }
     for (const b of store.barriers) {
@@ -374,7 +341,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       b.nudged = true;
       parts.push({
         text: `[barrier overdue "${b.id}"]: still waiting on ${b.mode} of ${b.pending.length} repl${b.pending.length === 1 ? "y" : "ies"} (${b.pending.join(", ")}) — none arrived by the deadline. Check in with the target thread(s), or the barrier will keep waiting silently.`,
-        delivery: "steer",
+        urgency: "high",
       });
     }
     if (parts.length === 0) return;
@@ -382,39 +349,15 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     emit(parts, ctx, collect);
   }
 
-  async function checkSchedules(ctx: ExtensionContext, collect?: Injection[]): Promise<void> {
-    if (!canInject()) return; // wakes stay armed; next heartbeat retries
-    const now = Date.now();
-    // Fired wakes are pruned, not kept — otherwise thread_status accumulates
-    // "(fired)" entries forever. Already-nudged entries (the Restate service
-    // fired them while this process was down and it spawned us with the
-    // reason as the prompt) are pruned too, without re-firing.
-    const due = store.schedules.filter(w => !w.nudged && new Date(w.fireAt).getTime() <= now);
-    const keep = store.schedules.filter(w => !w.nudged && new Date(w.fireAt).getTime() > now);
-    if (keep.length === store.schedules.length) return;
-    store.schedules = keep;
-    await store.persist();
-    emit(
-      due.map(w => ({
-        text: `[scheduled wake #${w.id}]: ${w.reason}`,
-        delivery: "steer" as const,
-      })),
-      ctx,
-      collect,
-    );
-  }
-
   return {
-    sendCrossThread,
+    sendEnvelope,
     sendToMany,
     resolveTargets,
     findMissingTargets,
     deliver,
     drainInbox,
     isTargetLive,
-    fireSubscribers,
     checkDeadlines,
-    checkSchedules,
     inject,
     canInject,
     noteCompactionStart,

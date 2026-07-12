@@ -1,13 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { ThreadStore } from "../core/types";
-import {
-  barrierLines,
-  formatThreadLine,
-  obligationLines,
-  owedLines,
-  scheduleLines,
-} from "../core/format";
+import { barrierLines, formatThreadLine, obligationLines, owedLines } from "../core/format";
 import { splitJournalEntries } from "../journal";
 import { err } from "./shared";
 
@@ -17,17 +11,16 @@ export function registerIntrospectionTools(pi: ExtensionAPI, store: ThreadStore)
     name: "thread_status",
     label: "Thread Status",
     description:
-      "Read this thread's own state and journal. Use this to understand what you were doing before a compaction.",
+      "Read this thread's own state and journal. Use this to understand what you were doing before a compaction, and to recover the envelope ids you owe replies to.",
     parameters: Type.Object({}),
     async execute() {
       const journal =
         (await store.readJournal(store.threadId)) ?? "(no journal yet — this is the first turn)";
-      const lockDesc = `${store.lockEventId ?? "none"}${store.lockPartner ? ` (with ${store.lockPartner})` : ""}`;
       return {
         content: [
           {
             type: "text" as const,
-            text: `Id: ${store.threadId}\nRole: ${store.role ?? "-"}\nState: ${store.state}${store.holdReason ? ` (${store.holdReason})` : ""}\nStatus: ${store.status}\nLock: ${lockDesc}\nSubscriptions: ${store.subscriptions.length}\nBarriers:${barrierLines(store.barriers)}\nObligations:${obligationLines(store.obligations)}\nOwed replies:${owedLines(store.owed)}\nSchedules:${scheduleLines(store.schedules)}\n\n${journal}`,
+            text: `Id: ${store.threadId}\nRole: ${store.role ?? "-"}\nState: ${store.state}${store.holdReason ? ` (${store.holdReason})` : ""}\nStatus: ${store.status}\nBarriers:${barrierLines(store.barriers)}\nObligations:${obligationLines(store.obligations)}\nOwed replies:${owedLines(store.owed)}\n\n${journal}`,
           },
         ],
         details: {
@@ -36,14 +29,9 @@ export function registerIntrospectionTools(pi: ExtensionAPI, store: ThreadStore)
           state: store.state,
           status: store.status,
           holdReason: store.holdReason,
-          lockEventId: store.lockEventId,
-          lockPartner: store.lockPartner,
-          lockType: store.lockType,
-          subscriptions: store.subscriptions,
           obligations: store.obligations,
           owed: store.owed,
           barriers: store.barriers,
-          schedules: store.schedules,
         },
       };
     },
@@ -53,7 +41,7 @@ export function registerIntrospectionTools(pi: ExtensionAPI, store: ThreadStore)
     name: "thread_list",
     label: "Thread List",
     description:
-      "List all known threads sharing this workspace and their last known state. Use this to find a valid `to` id before calling thread_send or thread_sync_request.",
+      "List all known threads sharing this workspace and their last known state. Use this to find a valid `to` id before calling thread_send.",
     parameters: Type.Object({}),
     async execute() {
       const threads = await store.listThreads();
@@ -93,6 +81,9 @@ export function registerIntrospectionTools(pi: ExtensionAPI, store: ThreadStore)
       ),
     }),
     async execute(_id, params) {
+      if (!store.adapter.readJournal) {
+        return err("This storage backend has no journal channel (optional extension, §5).");
+      }
       if (!(await store.threadExists(params.id))) {
         return err(`No thread "${params.id}" found. Call thread_list to see known ids.`);
       }

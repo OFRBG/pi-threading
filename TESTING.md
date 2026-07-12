@@ -19,7 +19,7 @@ The clearest violation this suite had:
 // three separate flaky-CI failures this project has hit.
 assert.match(r.stdout.trim(), /^1$/m);
 const s = readState(tmpDir, "t1");
-assert.strictEqual(s?.subscriptions?.length ?? 0, 0);
+assert.strictEqual(s?.owed?.length ?? 0, 0);
 ```
 
 The state check is the real assertion — it reads the durable, structured
@@ -34,39 +34,39 @@ a strict regex. Delete assertions like this; don't loosen them.
 Three layers exist in this suite. Default to the cheapest one that can
 actually prove the behavior.
 
-| Layer                              | What it proves                                                                                                                    | How                                                                                 | Cost                                                                       |
-| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| **Unit** (`describe("unit: ...")`) | Deterministic extension logic: state transitions, obligation/barrier correlation, dedup, file writes, error handling              | `makeHarness()` — stub `pi`, no subprocess, call `store`/`inbox` functions directly | ~1ms                                                                       |
-| **E2E** (everything else today)    | The model, given only the system prompt and a natural-language ask, discovers and correctly invokes the right tool                | Real `pi` subprocess, real model call via `runPi()`                                 | 5–25s + API cost                                                           |
-| **Eval** (doesn't exist yet)       | Aggregate model judgment quality across ambiguous phrasings (e.g. "does the model pick Brief vs Note correctly ≥80% of the time") | N-sample runs, pass-rate threshold                                                  | expensive; only worth building if `system-prompt.ts` starts changing often |
+| Layer                              | What it proves                                                                                                                                  | How                                                                                 | Cost                                                                       |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| **Unit** (`describe("unit: ...")`) | Deterministic extension logic: state transitions, obligation/barrier correlation, dedup, file writes, error handling                            | `makeHarness()` — stub `pi`, no subprocess, call `store`/`inbox` functions directly | ~1ms                                                                       |
+| **E2E** (everything else today)    | The model, given only the system prompt and a natural-language ask, discovers and correctly invokes the right tool                              | Real `pi` subprocess, real model call via `runPi()`                                 | 5–25s + API cost                                                           |
+| **Eval** (doesn't exist yet)       | Aggregate model judgment quality across ambiguous phrasings (e.g. "does the model set expects=true vs a plain note correctly ≥80% of the time") | N-sample runs, pass-rate threshold                                                  | expensive; only worth building if `system-prompt.ts` starts changing often |
 
 Decision test: **does this test's outcome depend on what the model decides,
 or only on what happens after some tool gets called with some params?**
 
 - If the test would pass identically no matter which specific correctly-shaped
   tool call triggered it, it's testing deterministic logic → **unit test**,
-  drive `inbox.sendCrossThread`/`deliver`/`drainInbox`/`checkDeadlines`
+  drive `inbox.sendEnvelope`/`deliver`/`drainInbox`/`checkDeadlines`
   directly against a `makeHarness()` store. See
   `describe("unit: inbox delivery")` for the pattern.
-- If the test exists to prove the model actually _finds_ the right tool from
-  ambiguous English (e.g. "tell your parent you're stuck" → `Blocker`), that's
-  the one thing only a live model call can prove → **E2E**, and keep it.
+- If the test exists to prove the model actually _finds_ the right call from
+  ambiguous English (e.g. "tell your parent you're stuck" → a tracked request
+  to the parent), that's the one thing only a live model call can prove →
+  **E2E**, and keep it.
 
-Most of `cross-thread messaging` and `protocol: envelope, broadcast, blocker,
-barrier` today are E2E tests of the second kind's _cost_ but the first kind's
-_content_ — the prompts spell out the exact tool call
-(`Call thread_send with to="alice", type="Brief", body="task A"`), so there's
-no ambiguity left for the model to resolve. That's a known debt, not a
-model to copy for new tests: new tests for deterministic follow-through
-(does a matching Result clear the obligation, does a barrier dedup, does a
-stale lock get dropped) belong at the unit layer.
+A prompt that spells out the exact tool call (`Call thread_send with
+to="alice", expects=true, body="task A"`) pays E2E cost for unit content —
+there's no ambiguity left for the model to resolve. New tests for
+deterministic follow-through (does a matching reply clear the obligation,
+does a barrier dedup, does the discharge gate hold) belong at the unit
+layer.
 
 ## Regression discipline
 
 Every real bug becomes a permanent test at the cheapest layer that can
-express it — not a fix-and-forget. The barrier double-message bug and the
-`wait=true`-on-Note gap both became unit tests the same session they were
-found; that's the pattern to keep.
+express it — not a fix-and-forget. The barrier double-message bug, the
+misdirected-reply discharge gate (Erratum 1), and the drain-window gate
+(Erratum 5) all became unit tests the same session they were found; that's
+the pattern to keep.
 
 ## Assertion shapes that are flaky by construction
 
@@ -96,15 +96,15 @@ changing behavior, it's testing the wrong thing.
 
 Every unit test added for a happy path should prompt the question: what's
 the adjacent error path? Malformed inbox JSON, `thread_send` to an unknown
-id, answering the same `requestId` twice, arming two barriers on the same
+id, replying to the same envelope id twice, arming two barriers on the same
 id — these are cheap to add once `makeHarness()` exists for a given
 function and are currently under-covered. Don't wait for a production
 failure to add them if the harness is already there.
 
 ## One test, one reason to fail
 
-Name tests after the guaranteed behavior ("Brief creates an obligation
-that a matching Result clears" — good, keep naming this way), and keep
+Name tests after the guaranteed behavior ("expects=true records an
+obligation that a matching reply clears" — good, keep naming this way), and keep
 each test's assertions traceable to that one behavior. If a test can fail
 for two unrelated reasons, split it — a red CI run should tell you what
 broke without opening the test body.
