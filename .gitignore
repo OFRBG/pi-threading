@@ -5,3 +5,4 @@ node_modules/
 .thread/
 live-workspace/
 package-lock.json
+PROTOCOL-FORMALISM.md
