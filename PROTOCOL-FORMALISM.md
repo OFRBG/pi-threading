@@ -1,443 +1,786 @@
-# A formal model of the messaging protocol
+# TMP — Thread Messaging Protocol
 
-**Status: living document.** This is a mathematical restatement of what
-`src/inbox.ts`, `src/core/types.ts`, `src/core/thread-ops.ts`, `src/state.ts`,
-and `src/tools/{messaging,sync}.ts` implement, written to make the protocol's
-invariants explicit and check them for violations. Every claim cites the code
-it's derived from; when the code changes, this doc should change with it —
-don't let it drift into aspirational documentation. Three real defects have
-surfaced so far while building/extending the model — flagged inline as
-**Finding 1**, **Finding 2**, **Finding 3**, tracked to resolution in the
-changelog at the bottom.
+**Status:** Living Specification &nbsp;·&nbsp; **Revision:** 8 &nbsp;·&nbsp; **Relation to code:** this is the target spec; the current implementation is described by Appendix A and migrates toward the main body &nbsp;·&nbsp; **Errata:** 5 reported, 5 resolved — Erratum 5 spec-side, implementation pending (§16)
 
-## 1. Objects
+## 1. Status of this document
 
-**Threads.** `T` is the finite set of thread ids live in a workspace at a given
-time. Each `t ∈ T` owns a mutable record
+Rules are written at the generality their own justification actually has.
+Where the spec is broader or cleaner than the current implementation, the
+spec wins: the gap is either a migration item (Appendix A) or, when the
+spec catches a real defect, an **erratum** (§16). Nothing this protocol
+describes is in production, so the main body carries no compatibility
+baggage — superseded designs are dropped from the spec and survive only in
+Appendix A, as a coding reference for the migration.
 
-```
-t = ⟨σ, L, O, W, B, S, Z⟩
-```
+## 2. Layering model
 
-- `σ ∈ Σ = {open, thinking, working, listening, in-sync, on-hold, done, …}` — state (`core/types.ts:8-17`)
-- `L ∈ (RequestId × T × {sync, reply}) ∪ {⊥}` — the mutex lock, at most one at a time (`core/thread-ops.ts:10-21`)
-- `O ⊆ RequestId × T × ObligationType` — sent-side debts (`core/types.ts:59-67`)
-- `W ⊆ RequestId × T × OwedType` — received-side debts (`core/types.ts:73-79`)
-- `B` — armed barriers, each `⟨pending ⊆ RequestId, mode ∈ {all, any}⟩` (`core/types.ts:82-89`)
-- `S, Z` — local subscriptions and scheduled wakes (not central to this analysis)
-
-**Messages.** `m = ⟨from, to, τ, body, rid, δ, t⟩ ∈ M`, where
-`τ ∈ Types = {Brief, Note, Question, Answer, Update, Result, Blocker, Sync}` and
-`δ ∈ {steer, follow-up}` (`core/types.ts:19-24, 129-137`).
-
-**Type partition.** Two subsets of `Types` matter:
+The protocol is three layers with strict downward-only dependencies:
 
 ```
-ObligationType = {Brief, Question, Blocker, Sync}
-OwedType       = ObligationType \ {Sync}   (core/types.ts:27-31)
-Locking        = {Question, Blocker, Sync} (messaging.ts:128)
++----------------------------------------------------------+
+|  LAYER 2 — SEMANTICS (client-side, per-implementation)    |
+|  vocabulary (request/reply/...), obligations & owed       |
+|  replies, deadlines & nudges, barriers, state machine     |
++----------------------------------------------------------+
+|  LAYER 1 — POSTBOX (the protocol proper, wire-level)      |
+|  self-contained durable envelopes, per-thread mailboxes,  |
+|  presence, journal, delivery windows & batching           |
++----------------------------------------------------------+
+|  LAYER 0 — STORE (pluggable backend)                      |
+|  StorageAdapter (state + mailbox) | JournalAdapter (ext.) |
+|  bindings: local-fs (Appendix B), Restate                 |
++----------------------------------------------------------+
 ```
 
-`OwedType ⊊ ObligationType`: a `Sync`'s reply is produced by the lock
-machinery (`thread_sync_close`), not tracked as a durable owed record. This
-asymmetry is deliberate but, as shown below, it's also where an untracked
-edge case lives (§3).
+- **Layer 0** is a narrow storage contract. The postbox never touches a
+  filesystem, a database, or an RPC client directly — only this interface.
+  The protocol is **store-agnostic by construction**.
+- **Layer 1** is the only part two independent implementations must agree
+  on: what an envelope is, where it goes, when it may be delivered, and
+  what a thread publishes about itself.
+- **Layer 2** is meaning: which envelopes create debts, how a client
+  waits, what states it displays. None of its _machinery_ crosses the
+  wire (its published state does — §2.1); two peers can run different
+  Layer-2 policies against the same Layer-1 traffic and interoperate.
 
-## 2. The state machine
+**2.1 Three channels, one store.** Threads share three surfaces through
+the store, and only one of them is the mailbox:
 
-`σ_t` moves through `Σ` under a fixed set of triggers, all wired in
-`src/lifecycle.ts`'s `pi.on(...)` handlers plus the two lock primitives in
-`core/thread-ops.ts`. It's easiest read as one function per trigger rather
-than a single transition table, because several triggers close over more
-state than just `σ` (the lock, `holdReason`, `toolUsedThisTurn`).
+| Channel  | Access                              | Content                             | Spec  |
+| -------- | ----------------------------------- | ----------------------------------- | ----- |
+| Mailbox  | write-any, read-owner (destructive) | envelopes                           | §6–§7 |
+| Presence | write-owner, read-any               | liveness + coarse state summary     | §8    |
+| Journal  | write-owner, read-any               | history stream (optional extension) | §8    |
 
-```
-turn_start(t):        σ ← "thinking"                              (lifecycle.ts:93)
-                       wasOnHold ⟹ holdReason ← null, drain()      (lifecycle.ts:94-99)
+The mailbox is the communication channel; presence and journal are
+observability channels. No thread's Layer-2 machinery (debts, barriers)
+is ever interpreted by another thread's machinery — but some Layer-2
+_state_ is published for others to read, and readers get normative rules
+for it (§8). Those fields are Layer-1 surface, whatever layer computes
+them.
 
-tool_execution_start(t): σ ← "working"                             (lifecycle.ts:105)
+**2.2 Conformance classes.** Not every actor runs every layer. Rules bind
+by class: §5–§8 bind everyone who touches the store; §9 onward binds only
+C2 and up.
 
-turn_end(t):           σ ← rest(t, "open")                         (lifecycle.ts:110)
+| Class                     | Runs                                          | Examples                                                |
+| ------------------------- | --------------------------------------------- | ------------------------------------------------------- |
+| **C0 Observer**           | reads presence + journal                      | dashboards, `thread-cli list/status`                    |
+| **C1 Postbox actor**      | C0 + mailbox enqueue/drain                    | a human on `thread-cli send/tail`, harnesses, cron jobs |
+| **C2 Correlating client** | C1 + the debt ledger and deadlines (§9)       | a minimal agent client                                  |
+| **C3 Full client**        | C2 + waits, state machine, vocabulary profile | the pi extension                                        |
 
-agent_end(t):           σ ← rest(t, "done")                        (lifecycle.ts:181)
+Every protocol feature MUST be exercisable by a C1 actor. A feature that
+needs both peers at C3 does not belong in the protocol.
 
-acquireLock(t, r, p, k): σ ← (k = sync ? "in-sync" : "listening")   (thread-ops.ts:10-21)
-                          L ← ⟨r, p, k⟩
+**2.3 Participation is opt-in.** A process is a thread only if it
+explicitly joins (loads a client with a thread id). In particular,
+**forked children of a participating thread do not inherit participation**
+— a fork is a plain process unless explicitly enrolled. Nothing in the
+protocol assumes a process tree maps to a thread tree; `parent` (§8.1) is
+declared topology, not inherited.
 
-releaseLock(t):          σ ← "open", L ← ⊥                         (thread-ops.ts:24-29)
+## 3. Requirements language
 
-suspendThread(t, reason): σ ← "on-hold", holdReason ← reason        (thread-ops.ts:31-38)
+**MUST** / **MUST NOT**: enforced unconditionally; violations are bugs and
+are tracked in §16. **SHOULD**: followed by default, knowingly
+overridable. **MAY**: permitted, left to the acting thread's judgment.
 
-resumeThread(t):          σ ← "open", holdReason ← null, drain()    (thread-ops.ts:41-51)
-                           [no-op if σ ≠ "on-hold"]
+## 4. Terminology
 
-init(t) [process boot]:   σ ← f_restore(σ_persisted)                (state.ts:140-145)
-```
+| Term       | Meaning                                                                                                        | Layer |
+| ---------- | -------------------------------------------------------------------------------------------------------------- | ----- |
+| Thread     | An addressable peer; identity is its thread id (§6.2). Need not be a pi process — anything that speaks Layer 1 | 1     |
+| Envelope   | One message: `{id, from, to, body, sentAt, re?, expects?, urgency?, deliverAfter?}` (§6)                       | 1     |
+| Mailbox    | A thread's durable inbox: envelopes enqueue when the peer is absent, drain when it returns                     | 1     |
+| Presence   | A thread's published liveness/status record; write-owner, read-any (§8)                                        | 1     |
+| Journal    | A thread's published history stream; write-owner, read-any (§8)                                                | 1     |
+| Obligation | Sender-side record that an envelope it sent expects a reply                                                    | 2     |
+| Owed reply | Receiver-side mirror of the same debt                                                                          | 2     |
+| Barrier    | A client-side wait across outstanding envelope `id`s, resolved on `all`/`any`                                  | 2     |
 
-where the **resting-state function** `rest` is the piece of logic that keeps
-a waiting thread waiting across a turn boundary instead of being stomped back
-to `open`/`done` just because a turn finished:
+---
 
-```
-rest(t, whenUnlocked) =
-  "on-hold"                        if σ_t = "on-hold"
-  ("in-sync" if L.kind = sync
-             else "listening")     if L ≠ ⊥
-  whenUnlocked                     otherwise                       (lifecycle.ts:13-17)
-```
+# PART I — LAYER 0: THE STORE
 
-and the **restore function**, applied once at process boot from the last
-persisted `StateFile`, canonicalizes states that only made sense mid-process
-into states that make sense for a freshly-started one:
+## 5. Store contract
 
-```
-f_restore(s) =
-  "idle"   if s ∈ {"done", "stopped"}
-  "open"   if s = "in-sync"  ∨  (s = "listening" ∧ ¬keepLock)
-  s        otherwise                                               (state.ts:140-145)
-```
-
-`keepLock` is itself a small predicate worth stating explicitly, because it's
-the asymmetry between the two lock kinds made concrete: `keepLock = (L ≠ ⊥) ∧
-(L.kind = reply)` (`state.ts:124`) — a reply lock (`Question`/`Blocker`)
-survives a restart because the eventual `Answer` is a durable, addressable
-message that can still arrive at a revived process; a sync lock does not
-survive, because `in-sync` is a live rendezvous between two running
-processes and there is no message that "resumes" it — the partner's process
-identity for that conversation is gone the moment either side restarts. This
-is the same live-vs-durable distinction that makes `Sync ∉ OwedType` in §1 —
-one design decision, two independent places it has to be honored correctly.
-
-**Reachability note.** Every trigger above is monotonically forward except
-`resumeThread`/the `wasOnHold` branch of `turn_start` (both re-enter `open`
-from `on-hold`) and `releaseLock` (re-enters `open` from `listening`/
-`in-sync`). So the live subgraph of `Σ` under normal operation is a DAG with
-exactly two back-edges, both of which model "an external event ended a wait,"
-never "a turn just happened to finish." That's a useful sanity check on any
-future state: if you're about to add a new trigger that moves `σ` backward
-for a reason *other* than "a wait ended," it's very likely fighting the
-existing model rather than extending it.
-
-## 3. The conservation law
-
-Sending an obligation-type message and later closing it is meant to satisfy a
-simple invariant: **every open debt has exactly one owner-side record, on
-exactly one side, until discharged.** Formally, define two indicator predicates
-over time:
-
-```
-owes(a, r)  ⟺  ∃ entry in O_a with requestId = r      (a sent it, unanswered)
-owed(b, r)  ⟺  ∃ entry in W_b with requestId = r      (b received it, unreplied)
-```
-
-The intended lifecycle for `r`, sent `a → b` with `τ ∈ OwedType`:
-
-```
-t0: send(a, b, τ, r)         owes(a,r) := true                      (messaging.ts:153-192)
-t1: deliver at b             owed(b,r) := true                      (inbox.ts:293-301)
-t2: send(b, a', τ', r)       owed(b,r) := false   [τ' ∈ {Answer,Result}]  (inbox.ts:174-180)
-t3: deliver at a             owes(a,r) := false                     (inbox.ts:274-281)
-```
-
-The two clears (`t2`, `t3`) are **independent, asynchronous writes on
-different machines**, not one atomic transaction. `owed(b,r)` is cleared the
-instant `b` *sends*, regardless of whether the reply ever reaches `a`.
-`owes(a,r)` is cleared only when `a` actually *receives* it. This gap is
-structural — a durable multi-process system can't do better without a
-two-phase commit nobody wants here — but it means the invariant
-
-```
-∀r: owes(a,r) ⟹ owed(b,r) ∨ (r was answered and the answer is in flight)
-```
-
-is only *eventually* true, and the code's job is to bound how long the
-exception window can last and who gets told about it.
-
-### Finding 1 — the discharge guard is unconditional on destination
-
-Look again at `t2`. The clear in `sendCrossThread` is:
+The persistence surface is one core interface plus one optional
+extension:
 
 ```ts
-if (type === "Answer" || type === "Result") {
-  const before = store.owed.length;
-  store.owed = store.owed.filter(o => o.requestId !== requestId);   // inbox.ts:178
-  ...
+interface StorageAdapter {
+  configure(baseDir)                 // one-time setup
+  loadState(id) / saveState(id, s)   // the thread's own state (presence source)
+  listThreads() / threadExists(id)
+  enqueueMessage(msg)                // place msg in the mailbox msg.to names
+  drainInbox(id)                     // claim-and-remove, FIFO, atomic
+  watchInbox(id, cb)                 // live trigger — NOT a durability mechanism
+}
+
+interface JournalAdapter {           // optional extension
+  appendJournal(id, entry)
+  readJournal(id)
 }
 ```
 
-This fires for *any* `to`, as long as `requestId` matches something in `b`'s
-own `store.owed`. Formally, discharge is keyed only on `rid ∈ W_b`, not on
-`(rid, to) ∈ W_b × {correct target}`. `thread_send` layers a soft warning on
-top (`messaging.ts:119-127`, added in Phase 1 of the prior plan) when
-`to ∉ {owedMatch.from}` — but a warning is advisory text in the tool result,
-not a gate. The send still executes, `owed(b,r)` still flips false.
+A backend implements `StorageAdapter` and MAY implement `JournalAdapter`
+(`StorageAdapter & Partial<JournalAdapter>`); the journal channel (§8.3)
+simply doesn't exist on backends that omit it, and C0 readers degrade
+gracefully. The journal is split out because it is not part of the
+message world proper — it is a union _over_ it (§8.3), an extension.
 
-Consequence: if `b` sends the Answer to the wrong thread (or `a` never
-receives it because the target string was stale/typo'd but happened to
-collide with a real thread id), `owed(b,r)` clears while `owes(a,r)` never
-does. The conservation law is now permanently violated for that `r` — `a`
-has a debt nobody is tracking as owed, `b`'s ledger says the debt is gone.
-The *only* recovery path is `a`'s own deadline nudge (`checkDeadlines`,
-`inbox.ts:338-361`), and that only fires **if `a` set a `deadlineSeconds`**
-on the original send — otherwise `ob.deadline` is `undefined`, the loop's
-guard (`if (!ob.deadline || ...) continue`) skips it forever, and the
-obligation sits in `O_a` with no automatic recovery at all.
+There is no wake/timer member. A future self-wake is a self-addressed
+envelope with `deliverAfter` (§6), so Layer 0 is pure storage and delayed
+delivery is durable on every backend by the same mechanism as everything
+else.
 
-This isn't hypothetical scope-creep — it's the exact failure class the owed-
-reply nudge (Phase 1 of the prior plan) was built to catch on the *receiving*
-side, but the *sending* side's discharge is still a soft warning rather than
-a hard gate. Tightening it doesn't touch `Sync` (excluded from `OwedType`
-already, so unaffected) and is a small, local change:
+Requirements on any backend:
 
-```ts
-if (type === "Answer" || type === "Result") {
-  const owedMatch = store.owed.find(o => o.requestId === requestId);
-  if (owedMatch && owedMatch.from === to) {
-    store.owed = store.owed.filter(o => o.requestId !== requestId);
-    await store.persist();
-  }
-  // else: leave W_b alone — a misdirected/stale reply must not discharge
-  // a debt it didn't actually settle. The warning text stays as-is.
+- `enqueueMessage` MUST be durable before it returns — Layer 1's
+  "delayed, never lost" guarantee (§7.4) is only as strong as this. It
+  MUST NOT make an envelope drainable before its `deliverAfter` (if
+  present) has passed.
+- `drainInbox` MUST be atomic claim-and-remove: two concurrent drains
+  MUST NOT both return the same envelope.
+- `watchInbox` MAY be best-effort. Durability comes from the cold-start
+  drain, not the watcher.
+- State readers MUST tolerate a stale record: a thread that died without
+  cleanup is detected by `lastSeen` age (`STALE_MS`), never by trusting
+  `status` (§8.2).
+
+**5.1 The binding is the interop point.** `StorageAdapter` is a
+TypeScript interface — a contract between one codebase's modules, not
+something a Go harness or a human can link against. Independent
+implementations interoperate by agreeing on a **binding**: the concrete
+encoding of mailboxes, presence, and journals onto a shared store. The
+local-fs binding is normative in Appendix B; the Restate binding (object
+keys, handler names, payload shapes) remains an open gap (§17).
+
+**5.2 Trust model.** Everything inside one store is one trust domain:
+any actor that can reach the store can forge `from`, read any journal,
+and write into any mailbox. Envelope fields are not authenticated and are
+not meant to be — the security boundary is access to the store itself
+(filesystem permissions, Restate auth), never the protocol. Federation
+across trust domains is out of scope.
+
+---
+
+# PART II — LAYER 1: THE POSTBOX
+
+This is the protocol proper — the only layer where independent
+implementations must agree.
+
+## 6. Envelope format
+
+One self-contained record, five required fields, no type tag:
+
+```
+Envelope {
+  id:           string               own identity — always minted, never echoed (§6.2)
+  from:         ThreadId
+  to:           ThreadId             consumed at enqueue: names the target mailbox
+  body:         string
+  sentAt:       ISO-8601
+  re?:          EnvelopeId           reply correlation: discharges the debt on `re`
+  expects?:     true                 sender tracks a debt; reply with re = this id
+  urgency?:     "high" | "low"       delivery-priority level (default: low)
+  deliverAfter?: ISO-8601            not drainable before this instant
 }
 ```
 
-This changes the observable behavior on the *misdirected* path only: today a
-misdirected Answer silently succeeds and desyncs the two ledgers; with the
-guard, `owed(b,r)` stays true, `thread_status` keeps showing it, and the
-existing owed-reply nudge in `lifecycle.ts` keeps reminding `b` — which is
-the correct outcome, since `b` in fact still owes `a` a reply.
+The envelope is self-contained: `enqueueMessage(msg)` takes no target
+parameter because `to` _is_ the addressing input — the store consumes it
+to place the envelope. After placement, position is authoritative:
+receivers MUST NOT branch on `to` (an envelope in your mailbox is yours,
+wherever its `to` claims it was headed). Layer 1 treats `body` as opaque
+payload. `id`/`re` are the sole join keys between a request and its
+reply.
 
-## 4. The lock automaton and deadlock
+`urgency` is an ordered level, deliberately abstract: each client
+translates it into its own delivery mechanics — the pi client maps
+`high` to a steering injection and `low` to delivery at idle; another
+implementation may map levels onto queue priorities or notification
+tiers. It is a hint the receiving client SHOULD honor (§7.5) but no
+sender can rely on. The enum is ordered and MAY grow levels; receivers
+MUST treat unknown levels as `low`.
 
-`L` is a single mutable slot per thread — mutual exclusion, not a queue. Two
-of the three `Locking` types acquire it on the *sender's* side at send time
-(`Question`/`Blocker`, via `acquireLock` in `messaging.ts:162-164`); `Sync`
-acquires it on the sender's side too, but through a different tool
-(`thread_sync_request`, `sync.ts:46`) and unconditionally before the message
-even leaves (`acquireLock` then `sendCrossThread`, rolled back on send
-failure). All three acquire it on the *receiver's* side on delivery
-(`Sync` in `inbox.ts:304-318`; `Question`/`Blocker` don't lock the receiver —
-only the sender waits).
+`deliverAfter` makes delayed delivery a wire feature: the store holds
+the envelope invisible until the instant passes (§5). A self-addressed
+`deliverAfter` envelope is the protocol's scheduled wake (§12.2).
 
-Define the **wait-for graph** `G = (T, →)` at an instant: `a → b` iff
-`L_a = ⟨r, b, _⟩` (a is locked, waiting on a reply keyed to `r`, from `b`).
-A cycle `a → b → a` is a live deadlock candidate: both sides are locked
-waiting on each other. `resolveTargets`/existence checks (`messaging.ts:140-
-145`, `sync.ts:39-45`) rule out locking onto a thread that has *never
-existed*, but they do nothing about a thread that exists and is itself
-locked waiting on you.
+**6.1 Derived kinds.** The envelope is a union of four message kinds,
+discriminated **structurally by field presence** — never by a tag:
 
-### Finding 2 — deadlock is bounded by nudges, not prevented, and only when a deadline was set
+| Kind           | `expects` | `re` | Meaning                                                                |
+| -------------- | --------- | ---- | ---------------------------------------------------------------------- |
+| `Info`         | —         | —    | fire-and-forget                                                        |
+| `Request`      | ✓         | —    | creates an obligation/owed pair (§9)                                   |
+| `Reply`        | —         | ✓    | discharges the debt on `re`                                            |
+| `ReplyRequest` | ✓         | ✓    | discharges `re` _and_ opens a new debt — a reply that asks a follow-up |
 
-The protocol doesn't do lock-ordering or cycle detection at acquire time —
-it can't, cheaply, across independent OS processes with only a shared
-filesystem. Instead it relies on two separate mitigations, and it's worth
-being precise about what each one actually covers:
+The two optionals are orthogonal, not exclusive: `ReplyRequest` is a
+legal, useful kind. Implementations SHOULD expose this union as
+refinement types over the record (e.g. TypeScript narrowing on field
+presence) — derived, never serialized.
 
-1. **Symmetric-`Sync`-race self-healing.** If `a` and `b` call
-   `thread_sync_request` on each other concurrently, both self-lock with
-   *different* `rid`s (`mintId("sync." + partner)` — asymmetric per
-   direction) before either message lands. Whichever `Sync` arrives second
-   finds the receiver already locked and rejects it with an `Answer` keyed to
-   the *original* `rid`, which unwinds the sender's lock on delivery
-   (`inbox.ts:304-316`, the `store.lockEventId === msg.requestId` check in
-   `deliver()`). This resolves the 2-cycle **only if that rejection Answer is
-   itself delivered** — which routes through the exact same injection-gate
-   and discharge path as everything else. If it's dropped, both sides end up
-   permanently locked with no message left to unstick either one.
+**6.2 Identifiers.** All identifiers are opaque strings to receivers;
+structure inside them is for minting and debugging, never for mechanical
+branching. Constraints and recommended forms:
 
-2. **Deadline nudge for `Question`/`Blocker` cycles.** These don't self-heal
-   like `Sync` does — there's no receiver-side lock or rejection path at all,
-   just two independent sender-side locks. A cycle here is inert: nothing in
-   the system observes it as a cycle. The only way either side gets nudged
-   is `checkDeadlines` firing on an *individual* obligation's own
-   `deadlineSeconds` timer (`inbox.ts:338-361`) — a per-obligation timeout,
-   not cycle detection. **`wait`/`deadlineSeconds` are both optional
-   parameters on `thread_send`** (`messaging.ts:72-89`). A `Question`↔
-   `Question` cycle formed by two calls that both omit `deadlineSeconds` has
-   zero automatic recovery: `ob.deadline` is `undefined` for both sides,
-   `checkDeadlines`' guard skips them forever, and the only way out is a
-   human or a third thread noticing via `thread_list`/`thread_status` and
-   intervening manually.
+- **Envelope ids** MUST be unique per sender (receivers MAY use `id` as
+  a dedup key, §7.6). RECOMMENDED form: `<from>/<ulid>` — globally
+  unique by construction (sender scope + monotonic ULID), time-sortable,
+  and self-describing about origin. A bare UUID is conforming but loses
+  sortability and self-description.
+- **Thread ids** are bare names unique within a store (`--thread-id`,
+  or generated and persisted). They MUST be safe as path segments in the
+  binding (Appendix B). A namespaced form `<store>:<name>` is reserved
+  for future federation and MUST NOT be minted today (§5.2: federation
+  out of scope).
 
-So: liveness under contention is a **detect-and-recover-via-timeout**
-strategy, and today it's opt-in per call rather than a system default. The
-formal gap is narrow but real: nothing currently distinguishes "I chose not
-to set a deadline because I don't need one" from "I forgot," and the second
-case is exactly the one that leaves a true 2-cycle unrecoverable.
+**6.3 Design rationale.** Precedent from protocols that faced the same
+choices:
 
-Two independent, low-cost hardenings fall out of this, not mutually
-exclusive:
+- **Structural union, no tag** — JSON-RPC 2.0 is the closest relative: a
+  genuine Request/Notification/Response union discriminated purely by
+  field presence, no `kind` field on the wire. Rule: when the
+  discriminant is fully derivable from field presence, don't duplicate
+  it as a tag — a tag can contradict the structure, and structural
+  discrimination makes those states unrepresentable.
+- **Reply-ness as an optional header** — email (RFC 5322) models replies
+  with the optional `In-Reply-To` header on an otherwise uniform
+  message. That is `re` exactly, and it is why replies to replies cost
+  nothing: every envelope has its own `id`, so follow-ups about a reply,
+  barriers over replies, and correlation chains need no new machinery.
+- **Address on the envelope, position as truth** — like postal mail: the
+  writer addresses the envelope, the carrier routes by it, and the
+  recipient doesn't re-check the address to decide whether the letter in
+  their box is theirs.
 
-- **Default deadline for locking sends.** Give `Question`/`Blocker`/`Sync`
-  a fallback `deadlineSeconds` (e.g. via a workspace-level constant) when the
-  caller omits one, rather than leaving `ob.deadline` unset. This converts
-  "no automatic recovery" into "bounded automatic recovery" for the whole
-  `Locking` type-class, at the cost of an eventual nudge firing on
-  legitimately long-lived waits — which is exactly the tradeoff `deadlineSeconds` already exists to let a caller tune, just flipped to opt-out instead of opt-in.
-- **Cheap cycle check at acquire time.** Before `acquireLock` commits a
-  `Question`/`Blocker` lock onto partner `b`, a single `store.adapter.loadState(b)`
-  (already the primitive `isTargetLive` uses, `inbox.ts:123-127`) can check
-  whether `b`'s own `lockEventId`/`lockPartner` already points back at `a`.
-  This doesn't catch cycles that form in the race window between two
-  concurrent sends (TOCTOU — same class of gap as the `Sync` case above,
-  fundamentally unfixable without a real distributed lock), but it does
-  catch the far more common straight-line case: `a` deliberately sends a
-  `Question` to `b` while `b` is *already* sitting there waiting on `a`.
-  That's a strict, symmetric, cheap-to-check precondition failure, not a
-  probabilistic one — worth rejecting synchronously rather than deferring
-  to a timer.
+**6.4 Extensibility.** Receivers MUST ignore unknown envelope fields.
+New capabilities are added as optional fields whose absence means "old
+behavior." There is deliberately no version field: with must-ignore plus
+presence discrimination, a version tag would be a second source of truth
+that can contradict the fields it describes — §6.3's argument against
+type tags, applied to versioning.
 
-## 5. The injection gate as a queueing system
+## 7. Delivery
 
-Model each thread's own pi session as a single server with two down-states:
+**7.1 Enqueue.** Sending is one durable write into the mailbox `to`
+names. The target need not exist yet or ever run — a mailbox is a
+durable dead-drop.
 
-```
-available(t) = ¬compacting(t) ∧ ¬inFlight(t)     (canInject(), inbox.ts:91-96)
-compacting(t): true for ≤ COMPACTION_HOLD_MAX_MS (180_000ms) after session_before_compact,
-               cleared early by session_compact
-inFlight(t):   true for ≤ INJECTION_GRACE_MS (3_000ms) after an idle-time inject(),
-               cleared early by turn_start (noteRunStarted)
-```
+**7.2 Drain.** A live pi thread drains its mailbox at session start, at
+turn boundaries, on watcher triggers, and on a heartbeat. External
+actors drain by reading their own mailbox whenever they choose —
+polling is a conforming client.
 
-Injections (`Injection = ⟨text, delivery⟩`) are produced by four independent
-sources — `drainInbox`, `checkDeadlines`, `checkSchedules`, `fireSubscribers`
-— and queue durably on disk (the inbox file, the obligation/barrier/schedule
-records themselves) whenever `¬available(t)`. `inject()` is the sole point
-where `Injection[]` becomes a real `pi.sendUserMessage` call, and it already
-does the right thing *within* one call site: it coalesces a whole `parts`
-array into **one** message, `steer` if any part demands it
-(`inbox.ts:98-108`). That's a genuine amortization — collapsing what could be
-`|parts|` separate server-availability windows into 1.
-
-### Finding 3 (optimization, not correctness) — coalescing stops at the function boundary, not the heartbeat tick
-
-`store.startHeartbeat` (wired in `lifecycle.ts:62-66`) runs all three
-heartbeat-driven checks in sequence:
-
-```ts
-await inbox.drainInbox(ctx);
-await inbox.checkDeadlines(ctx);
-await inbox.checkSchedules(ctx);
-```
-
-Each function independently: checks `canInject()`, builds its own `parts`,
-and calls `inject(parts, ctx)` on its own. If `drainInbox` finds a message to
-deliver *and* `checkDeadlines` finds an overdue obligation in the same tick,
-that's two separate `inject()` calls, and the first one — if the thread was
-idle — sets `inFlightSince = Date.now()` (`inbox.ts:104`). The second call's
-own `canInject()` check, running microseconds later, now sees
-`inFlightSince` inside the 3-second grace window and returns `false`. Not a
-lost message (deadlines/schedules leave their durable record untouched and
-retry next tick), but a **self-inflicted latency tax**: an overdue-obligation
-nudge that could have shipped in the same batch as the inbox drain instead
-waits a full `HEARTBEAT_MS` (20s) longer than necessary, purely because the
-three checks don't share one `parts` array.
-
-The fix is mechanical — thread one `parts: Injection[]` through all three
-calls (or have the heartbeat callback collect their return values) and call
-`inject()` exactly once per tick:
-
-```ts
-store.startHeartbeat(async () => {
-  const parts: Injection[] = [
-    ...(await inbox.drainInboxParts(ctx)),   // same bodies, minus the trailing inject() call
-    ...(await inbox.checkDeadlineParts(ctx)),
-    ...(await inbox.checkScheduleParts(ctx)),
-  ];
-  inbox.inject(parts, ctx);
-});
-```
-
-This is the same reasoning that motivated coalescing *within* `drainInbox`
-in the first place (documented in `inbox.ts:78-87`'s block comment) — it
-just wasn't carried one level up to the caller that already had three
-sibling sources of `Injection[]` in hand.
-
-## 6. Barrier resolution as set algebra
-
-A barrier `b = ⟨pending, mode⟩` resolves against an incoming `rid` by
+**7.3 Delivery windows.** A pi client MUST NOT inject drained envelopes
+into its live session at arbitrary moments:
 
 ```
-pending' = pending \ {rid}
-done ⟺ (mode = any) ∨ (pending' = ∅)          (inbox.ts:241-243)
+available = ¬compacting ∧ ¬inFlight
 ```
 
-i.e. `any` is existential (`∃ rid ∈ pending` — trivially satisfied the
-instant *any* member arrives, since `resolveBarriers` only runs for a `rid`
-already confirmed `∈ pending` via the `includes` filter one line above), and
-`all` is the standard set-difference-to-empty. `resolveBarriers` scans every
-barrier in `store.barriers` per delivered `Answer`/`Result`
-(`inbox.ts:233-253`) — `O(|B_t| · |pending|)` worst case per message. Given
-`|B_t|` is bounded by how many outstanding fan-out waits one thread can
-plausibly hold open at once (a handful, in practice — each one requires an
-explicit `thread_send(wait=true)` or `thread_await` call), this is not a
-scaling concern worth optimizing; noted here only because the set-algebra
-framing makes the `any`/`all` semantics and the deadline-nudge interaction
-(`inbox.ts:350-357`, same per-barrier `nudged` one-shot guard as obligations)
-fully precise rather than read off the code by inspection each time.
+`compacting` holds during context compaction (bounded by a timeout);
+`inFlight` holds briefly after an idle-time injection, cleared by
+`turn_start`. This is client behavior (Layer 2 strictly), specified here
+because it bounds Layer 1's _observable latency_.
 
-## 7. Escalation as a bounded Markov chain
+**7.4 Delayed, never lost.** While a client is unavailable, envelopes
+stay in the durable mailbox. Every wait in this protocol degrades to
+"retry later," never "drop."
 
-`owedSilentStreak ∈ {0,1,2,3}` (capped, `lifecycle.ts:148`) with transitions
+**7.5 Batching.** A client draining multiple envelopes MUST coalesce
+them into one session injection, at the highest `urgency` present; a
+client running several drain sources in one tick MUST coalesce across
+them too (Errata 3, §16).
+
+**7.6 Ordering and duplication.** Drain preserves per-mailbox FIFO by
+enqueue order (`deliverAfter` envelopes enter the order when they become
+drainable). No ordering exists _across_ channels or mailboxes — a reply
+and a presence update may be observed in either order. Enqueue is
+at-least-once from the sender's perspective: a sender that cannot tell
+whether its write landed MAY retry with the same `id`, so receivers
+SHOULD treat `id` as a dedup key.
+
+**7.7 The drain window (Erratum 5, resolved: declare-and-shrink).** §5
+requires drain to be destructive claim-and-remove, and §7.4 promises
+"delayed, never lost." Read together, durability ends at the drain — so
+the window between claiming and delivering is the protocol's one
+declared loss window, and this section bounds it: a client MUST NOT
+drain except when it can deliver in the same tick — for a pi client,
+only while the delivery window (§7.3) is open — and MUST inject every
+claimed envelope in that same tick. The residual exposure is a process
+crash inside a single drain-and-inject tick, accepted and documented
+here. Strengthening Layer 0 to peek/ack consumption (removal after
+delivery) remains available as a future upgrade; it changes the adapter
+contract and binding, not the wire.
+
+## 8. Presence and journal
+
+The two observability channels (§2.1). Both are write-owner, read-any.
+
+**8.1 Presence record.** Each thread publishes a presence record. Only
+the following fields are protocol surface; everything else in an
+implementation's state file is private to it:
+
+| Field                                      | Meaning                                                                                                                                                            |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `id`                                       | thread identity                                                                                                                                                    |
+| `status`                                   | `running` \| `stopped` — advisory only (§8.2)                                                                                                                      |
+| `lastSeen`                                 | heartbeat timestamp — the authoritative liveness signal                                                                                                            |
+| `state`                                    | coarse activity label — informative; readers MUST NOT branch mechanically on specific values, since another implementation may run a different state machine (§11) |
+| `parent`, `role`                           | declared topology and deployment metadata (§2.3)                                                                                                                   |
+| `obligations`, `owed`, `barriers` (counts) | coordination-load observability                                                                                                                                    |
+
+**8.2 Liveness rule.** Readers MUST derive liveness from `lastSeen` age
+against `STALE_MS`, overriding the stored `status` — a hard-killed
+process never writes its own obituary. This is the one presence rule
+normative for every class from C0 up.
+
+**8.3 Journal.** The journal is not a second message system — it is a
+union over the same one: an **append-only, non-draining stream of
+envelope-shaped notes** the owner writes to itself
+(`{id, from, body, sentAt}` with `from = owner`), readable by anyone,
+consumed by no one. Backends provide it through the optional
+`JournalAdapter` (§5); on backends without it the channel simply doesn't
+exist.
+
+Because entries are envelope-shaped, appends are idempotent on `id` —
+the write path needs no guarding, including for notes produced by forked
+model calls. What the pi client's journal guards actually throttle is
+_generation_ (each entry may cost a forked model call), and that is
+private Layer-2 client economy, invisible to the protocol. Readers MUST
+treat `body` as opaque text and MUST NOT parse it mechanically.
+
+---
+
+# PART III — LAYER 2: SEMANTICS
+
+Nothing below is interpreted by another thread's machinery; what a
+thread _publishes_ about itself is specified in §8. Each implementation
+brings its own version of this layer (or none — a human on `thread-cli`
+runs almost none of it and interoperates fine).
+
+## 9. Correlation: obligations and owed replies
+
+The kernel is the two envelope optionals, read directly:
+
+- **`expects`** — the envelope creates a debt: the sender MUST record an
+  obligation, the receiver MUST record an owed reply, both keyed by the
+  envelope's `id`.
+- **`re`** — the envelope discharges the debt keyed by `re`.
+
+**9.1 Discharge.** A replying thread MUST clear its owed-reply record
+for `re`, and MUST NOT clear it unless the reply's `to` matches the
+thread the debt is owed to (Errata 1, §16). Send-side warnings for
+unrecognized or misdirected `re` values SHOULD be produced.
+
+**9.2 Default deadline.** Every `expects` send SHOULD carry a deadline;
+when the caller omits one the client MUST apply a fallback
+(`DEFAULT_OBLIGATION_DEADLINE_MS`, currently 15 minutes; Errata 2/4,
+§16). An overdue obligation gets exactly one reminder (one-shot
+`nudged`).
+
+**9.3 Non-atomicity.** Discharge (at the replier) and obligation-clearing
+(at the original sender, on receipt) are independent writes on two
+processes. The guarantee is eventual; the deadline bounds the window.
+
+**9.4 Silent-debtor nudge.** A pi client whose thread ends a no-tool
+turn while holding owed replies receives an escalating passive reminder,
+capped, re-armed once per run.
+
+The reminder solicits a **canary acknowledgement**: a thread that is
+intentionally holding the debt while it works answers with the phrase
+**"Standing by"** in its turn output — a cheap, checkable signal that it
+still speaks the protocol. The canary's absence is the drift signal this
+nudge exists to catch: a thread that has slipped into answering in plain
+text (which reaches only the human, never the creditor) produces neither
+a discharging reply nor the canary. The client SHOULD therefore escalate
+on _missing canary_, not on silence alone — an acknowledged hold is
+conforming behavior and resets the escalation clock; an unacknowledged
+silent turn with debts outstanding is presumed drift. (Requires the
+client to observe its own turn text; whether the pi extension API exposes
+this is an open implementation question — the rule stands regardless,
+per §1.)
+
+The canary is not an escape hatch: it resets only the _debtor's own_
+escalation, never the counterparty's ledger — the exchange stays bounded
+by the creditor's deadline nudge (§9.2), so a thread cannot stand by
+forever unchallenged. And a thread standing by while holding
+_obligations_ (waiting on others) needs no prompting at all: that is
+conforming behavior, already bounded by the deadlines on each
+obligation.
+
+**9.5 Holds: pass the ball, don't pause the debt.** A debt has no hold
+state. A debtor that cannot yet discharge has exactly two conforming
+moves:
+
+- **Keep working, acknowledge nudges** with the canary (§9.4) — right
+  when the debtor has everything it needs and just needs time.
+- **Pass the ball** when the block is on the requester's side (missing
+  data, ambiguous ask): send a `ReplyRequest` (`re` + `expects`, §6.1)
+  — "here is what I need to proceed." This discharges the original debt
+  and opens a mirrored one owed by the requester. The ledger keeps
+  exactly one side owing the next move: deadlines tick against whoever
+  actually holds the ball, and neither side's nudge machinery fires at a
+  thread that is legitimately waiting. The final answer arrives as an
+  ordinary reply in the new exchange.
+
+Consequence for barrier users: a barrier over the original `id` resolves
+on the counter-request — the wait for _a response_ did end. A client
+that still wants the eventual answer re-arms over the new `id`.
+
+## 10. Vocabulary
+
+Words are prompt-level names for kernel patterns — they never appear on
+the wire, and any client may use different ones against the same
+traffic:
+
+| Word           | Kernel form                                                                                                                                                           |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **request**    | `expects` set — creates the debt pair (§9)                                                                                                                            |
+| **reply**      | `re` set — discharges a debt (add `expects` for a follow-up)                                                                                                          |
+| **note**       | neither — fire-and-forget; use `urgency` for attention level                                                                                                          |
+| **meeting**    | a convention, not a kind: request "meet?" → reply "ok"/"busy" → an exchange of high-urgency notes → note "closing". Exclusivity is advisory — a busy peer says "busy" |
+| **escalation** | a convention, not a kind: a request to your `parent` at high urgency                                                                                                  |
+
+There is no lock anywhere in this protocol: a client that wants to block
+on a request arms a barrier over it (§12) and stops taking other work by
+its own policy. Mutual exclusion, where wanted, is the meeting
+convention's advisory "busy."
+
+## 11. Thread state machine (pi client)
 
 ```
-toolUsedThisTurn        ⟹ streak → 0, owedNudgePending → false     (lifecycle.ts:144-146)
-¬toolUsedThisTurn ∧
-  ¬lockEventId ∧ owed≠∅ ⟹ streak → min(streak+1, 3)                (lifecycle.ts:147-148)
-agent_end                                                          
-  (every run)            ⟹ owedNudgePending → false                (lifecycle.ts:186)
+                    turn_start
+        +----------------------------------+
+        |                                  |
+        v                                  |
+  +-----------+   tool_execution   +-------+----+
+  |   OPEN    |------------------->|  THINKING  |
+  +-----------+                    +------------+
+     ^     ^                              |
+     |     |                              v
+     |     |                       +------------+
+     |     +--- resumeThread ------|  WORKING   |
+     |          (from ON-HOLD)     +------------+
+     |                               |        |
+     +--- turn_end / agent_end ------+        +--- suspend ---> ON-HOLD
+          --> OPEN / DONE
 ```
 
-`owedNudgePending` is the *emission* gate (fires at most once per run);
-`owedSilentStreak` only selects wording severity once a nudge does fire
-(`escalation` string, `lifecycle.ts:154-157`). This is a fairly deliberate
-design already (documented at length in the plan that shipped it, with a
-specific bug — unreachable escalation — caught and fixed by a second review
-pass before merge), so there's no defect to report here. One formal
-observation worth carrying forward if this is revisited: the streak counts
-*turns*, not wall-clock time. A thread that takes one very long turn to
-think and a thread that takes three quick silent turns register identically
-different severities that don't track actual elapsed debt age. If escalation
-wording is ever meant to reflect urgency rather than call-count, `receivedAt`
-on the `OwedReply` record itself (already durable, `core/types.ts:78`) is the
-more faithful signal — `now − min(o.receivedAt for o in store.owed)` instead
-of `owedSilentStreak`.
+**11.1 Resting-state rule.** `turn_end`/`agent_end` MUST NOT stomp a
+waiting state: `rest(σ) = on-hold if held; open/done otherwise`.
 
-## Summary of actionable findings
+**11.2 Restart rule.** On boot: `done`/`stopped` → `idle`. Barriers and
+debts persist (§13.2); no state encodes a wait, so nothing else needs
+repair.
 
-| # | Where | Class | Status |
-|---|-------|-------|--------|
-| 1 | `inbox.ts` (`sendCrossThread` discharge) | Correctness — conservation law violated by misdirected Answer/Result | **Fixed** — discharge now gated on `owedMatch.from === to` |
-| 2 | `tools/messaging.ts` / `core/types.ts` (lock acquisition) | Liveness — `Question`/`Blocker` cycles have zero automatic recovery when no `deadlineSeconds` is passed | **Fixed** — `DEFAULT_LOCK_DEADLINE_MS` (15min) fallback + synchronous 2-cycle rejection at acquire time; `Sync` deliberately excluded (see changelog) |
-| 3 | `lifecycle.ts` heartbeat wiring / `inbox.ts` | Latency — heartbeat's three injection sources self-serialize instead of coalescing | **Fixed** — `drainInbox`/`checkDeadlines`/`checkSchedules` take an optional `collect?: Injection[]`; heartbeat shares one array, one terminal `inject()` |
+**11.3 Back-edges.** Exactly one transition class moves backward
+(`resumeThread`), meaning "an external event ended a hold," never "a
+turn finished."
 
-None of these are urgent — the system already degrades gracefully in each
-case (dangling obligation surfaces via `thread_status` and, if a deadline was
-set, a nudge; a locked cycle is visible to any thread that runs
-`thread_list`; the latency tax is bounded by one heartbeat interval). They're
-the kind of thing worth fixing opportunistically rather than as their own
-project.
+This state machine is Layer-2 client behavior. Another implementation
+MAY run a different one (an external CLI actor effectively has two
+states). What crosses to observers is the presence record (§8) — the
+`state` label there is informative, and liveness is derived per §8.2.
 
-## Changelog
+## 12. Waiting: barriers and delayed self-sends
 
-Findings are tracked here rather than left implicit in prose above, so the
-doc's "current truth" is always visible without re-reading every section.
+**12.1 Barriers.** A client MAY arm a wait across outstanding envelope
+`id`s; resolution: `pending' = pending ∖ {re}; resolved ⟺ mode=any ∨
+pending'=∅`. Same one-shot deadline nudge as obligations. Barriers
+persist across restarts unconditionally. A barrier MAY carry a payload
+to inject on resolution — this subsumes local pub/sub ("when X resolves,
+tell me Y").
 
-| Date | Change |
-|------|--------|
-| 2026-07-02 | Initial model: §1 Objects, §3 Conservation law (Finding 1), §4 Lock automaton (Finding 2), §5 Injection gate (Finding 3), §6 Barrier algebra, §7 Escalation chain. |
-| 2026-07-11 | Added §2 State machine (turn-cycle triggers, `rest`/`f_restore`/`keepLock`) — the model was previously silent on `σ` transitions outside locks. Findings 1–3 implemented and verified (tsc/eslint/prettier clean, unit suite 123→134 tests, all passing); table above updated to reflect the fixed code, not just a plan. `Sync` was deliberately excluded from Finding 2's default-deadline and cycle-check hardening — it goes through a different tool (`thread_sync_request`) and already self-heals a concurrent-race 2-cycle via `deliver()`'s receiver-side rejection path (§4), so a timeout-based fallback would be redundant rather than protective. Changes are implemented but **not yet committed** — working tree has 5 modified files pending review. |
+**12.2 Delayed self-sends.** A scheduled wake is an envelope to self
+with `deliverAfter` (§6). It is durable, cancellable only by draining,
+and needs no client machinery beyond ordinary receive.
 
-**Open model gaps** (known incomplete, not yet formalized):
-- The subscription mechanism (`Subscription`, `fireSubscribers`) is used in
-  the message-flow sections but never given its own algebraic treatment —
-  it's structurally a lightweight pub/sub keyed on `eventId`, worth a short
-  section if it grows more call sites.
-- `ScheduledWake`/`checkSchedules` likewise — currently just referenced from
-  the queueing section (§5), not modeled as its own timer algebra.
-- No treatment yet of the `Restate` storage-adapter backend mentioned in
-  `inbox.ts:63-65`'s comment (`checkSchedules` behaves differently there) —
-  everything above is implicitly about the local-fs adapter's semantics.
-- Journal forking (`shouldJournal`/`forkJournal`) is a parallel bookkeeping
-  system this doc doesn't touch at all.
+External actors implement waiting however they like (poll, `thread-cli
+tail`) — none of this crosses the wire.
+
+## 13. Robustness considerations
+
+**13.1 Misdirected replies** desync the two ledgers permanently; the
+§9.1 gate prevents it going forward (Errata 1). **13.2 Restarts:**
+obligations, owed replies, and barriers persist unconditionally; delayed
+self-sends live in the store, not the process. **13.3 Stalled partners:**
+the default deadline (§9.2) bounds every debt; there is no lock, so
+there is no deadlock class — a thread that chooses to wait is bounded by
+its barrier's deadline. **13.4 Nothing is dropped:** every unavailable
+window degrades to durable queueing (§7.4), except the declared
+single-tick drain window (§7.7).
+
+## 14. Tool surface
+
+The full Layer-2 client needs five tools; everything else in Appendix A
+is machinery this spec has since absorbed into the envelope or deleted:
+
+| Tool      | Does                                                                        |
+| --------- | --------------------------------------------------------------------------- |
+| `send`    | enqueue an envelope (all of §6: `re`, `expects`, `urgency`, `deliverAfter`) |
+| `wait`    | arm a barrier (§12.1)                                                       |
+| `status`  | read presence — own or another's (§8.1)                                     |
+| `list`    | enumerate threads (presence summaries)                                      |
+| `journal` | read a journal (§8.3), where the backend has one                            |
+
+Acceptance test, restated from §2.2: each of these must be exercisable
+end-to-end by a C1 actor via the binding alone — `thread-cli` and file
+reads/writes, no extension on either side.
+
+## 15. Design questions (all decided)
+
+1. ~~**Should the reply deadline travel on the wire?**~~ Decided: **no**
+   — `expects` stays `true`; deadlines remain sender-private Layer-2
+   records (§9.2). Rationale for revisiting later if needed: §6.4's
+   must-ignore rule makes `expects: { by? }` a compatible extension.
+2. ~~**Erratum 5 resolution.**~~ Decided: **declare-and-shrink**, now
+   normative in §7.7; peek/ack remains a possible future Layer-0
+   upgrade.
+3. ~~**Standard vocabulary mapping.**~~ Resolved: Appendix C maps the
+   envelope onto ActivityStreams 2.0 via a JSON-LD aliasing context —
+   no wire change. schema.org was considered and rejected there (no
+   reply-correlation property; its `CommunicateAction` types would
+   reintroduce the tag §6 deleted).
+
+## 16. Errata
+
+Numbering is historical; section references are to the current revision.
+
+### Errata 1 — discharge not gated on destination (now §9.1)
+
+**Status:** Verified, resolved. The pre-fix discharge cleared the owed
+ledger on correlation-id match alone; a misdirected reply desynced the
+ledgers permanently (absent a deadline). Fixed: discharge requires the
+debt to be owed to the reply's target.
+
+### Errata 2 — no deadlock recovery for reply locks
+
+**Status:** Verified, resolved — then mooted. Question↔Question lock
+cycles with no deadline had zero automatic recovery. Fixed by a default
+deadline plus an acquire-time 2-cycle rejection; Rev 8 removes locks
+from the protocol entirely (Appendix A), deleting the problem class. The
+default deadline survives as §9.2.
+
+### Errata 3 — heartbeat sources didn't coalesce (now §7.5)
+
+**Status:** Verified, resolved. Drain/deadline/schedule checks each
+injected independently; the first one's idle-time write gated the others
+out for a full heartbeat interval. Fixed: one coalesced injection per
+tick.
+
+### Errata 4 — default deadline narrower than its own justification (now §9.2)
+
+**Status:** Verified, resolved. The fallback covered two request types
+only, though the justification (unbounded silent obligations) applies to
+every `expects` send. Generalized. Found by reading the spec, not the
+code.
+
+### Erratum 5 — the drain window contradicts "never lost" (§7.7)
+
+**Status:** Resolved in spec; implementation pending (migration step 1).
+Destructive drain (§5) plus "delayed, never lost" (§7.4) are
+inconsistent — durability ends at the drain, and the claim-to-delivery
+window was unbounded and unspecified. Resolution adopted:
+declare-and-shrink (§7.7) — drain only when delivery can happen in the
+same tick; the residual single-tick crash slice is the protocol's one
+declared loss window. Peek/ack stays available as a future Layer-0
+upgrade.
+
+**Verification:** Errata 1–3: 123→134 tests, committed `28852f3`.
+Errata 4: 134→135 tests, uncommitted at time of writing. Erratum 5:
+spec-resolved; code conformance to be established in migration step 1.
+
+## 17. Revision history
+
+| Rev | Date       | Change                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| --- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | 2026-07-02 | Initial formalization: message/obligation algebra, injection-gate queueing model, barrier set algebra, escalation chain.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| 2   | 2026-07-11 | Added explicit state-machine section; Errata 1–3 implemented, verified, committed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| 3   | 2026-07-11 | Reframed as a Petri net — conservation as place-invariant, deadlock as dead-marking vs. livelock.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| 4   | 2026-07-11 | Reframed as a protocol specification; method change (rules at their natural generality) surfaced Errata 4. Added the minimality analysis and the external-implementability criterion.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| 5   | 2026-07-11 | Restructured into three layers: Store (L0), Postbox (L1), Semantics (L2). The eight message types became a _profile_ over a two-boolean kernel; locking marked legacy.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 6   | 2026-07-11 | Minimal structural-union envelope (`id`/`re`/`expects`, four presence-discriminated kinds, positional addressing) made normative.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| 7   | 2026-07-11 | Layer review on the protocol's own merit: three channels named (mailbox/presence/journal), presence specified normatively, conformance classes, binding-is-the-interop-point, trust model, extensibility rules; Erratum 5 reported at spec level.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| 8   | 2026-07-12 | The spec becomes the target outright — no compatibility framing in the main body; the current implementation moves to Appendix A as a coding reference. `delivery` → ordered `urgency` levels (client-translated); envelope self-contained (`to` required, consumed at enqueue; `enqueueMessage(msg)`); `deliverAfter` added, deleting wake/timer members from Layer 0; `JournalAdapter` split out as an optional extension and the journal modeled as an append-only stream of envelope-shaped notes (forked-note writes guard-free; generation throttling stays client-private); identifier scheme specified (`<from>/<ulid>` recommended, arn-lite); vocabulary v2 (request/reply/note + meeting/escalation conventions — brief→request, sync→meeting, blocker folded into escalation-to-parent, question/answer/result/update merged away); locks removed from the protocol (Errata 2 mooted); state machine loses `listening`/`in-sync`; subscriptions folded into barriers-with-payload; tool surface fixed at five; local-fs binding written (Appendix B); participation declared opt-in for forked children (§2.3). Amended same day: the silent-debtor nudge (§9.4) gains a "Standing by" canary acknowledgement — escalation keys on the canary's absence, not on silence alone — bounded by the creditor's deadline so standby cannot be indefinite; §9.5 added — debts have no hold state, blocked debtors pass the ball via `ReplyRequest`; Appendix C added — JSON-LD/AS2 aliasing context, resolving §15 question 3. Design questions closed: deadline stays off the wire (§15.1); Erratum 5 resolved by declare-and-shrink, normative in §7.7. |
+
+**Open gaps:** the Restate binding (§5.1); the canary turn-text
+capability spike (§9.4); Appendix A's migration checklist is direction,
+not schedule.
+
+---
+
+# APPENDIX A — Current implementation (coding reference)
+
+The code predates Rev 8 and implements the following; this appendix
+exists so the migration can be coded against it, and shrinks as the code
+catches up. None of it is normative.
+
+**A.1 Wire format.** `InboxMessage {from, to, type, body, requestId,
+delivery, sentAt}` (`core/types.ts`). Mapping to §6:
+
+| Current                                            | Target                                             |
+| -------------------------------------------------- | -------------------------------------------------- |
+| `requestId` on `Brief`/`Question`/`Blocker`/`Sync` | `id` + `expects`                                   |
+| `requestId` on `Answer`/`Result`                   | `re` (a fresh `id` is minted)                      |
+| `requestId` on `Note`/`Update`                     | `id`                                               |
+| `type`                                             | dropped — vocabulary moves to prompt level (§10)   |
+| `delivery: "steer" \| "follow-up"`                 | `urgency: "high" \| "low"`                         |
+| `to`                                               | unchanged in shape; becomes the enqueue input (§6) |
+| —                                                  | `deliverAfter` (new)                               |
+
+`requestId` is overloaded: the envelope's own identity on a request but
+an _echo_ of someone else's on a reply, disambiguated only by `type` —
+the coupling §6 removes.
+
+**A.2 Eight-type vocabulary.** `Brief`/`Note`/`Question`/`Answer`/
+`Update`/`Result`/`Blocker`/`Sync`, each with a delivery default
+(`DEFAULT_DELIVERY`). Mechanical branches key on two sets only:
+obligation-creating `{Brief, Question, Blocker}` (+`Sync`, sender side)
+and reply-carrying `{Answer, Result}` — which is what licenses the
+collapse to `expects`/`re`. Renames en route: brief→request,
+sync→meeting; question/answer/result/update merge into request/reply/
+note; blocker becomes the escalation convention.
+
+**A.3 Locks.** `Question`/`Blocker` lock the sender until the matching
+`Answer` (`lockType: "reply"`, state `listening`); `Sync` locks both
+sides (`lockType: "sync"`, state `in-sync`) via `thread_sync_request`/
+`thread_sync_close`, with acquire-time 2-cycle rejection, `keepLock`
+restart handling, and race self-healing by rejection. All deleted by
+Rev 8: blocking becomes barrier + client policy; the rendezvous becomes
+the meeting convention (§10).
+
+**A.4 Subscriptions and schedules.** `thread_subscribe`/`thread_emit`
+(local pub/sub) fold into barriers-with-payload (§12.1);
+`thread_schedule`/`thread_schedule_cancel` and the adapter's
+`scheduleWake`/`cancelWake` fold into `deliverAfter` self-sends (§12.2).
+
+**A.5 Tool surface.** 13 tools (`thread_send`, `thread_await`,
+`thread_subscribe`, `thread_emit`, `thread_suspend`, `thread_resume`,
+`thread_schedule`, `thread_schedule_cancel`, `thread_status`,
+`thread_list`, `thread_journal`, `thread_sync_request`,
+`thread_sync_close`) → five (§14). `thread_suspend`/`thread_resume`
+survive inside the pi client as `on-hold` controls but are Layer-2 local
+and drop out of the protocol surface.
+
+**A.6 Migration checklist.**
+
+1. Wire: mint `id`, write `re`/`expects`/`urgency`/`deliverAfter`;
+   key obligations/owed/barriers on `id`; delete `type` branches.
+2. Delete locks: states `listening`/`in-sync`, `lockEventId`/
+   `lockPartner`/`lockType`, `keepLock`, cycle check, sync tools;
+   re-express blocking sends as barriers.
+3. Fold subscriptions → barrier payloads; schedules → `deliverAfter`;
+   delete `scheduleWake`/`cancelWake` from adapters.
+4. Split `JournalAdapter`; make journal appends idempotent on `id`.
+5. Collapse tools to five; move the vocabulary into the system prompt.
+6. Stop auto-loading pi-threading in forked children (§2.3).
+7. Align the local-fs adapter with Appendix B; write the Restate
+   binding.
+
+# APPENDIX B — Local-fs binding (normative target)
+
+The concrete encoding a C1 actor programs against. Root:
+`.thread/threads/` under the workspace.
+
+```
+.thread/threads/<threadId>/
+  state.json            presence + client state (owner-written)
+  journal.md            journal stream (optional — JournalAdapter)
+  inbox/
+    <ulid>.json         one envelope per file, filename = sortable id
+  inbox.tmp/            enqueue staging (same filesystem)
+```
+
+- **Enqueue:** write the envelope JSON to `inbox.tmp/<name>`, then
+  `rename(2)` into `inbox/` — atomic on POSIX, so a reader never sees a
+  partial envelope. The file name is the envelope's ULID (or its `id`
+  made path-safe), giving FIFO by sorted `readdir`.
+- **Drain:** sorted `readdir`, filter out envelopes whose `deliverAfter`
+  is in the future, read, then unlink. One consumer per mailbox is
+  assumed (the owner); the atomicity requirement in §5 is against
+  _concurrent drains by the same owner_ (e.g. heartbeat vs. watcher),
+  which the implementation MUST serialize.
+- **Presence:** `state.json`, rewritten whole (write-temp + rename).
+  Readers apply §8.2 to `lastSeen`.
+- **Journal:** append-only `journal.md`; entries are envelope-shaped
+  records serialized as fenced blocks or JSON lines (exact entry
+  encoding: open, §17).
+- **Watch:** filesystem watch on `inbox/` — best-effort per §5.
+
+Considered and not chosen: **maildir** as the mailbox encoding (its
+`tmp/`→`new/` rename discipline is exactly the enqueue rule above, and
+RFC 5322 headers could carry the envelope). Rejected for now to keep
+envelopes single-format JSON across bindings; the discipline is
+borrowed, the format is not.
+
+# APPENDIX C — JSON-LD mapping (interop annex)
+
+Resolves §15 question 3. A TMP envelope becomes valid JSON-LD **by
+reference** — no wire change, no field renames — because JSON-LD
+contexts support aliasing: TMP's field names map onto **ActivityStreams
+2.0** terms, with the three TMP-specific fields as extension terms (the
+sanctioned AS2 extension mechanism):
+
+```json
+{
+  "@context": [
+    "https://www.w3.org/ns/activitystreams",
+    {
+      "tmp": "https://pi-threading.dev/ns#",
+      "from": "attributedTo",
+      "body": "content",
+      "sentAt": "published",
+      "re": "inReplyTo",
+      "expects": "tmp:expects",
+      "urgency": "tmp:urgency",
+      "deliverAfter": { "@id": "tmp:deliverAfter", "@type": "xsd:dateTime" }
+    }
+  ]
+}
+```
+
+A request envelope, unchanged from §6, interpreted through the context:
+
+```json
+{
+  "@context": "https://pi-threading.dev/ns/context.jsonld",
+  "id": "planner/01J1XYQ8Z3",
+  "from": "planner",
+  "to": "builder",
+  "body": "ship the report by 17:00",
+  "sentAt": "2026-07-12T10:00:00Z",
+  "expects": true,
+  "urgency": "high"
+}
+```
+
+Rules:
+
+- The mapping is an **export/interop view**, never a wire requirement:
+  envelopes on the wire remain plain JSON per §6, and a binding MUST NOT
+  require receivers to process JSON-LD.
+- Exporters MAY add a node type (`"type": "Note"`), but it MUST be the
+  same constant on every envelope — kind stays structurally
+  discriminated (§6.1); a varying type would reintroduce the tag §6
+  deleted.
+- Thread ids are bare names within a store (§6.2); a full linked-data
+  export SHOULD set `@base` to the store's IRI so `from`/`to` and
+  envelope ids expand to absolute IRIs.
+
+**Why AS2 and not an email ontology.** "Inherit from email" was the
+right instinct with no maintained target: schema.org
+`Message`/`EmailMessage` has `sender`/`toRecipient`/`dateSent`/`text`
+but **no reply-correlation property** (its `CommunicateAction` types
+would also reintroduce the kind tag); SIOC (`reply_of`/`has_reply`,
+`addressed_to`) has genuine email lineage but is dormant; NEPOMUK NMO
+is a true email ontology and is dead. AS2 is email's living JSON-LD
+heir — `inReplyTo` is RFC 5322's `In-Reply-To`, actor-and-inbox is the
+native model — and W3C **Linked Data Notifications** (per-resource
+inboxes receiving JSON-LD payloads) is the standards precedent for
+TMP's whole postbox shape.

@@ -590,12 +590,23 @@ describe("Finding 2: lock liveness for Question/Blocker cycles", () => {
     assert.ok(new Date(dl).getTime() < Date.now() + 60_000);
   });
 
-  it("2a: a non-locking Brief still gets no deadline by default", async () => {
+  it("2a (generalized): a non-locking Brief also gets the default deadline", async () => {
+    // A Brief to a thread that crashes before replying is just as
+    // permanently silent as a locking cycle — same fix, same reasoning,
+    // extended once checked against the non-locking case.
     const h = makeHarness(tmpDir);
     seedRemoteThread(h, "alice");
     await callTool(h, "thread_send", { to: "alice", type: "Brief", body: "task" });
     assert.strictEqual(h.store.obligations.length, 1);
-    assert.strictEqual(h.store.obligations[0].deadline, undefined);
+    assert.ok(h.store.obligations[0].deadline);
+  });
+
+  it("2a: a Note/Update (no OwedType) gets no default deadline", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    await callTool(h, "thread_send", { to: "alice", type: "Note", body: "fyi" });
+    // Note creates no obligation at all — nothing to assert a deadline on.
+    assert.strictEqual(h.store.obligations.length, 0);
   });
 
   it("2b: a Question that would form an immediate 2-cycle is rejected before sending", async () => {

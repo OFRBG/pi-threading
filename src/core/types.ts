@@ -56,16 +56,23 @@ export const HEARTBEAT_MS = 20_000;
 export const STALE_MS = 60_000;
 export const PROCESSED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** Fallback obligation deadline for a locking send (Question/Blocker) when the
- *  caller passes no explicit deadlineSeconds. Without it a Question↔Question or
- *  Blocker cycle has zero automatic recovery: checkDeadlines skips every
- *  obligation whose deadline is undefined, so a forgotten deadline leaves a
- *  true 2-cycle unrecoverable (§3, Finding 2). 15 minutes is a deliberately
- *  generous agent-to-agent reply SLA — long enough not to nag a partner doing
- *  real work, short enough that a genuinely stuck cycle gets one nudge before
- *  a human has to notice it. Callers who need longer still pass an explicit
- *  deadlineSeconds; this only flips the default from opt-in to opt-out. */
-export const DEFAULT_LOCK_DEADLINE_MS = 15 * 60_000;
+/** Fallback obligation deadline for any obligation-creating send
+ *  (Brief/Question/Blocker — everything in OwedType) when the caller passes
+ *  no explicit deadlineSeconds. Without it, checkDeadlines skips the
+ *  obligation forever (it only fires on obligations with a set deadline),
+ *  so a forgotten deadline leaves the sender with zero automatic recovery —
+ *  originally fixed for Question/Blocker only (PROTOCOL-FORMALISM.md
+ *  Errata 2), then generalized here once the same reasoning was checked
+ *  against Brief and found to apply identically: a Brief to a thread that
+ *  crashes before replying is just as permanently silent, it just doesn't
+ *  also deadlock anyone. 15 minutes is a deliberately generous
+ *  agent-to-agent reply SLA — long enough not to nag a partner doing real
+ *  work, short enough that a stuck obligation gets one nudge before a human
+ *  has to notice it. Callers who need longer still pass an explicit
+ *  deadlineSeconds; this only flips the default from opt-in to opt-out.
+ *  Sync is excluded — it isn't in OwedType (§8.4) and already self-heals via
+ *  its receiver-side rejection path. */
+export const DEFAULT_OBLIGATION_DEADLINE_MS = 15 * 60_000;
 
 export interface Obligation {
   requestId: string;

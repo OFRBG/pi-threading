@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Barrier, Delivery, MessageType, ThreadStore } from "../core/types";
-import { DEFAULT_LOCK_DEADLINE_MS } from "../core/types";
+import { DEFAULT_OBLIGATION_DEADLINE_MS } from "../core/types";
 import { mintId } from "../core/ids";
 import { deadlineFromSeconds, nowIso } from "../core/time";
 import { acquireLock } from "../core/thread-ops";
@@ -167,15 +167,18 @@ export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inb
         }
       }
 
-      // Locking replies (Question/Blocker) fall back to a default deadline when
-      // the caller omits one, so a forgotten deadlineSeconds can't leave a true
-      // 2-cycle with zero automatic recovery (§3, Finding 2a). Sync is excluded:
-      // it flows through thread_sync_request and self-heals via its receiver-side
+      // Any obligation-creating send (Brief/Question/Blocker — OwedType) falls
+      // back to a default deadline when the caller omits one, so a forgotten
+      // deadlineSeconds can't leave the sender with zero automatic recovery
+      // (PROTOCOL-FORMALISM.md §8/§9, Errata 2 and its generalization). Sync is
+      // excluded: it isn't in OwedType and self-heals via its receiver-side
       // rejection Answer, so it needs no obligation-timer fallback.
-      const isReplyLock = type === "Question" || type === "Blocker";
+      const isOwedType = type === "Brief" || type === "Question" || type === "Blocker";
       const deadline =
         deadlineFromSeconds(params.deadlineSeconds) ??
-        (isReplyLock ? new Date(Date.now() + DEFAULT_LOCK_DEADLINE_MS).toISOString() : undefined);
+        (isOwedType
+          ? new Date(Date.now() + DEFAULT_OBLIGATION_DEADLINE_MS).toISOString()
+          : undefined);
 
       let sent: Awaited<ReturnType<Inbox["sendToMany"]>>;
       try {
