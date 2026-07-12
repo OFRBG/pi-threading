@@ -1,0 +1,13 @@
+{
+  "name": "pi-postbox",
+  "owner": {
+    "name": "OFRBG"
+  },
+  "plugins": [
+    {
+      "name": "postbox",
+      "source": "./claude",
+      "description": "Postbox thread membership for Claude Code: MCP tools + push-delivery hooks over the shared .thread/ store."
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "postbox": {
+    "command": "node",
+    "args": ["${CLAUDE_PLUGIN_ROOT}/../../bin/postbox-mcp.mjs"],
+    "env": {
+      "POSTBOX_THREAD_ID": "${POSTBOX_THREAD_ID:-claude-1}"
+    }
+  }
+}

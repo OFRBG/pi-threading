@@ -1,0 +1,8 @@
+{
+  "name": "postbox",
+  "description": "Makes this Claude Code session a Postbox thread: MCP tools for send/inbox/wait/status/list/journal over the shared .thread/ store, plus hooks that push incoming mail into the session (cold-start drain, turn-start drain, high-urgency mid-turn injection, and mail-blocks-stop).",
+  "version": "0.1.0",
+  "author": {
+    "name": "OFRBG"
+  }
+}
