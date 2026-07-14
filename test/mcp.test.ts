@@ -340,6 +340,22 @@ describe("unit: postbox-mcp server", () => {
     assert.equal(readState(dir, "a")!.obligations.length, 0, "real reply discharges");
   });
 
+  it("an expired envelope is claimed but never rendered (Rev 10 expiresAt)", async () => {
+    const c = await spawnClient("a");
+    enqueueRaw(dir, "a", {
+      id: "b/01ABCDEFGHEXPIRED0000000001",
+      from: "b",
+      to: "a",
+      body: "standup in 5 min",
+      sentAt: new Date(Date.now() - 60_000).toISOString(),
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    const res = await c.call("thread_inbox");
+    assert.equal(res.text, "(no messages)", "expired mail must not render");
+    assert.equal(inboxFiles(dir, "a").length, 0, "claimed out of the inbox");
+    assert.equal(inboxFiles(dir, "a", "processed").length, 1, "retained as audit");
+  });
+
   it("deliverAfter in the future is not drained; drains once it passes", async () => {
     const c = await spawnClient("a");
     const now = Date.now();

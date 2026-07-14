@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import type { ThreadStore, ThreadState, ThreadSummary, StateFile } from "./core/types";
-import { HEARTBEAT_MS } from "./core/types";
+import { HEARTBEAT_MS, CLIENT_CAPABILITIES } from "./core/types";
 import { nowIso } from "./core/time";
 import { forkJournalEntry } from "./journal";
 import type { ThreadAdapter } from "./adapter/types";
@@ -77,6 +77,11 @@ export function createThreadStore(
         startedAt: store.startedAt,
         lastSeen: nowIso(),
         updatedAt: nowIso(),
+        capabilities: [...CLIENT_CAPABILITIES],
+        // Advisory revive recipe (Rev 10 §8.1) — published only when the
+        // operator provides one: the extension can't guess a correct launch
+        // incantation across machines and process managers.
+        ...(process.env.PI_THREAD_WAKE ? { wake: process.env.PI_THREAD_WAKE } : {}),
       };
       await store.adapter.saveState(store.threadId, payload);
     },

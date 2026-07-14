@@ -35,6 +35,8 @@ export interface SendOptions {
   /** Not deliverable before this instant — a self-addressed deliverAfter
    *  envelope is the protocol's scheduled wake (§12.2). */
   deliverAfter?: string;
+  /** Not deliverable after this instant — discarded at drain (Rev 10 §6). */
+  expiresAt?: string;
   /** Obligation deadline; defaults per §9.2 when expects is set. */
   deadline?: string;
 }
@@ -166,6 +168,7 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
       // Absence means "low" on the wire (§6) — only high is written.
       ...(opts.urgency === "high" ? { urgency: "high" as const } : {}),
       ...(opts.deliverAfter ? { deliverAfter: opts.deliverAfter } : {}),
+      ...(opts.expiresAt ? { expiresAt: opts.expiresAt } : {}),
     };
 
     const delivered = (await isTargetLive(to)) ? "live" : "queued";

@@ -49,7 +49,7 @@ import { buildWakeLaunch } from "../src/restate/wake-launch";
 import { createLocalFsAdapter } from "../src/adapter/local-fs";
 import type { StorageAdapter } from "../src/adapter/types";
 import type { StateFile, Envelope, ThreadSummary } from "../src/core/types";
-import { STALE_MS, PROCESSED_TTL_MS, toSummary } from "../src/core/types";
+import { STALE_MS, PROCESSED_TTL_MS, CLIENT_CAPABILITIES, toSummary } from "../src/core/types";
 import { ulid, mintEnvelopeId } from "../src/core/ids";
 
 // --- harness -----------------------------------------------------------
@@ -579,6 +579,57 @@ describe("Errata 1, obligation side: misdirected replies do not clear the sender
     await h.inbox.drainInbox(h.ctx);
     assert.strictEqual(h.store.obligations.length, 0, "correct sender discharges");
     assert.strictEqual(h.store.barriers.length, 0, "correct sender resolves the barrier");
+  });
+});
+
+describe("expiresAt: stale mail self-discards at drain (Rev 10 §6)", () => {
+  it("an expired envelope is claimed into processed/ but never delivered", async () => {
+    const h = makeHarness(tmpDir);
+    seedEnvelope(h, "t1", {
+      from: "alice",
+      body: "standup in 5 min",
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    seedEnvelope(h, "t1", { from: "alice", body: "still relevant" });
+    await h.inbox.drainInbox(h.ctx);
+    assert.strictEqual(h.calls.length, 1, "only the unexpired envelope delivers");
+    assert.match(h.calls[0].content, /still relevant/);
+    assert.doesNotMatch(h.calls[0].content, /standup/);
+    assert.strictEqual(inboxFileCount(h, "t1"), 0, "expired envelope is not left queued");
+  });
+
+  it("a future expiresAt does not block delivery", async () => {
+    const h = makeHarness(tmpDir);
+    seedEnvelope(h, "t1", {
+      from: "alice",
+      body: "hurry",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    await h.inbox.drainInbox(h.ctx);
+    assert.strictEqual(h.calls.length, 1);
+    assert.match(h.calls[0].content, /hurry/);
+  });
+
+  it("thread_send expiresAfterSeconds writes expiresAt on the wire", async () => {
+    const h = makeHarness(tmpDir);
+    seedRemoteThread(h, "alice");
+    await callTool(h, "thread_send", { to: "alice", body: "now-ish", expiresAfterSeconds: 30 });
+    const written = readInboxFile(h, "alice");
+    assert.ok(written.expiresAt, "expiresAt must be set");
+    const ttl = new Date(written.expiresAt!).getTime() - Date.now();
+    assert.ok(ttl > 20_000 && ttl < 40_000, `~30s ttl, got ${ttl}ms`);
+  });
+});
+
+describe("presence: capabilities and wake (Rev 10 §8.1)", () => {
+  it("persist publishes the client capability tokens", async () => {
+    const h = makeHarness(tmpDir);
+    await h.store.persist();
+    const onDisk = JSON.parse(
+      readFileSync(join(h.store.threadDir, "state.json"), "utf8"),
+    ) as StateFile;
+    assert.deepStrictEqual(onDisk.capabilities, [...CLIENT_CAPABILITIES]);
+    assert.strictEqual(onDisk.wake, undefined, "no wake recipe unless the operator sets one");
   });
 });
 

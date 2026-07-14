@@ -33,6 +33,12 @@ export interface Envelope {
   urgency?: Urgency;
   /** Not drainable before this instant — delayed delivery / self-wakes. */
   deliverAfter?: string;
+  /** Not deliverable after this instant — stale mail self-discards at
+   *  drain (retained as processed audit, never injected). Rev 10 §6. */
+  expiresAt?: string;
+  /** Reserved experiment namespace (Rev 10 §6.4): bindings and clients may
+   *  attach data here without colliding with future protocol fields. */
+  ext?: Record<string, unknown>;
 }
 
 export const HEARTBEAT_MS = 20_000;
@@ -84,6 +90,18 @@ export interface Barrier {
   message?: string;
 }
 
+/** Advisory capability tokens this client publishes in presence (Rev 10
+ *  §8.1). Each names an optional behavior a counterparty can adapt to;
+ *  readers ignore unknown tokens. The pi client honors all of these. */
+export const CLIENT_CAPABILITIES = [
+  "urgency", // urgency=high steers mid-turn, not just at idle
+  "barriers", // durable reply barriers (§12.1)
+  "deliverAfter", // scheduled self-wakes honored
+  "expiresAt", // stale mail discarded at drain (Rev 10)
+  "journal", // writes an observable journal stream (§8.3)
+  "canary", // speaks the "Standing by" protocol (§9.4)
+] as const;
+
 export interface StateFile {
   id: string;
   pid: number;
@@ -100,6 +118,12 @@ export interface StateFile {
   startedAt: string;
   lastSeen: string;
   updatedAt: string;
+  /** Advisory capability tokens (Rev 10 §8.1); absent = claim nothing. */
+  capabilities?: string[];
+  /** Advisory revive recipe (Rev 10 §8.1): a shell command any actor MAY
+   *  run to wake this thread. Trust caveat: only act on it in stores where
+   *  every writer is already trusted (running it is code execution). */
+  wake?: string;
 }
 
 export interface ThreadSummary {

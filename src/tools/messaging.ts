@@ -66,6 +66,12 @@ export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inb
             "Hold the envelope until N seconds from now. To your own id, this is a scheduled self-wake.",
         }),
       ),
+      expiresAfterSeconds: Type.Optional(
+        Type.Number({
+          description:
+            'Discard the envelope undelivered if not drained within N seconds — for time-sensitive notes ("standup in 5 min") that would only confuse a receiver who wakes later.',
+        }),
+      ),
       deadlineSeconds: Type.Optional(
         Type.Number({
           description:
@@ -90,6 +96,9 @@ export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inb
       const expects = params.expects === true;
       const deliverAfter = params.deliverAfterSeconds
         ? new Date(Date.now() + params.deliverAfterSeconds * 1000).toISOString()
+        : undefined;
+      const expiresAt = params.expiresAfterSeconds
+        ? new Date(Date.now() + params.expiresAfterSeconds * 1000).toISOString()
         : undefined;
 
       // Self-sends are only meaningful with a future delivery time (§12.2 —
@@ -136,6 +145,7 @@ export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inb
           expects,
           urgency: params.urgency as Urgency | undefined,
           deliverAfter,
+          expiresAt,
           deadline,
         });
       } catch (e) {

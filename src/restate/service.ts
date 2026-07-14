@@ -86,8 +86,11 @@ export const ThreadObject = restate.object({
     drainInbox: async (ctx: ObjectContext): Promise<Envelope[]> => {
       const inbox = (await ctx.get<Envelope[]>("inbox")) ?? [];
       const now = Date.now();
-      const due = inbox.filter(m => !m.deliverAfter || new Date(m.deliverAfter).getTime() <= now);
-      const held = inbox.filter(m => m.deliverAfter && new Date(m.deliverAfter).getTime() > now);
+      // Expired mail (Rev 10 §6 expiresAt) is dropped at drain — this
+      // binding keeps no processed/ audit tier, so discard is deletion.
+      const live = inbox.filter(m => !m.expiresAt || new Date(m.expiresAt).getTime() > now);
+      const due = live.filter(m => !m.deliverAfter || new Date(m.deliverAfter).getTime() <= now);
+      const held = live.filter(m => m.deliverAfter && new Date(m.deliverAfter).getTime() > now);
       ctx.set("inbox", held);
       return due;
     },

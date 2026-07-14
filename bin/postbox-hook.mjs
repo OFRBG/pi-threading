@@ -83,6 +83,8 @@ function drain({ highOnly = false } = {}) {
     } catch {
       continue; // lost the claim race to another actor — theirs now
     }
+    // Expired (Rev 10 §6 expiresAt): claimed as audit, never delivered.
+    if (msg.expiresAt && Date.parse(msg.expiresAt) <= now) continue;
     claimed.push(msg);
   }
   if (claimed.length > 0) updateLedger(claimed);
@@ -103,6 +105,10 @@ function updateLedger(messages) {
     owed: [],
     barriers: [],
     startedAt: new Date().toISOString(),
+    // Advisory (Rev 10 §8.1): hooks push urgency=high mid-turn
+    // (PostToolUse) and honor deliverAfter/expiresAt at drain.
+    capabilities: ["urgency", "deliverAfter", "expiresAt"],
+    ...(process.env.POSTBOX_WAKE ? { wake: process.env.POSTBOX_WAKE } : {}),
   };
   state.obligations ??= [];
   state.owed ??= [];

@@ -179,6 +179,16 @@ export function createLocalFsAdapter(): StorageAdapter & JournalAdapter {
         // Not due yet (§6 deliverAfter): stays queued; a later drain
         // (heartbeat, boot) picks it up once the instant passes.
         if (msg.deliverAfter && new Date(msg.deliverAfter).getTime() > now) continue;
+        // Expired (Rev 10 §6 expiresAt): never delivered — claimed into
+        // processed/ as audit trail without being returned.
+        if (msg.expiresAt && new Date(msg.expiresAt).getTime() <= now) {
+          try {
+            fs.renameSync(full, path.join(processedDir, f));
+          } catch {
+            // claim race — theirs now
+          }
+          continue;
+        }
         // Rename before returning it as claimed: if the caller throws after
         // this, the message is already moved and won't be redelivered.
         try {

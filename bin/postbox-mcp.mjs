@@ -144,6 +144,11 @@ const state = {
   startedAt: nowIso(),
   lastSeen: nowIso(),
   updatedAt: nowIso(),
+  // Advisory capability tokens (Rev 10 §8.1): this server delivers pull-only
+  // (thread_inbox/thread_wait), so it honors the store-level features it
+  // drains by, and nothing turn-level (no barriers, no mid-turn urgency).
+  capabilities: ["deliverAfter", "expiresAt"],
+  ...(process.env.POSTBOX_WAKE ? { wake: process.env.POSTBOX_WAKE } : {}),
 };
 saveStateSync();
 
@@ -236,6 +241,9 @@ function drainAndRender() {
     } catch {
       continue; // already claimed — shouldn't happen (single reader)
     }
+    // Expired (Rev 10 §6 expiresAt): claimed into processed/ as audit
+    // trail, never rendered.
+    if (msg.expiresAt && new Date(msg.expiresAt).getTime() <= now) continue;
     claimed.push(msg);
   }
 
@@ -281,7 +289,7 @@ function textResult(text) {
 // --- tools ----------------------------------------------------------------
 
 function toolThreadSend(params) {
-  const { to, body, re, expects, urgency, deliverAfterSeconds } = params ?? {};
+  const { to, body, re, expects, urgency, deliverAfterSeconds, expiresAfterSeconds } = params ?? {};
   if (!to || typeof to !== "string") {
     return errorResult('thread_send: "to" is required (a thread id, or "*" to fan out)');
   }
@@ -296,6 +304,10 @@ function toolThreadSend(params) {
   const deliverAfter =
     Number.isFinite(deliverAfterSeconds) && deliverAfterSeconds > 0
       ? new Date(Date.now() + deliverAfterSeconds * 1000).toISOString()
+      : undefined;
+  const expiresAt =
+    Number.isFinite(expiresAfterSeconds) && expiresAfterSeconds > 0
+      ? new Date(Date.now() + expiresAfterSeconds * 1000).toISOString()
       : undefined;
 
   let targets;
@@ -330,6 +342,7 @@ function toolThreadSend(params) {
       ...(expects ? { expects: true } : {}),
       ...(urgency === "high" ? { urgency } : {}),
       ...(deliverAfter ? { deliverAfter } : {}),
+      ...(expiresAt ? { expiresAt } : {}),
     };
     writeMessageAtomic(targetId, message);
 
@@ -493,6 +506,11 @@ const TOOLS = [
         deliverAfterSeconds: {
           type: "number",
           description: "Hold the message for N seconds before it becomes drainable.",
+        },
+        expiresAfterSeconds: {
+          type: "number",
+          description:
+            "Discard the message undelivered if not drained within N seconds — for time-sensitive notes.",
         },
       },
       required: ["to", "body"],

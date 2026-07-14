@@ -31,6 +31,7 @@ Commands:
     --urgency <high|low>        Delivery priority (default: high — operator sends
                                 should be seen at the target's next opening)
     --deliver-after <seconds>   Hold the envelope for N seconds before delivery
+    --expires-in <seconds>      Discard undelivered after N seconds (time-sensitive notes)
     Use "<to>" = "*" to fan out to every thread except --from.
 
   inbox <id>                 Show pending and recent processed messages for a thread
@@ -82,6 +83,8 @@ function parseArgs(argv) {
       args.urgency = argv[++i];
     } else if (a === "--deliver-after") {
       args.deliverAfter = Number(argv[++i]);
+    } else if (a === "--expires-in") {
+      args.expiresIn = Number(argv[++i]);
     } else if (a === "--help" || a === "-h") {
       args.help = true;
     } else if (a === "--all") {
@@ -391,6 +394,10 @@ function cmdSend(args) {
     Number.isFinite(args.deliverAfter) && args.deliverAfter > 0
       ? new Date(Date.now() + args.deliverAfter * 1000).toISOString()
       : undefined;
+  const expiresAt =
+    Number.isFinite(args.expiresIn) && args.expiresIn > 0
+      ? new Date(Date.now() + args.expiresIn * 1000).toISOString()
+      : undefined;
 
   const base = threadsDir(args.dir);
   let targets;
@@ -429,6 +436,7 @@ function cmdSend(args) {
       ...(args.expects ? { expects: true } : {}),
       ...(urgency === "high" ? { urgency } : {}),
       ...(deliverAfter ? { deliverAfter } : {}),
+      ...(expiresAt ? { expiresAt } : {}),
     };
     const file = writeMessageAtomic(threadDir, message);
     process.stdout.write(
