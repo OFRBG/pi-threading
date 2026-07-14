@@ -62,7 +62,7 @@ function runPi(
       "--extension",
       EXT,
       "--model",
-      "deepseek/deepseek-chat",
+      process.env.PI_E2E_MODEL ?? "deepseek/deepseek-chat",
       "--thinking",
       "off",
       ...sessionArgs,
@@ -384,8 +384,12 @@ describe("scheduled self-wake", () => {
     "a natural 'remind yourself shortly' becomes a deliverAfter self-send that arrives once due",
     { timeout: TIMEOUT * 2 },
     () => {
+      // Far enough out that it cannot come due while the first run is still
+      // alive — a short delay races the in-process drain: once due, the
+      // heartbeat delivers the reminder to the same session and the "held
+      // until the next run" assertion below reads an already-drained inbox.
       const r = runPi(
-        "Schedule a reminder to yourself for 2 seconds from now saying 'check the build'. Then say done.",
+        "Schedule a reminder to yourself for 10 minutes from now saying 'check the build'. Then say done.",
         tmpDir,
         { threadId: "t1" },
       );
@@ -394,14 +398,20 @@ describe("scheduled self-wake", () => {
       // The wake is a durable self-addressed envelope, held until due.
       const pending = inboxFiles(tmpDir, "t1");
       assert.strictEqual(pending.length, 1);
-      const msg = JSON.parse(
-        readFileSync(join(tmpDir, ".thread", "threads", "t1", "inbox", pending[0]), "utf8"),
-      );
+      const envelopePath = join(tmpDir, ".thread", "threads", "t1", "inbox", pending[0]);
+      const msg = JSON.parse(readFileSync(envelopePath, "utf8"));
       assert.strictEqual(msg.to, "t1");
       assert.strictEqual(msg.from, "t1");
       assert.ok(msg.deliverAfter);
+      assert.ok(new Date(msg.deliverAfter).getTime() > Date.now(), "held: not yet due");
 
-      // By the next run it's due — boot drain delivers and clears it.
+      // Backdate the envelope on disk (a C1 actor owns these files) instead
+      // of sleeping out the delay: by the next run it's due — boot drain
+      // delivers and clears it.
+      writeFileSync(
+        envelopePath,
+        JSON.stringify({ ...msg, deliverAfter: new Date(Date.now() - 1000).toISOString() }),
+      );
       const r2 = runPi("Say 'ok'.", tmpDir, { threadId: "t1" });
       assert.ok(r2.ok);
       assert.strictEqual(inboxFiles(tmpDir, "t1").length, 0);

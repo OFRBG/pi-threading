@@ -107,7 +107,14 @@ function updateLedger(messages) {
   state.obligations ??= [];
   state.owed ??= [];
   for (const msg of messages) {
-    if (msg.re) state.obligations = state.obligations.filter(o => o.id !== msg.re);
+    if (msg.re) {
+      // Errata 1 gate, obligation side: only a reply from the thread the
+      // debt was recorded against clears it.
+      const obMatch = state.obligations.find(o => o.id === msg.re);
+      if (obMatch && obMatch.to === msg.from) {
+        state.obligations = state.obligations.filter(o => o.id !== msg.re);
+      }
+    }
     if (msg.expects && !state.owed.some(o => o.id === msg.id)) {
       state.owed.push({
         id: msg.id,

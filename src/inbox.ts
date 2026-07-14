@@ -272,12 +272,19 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     let barrierNotes: string[] = [];
 
     if (msg.re) {
-      // A reply discharges the sender-side debt keyed by `re` (§9)...
-      store.obligations = store.obligations.filter(o => o.id !== msg.re);
-      // ...and resolves any barriers armed over it (§12.1).
-      const resolved = resolveBarriers(msg.re);
-      barrierNotes = resolved.notes;
-      parts.push(...resolved.payloads);
+      // A reply discharges the sender-side debt keyed by `re` (§9) — but the
+      // Errata 1 gate applies to this ledger too: only a reply from the
+      // thread the debt was recorded against may clear it (or resolve the
+      // barriers armed over it, §12.1). A misdirected reply whose `re`
+      // merely collides with someone else's obligation renders as a plain
+      // note and leaves the ledger and barriers untouched.
+      const obMatch = store.obligations.find(o => o.id === msg.re);
+      if (!obMatch || obMatch.to === msg.from) {
+        store.obligations = store.obligations.filter(o => o.id !== msg.re);
+        const resolved = resolveBarriers(msg.re);
+        barrierNotes = resolved.notes;
+        parts.push(...resolved.payloads);
+      }
     }
 
     if (msg.expects) {

@@ -20,6 +20,7 @@ import {
   existsSync,
   readFileSync,
   readdirSync,
+  utimesSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,7 +49,7 @@ import { buildWakeLaunch } from "../src/restate/wake-launch";
 import { createLocalFsAdapter } from "../src/adapter/local-fs";
 import type { StorageAdapter } from "../src/adapter/types";
 import type { StateFile, Envelope, ThreadSummary } from "../src/core/types";
-import { STALE_MS, toSummary } from "../src/core/types";
+import { STALE_MS, PROCESSED_TTL_MS, toSummary } from "../src/core/types";
 import { ulid, mintEnvelopeId } from "../src/core/ids";
 
 // --- harness -----------------------------------------------------------
@@ -532,6 +533,68 @@ describe("Errata 1: misdirected replies do not discharge the owed ledger (§9.1)
       readFileSync(join(h.store.threadDir, "state.json"), "utf8"),
     ) as StateFile;
     assert.strictEqual(onDisk.owed.length, 0);
+  });
+});
+
+describe("Errata 1, obligation side: misdirected replies do not clear the sender's ledger (§9.3)", () => {
+  function seedObligation(h: Harness, id: string, to: string) {
+    h.store.obligations.push({
+      id,
+      to,
+      summary: "do the thing",
+      sentAt: new Date().toISOString(),
+    });
+  }
+
+  it("a reply from the wrong thread leaves the obligation and its barrier intact", async () => {
+    const h = makeHarness(tmpDir);
+    seedObligation(h, "t1/q1", "alice");
+    h.store.barriers.push({
+      id: "barrier.t1.1",
+      pending: ["t1/q1"],
+      mode: "all",
+      createdAt: new Date().toISOString(),
+    });
+    seedEnvelope(h, "t1", { from: "bob", body: "done!", re: "t1/q1" });
+    await h.inbox.drainInbox(h.ctx);
+    assert.strictEqual(h.store.obligations.length, 1, "wrong sender must not discharge");
+    assert.strictEqual(h.store.barriers.length, 1, "wrong sender must not resolve the barrier");
+    assert.deepStrictEqual(h.store.barriers[0].pending, ["t1/q1"]);
+    // The envelope still renders — as an inert reply, not a discharge.
+    assert.strictEqual(h.calls.length, 1);
+    assert.doesNotMatch(h.calls[0].content, /barrier .* resolved/);
+  });
+
+  it("the real reply still discharges and resolves after a misdirected one", async () => {
+    const h = makeHarness(tmpDir);
+    seedObligation(h, "t1/q1", "alice");
+    h.store.barriers.push({
+      id: "barrier.t1.1",
+      pending: ["t1/q1"],
+      mode: "all",
+      createdAt: new Date().toISOString(),
+    });
+    seedEnvelope(h, "t1", { from: "bob", body: "done!", re: "t1/q1" }, "0-bob.json");
+    seedEnvelope(h, "t1", { from: "alice", body: "actually done", re: "t1/q1" }, "1-alice.json");
+    await h.inbox.drainInbox(h.ctx);
+    assert.strictEqual(h.store.obligations.length, 0, "correct sender discharges");
+    assert.strictEqual(h.store.barriers.length, 0, "correct sender resolves the barrier");
+  });
+});
+
+describe("local-fs: processed/ GC (Appendix B)", () => {
+  it("drain prunes processed files older than PROCESSED_TTL_MS", async () => {
+    const h = makeHarness(tmpDir, "gc1");
+    const processed = join(h.store.threadDir, "inbox", "processed");
+    const oldFile = join(processed, "ancient.json");
+    const freshFile = join(processed, "fresh.json");
+    writeFileSync(oldFile, "{}");
+    writeFileSync(freshFile, "{}");
+    const past = new Date(Date.now() - PROCESSED_TTL_MS - 60_000);
+    utimesSync(oldFile, past, past);
+    await h.inbox.drainInbox(h.ctx);
+    assert.strictEqual(existsSync(oldFile), false, "expired file must be GC'd");
+    assert.strictEqual(existsSync(freshFile), true, "fresh file must survive");
   });
 });
 

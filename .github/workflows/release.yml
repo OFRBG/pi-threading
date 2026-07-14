@@ -1,0 +1,49 @@
+# Publish @ofrbg/pi-threading to the GitHub npm registry on every v* tag.
+# Only the free suites run here (unit + MCP + typecheck + lint) — the e2e
+# suites need a model API key and real spend, so they stay local/manual.
+#
+# Consumers need a token even to install (GitHub Packages has no anonymous
+# read). In the consuming project or ~/.npmrc:
+#   @ofrbg:registry=https://npm.pkg.github.com
+#   //npm.pkg.github.com/:_authToken=<a read:packages PAT>
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+
+      - run: npm install
+
+      - run: npx tsc --noEmit
+      - run: npm run lint
+      - run: npm run test:unit
+      - run: npm run test:mcp
+
+      # Refuse to publish a tag that disagrees with package.json.
+      - name: Check tag matches package version
+        run: |
+          pkg="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$pkg" != "$tag" ]; then
+            echo "package.json is $pkg but tag is $tag" >&2
+            exit 1
+          fi
+
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

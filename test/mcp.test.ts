@@ -302,6 +302,44 @@ describe("unit: postbox-mcp server", () => {
     assert.equal(readState(dir, "a")!.owed.length, 0, "correct reply discharges the debt");
   });
 
+  it("draining a reply clears the obligation only when it comes from the right thread", async () => {
+    const c = await spawnClient("a");
+    await spawnClient("b");
+    const sent = await c.call("thread_send", { to: "b", body: "do it", expects: true });
+    const idMatch = /id=(\S+)/.exec(sent.text);
+    assert.ok(idMatch, `sent text carries the envelope id: ${sent.text}`);
+    const id = idMatch![1];
+    assert.equal(readState(dir, "a")!.obligations.length, 1);
+
+    // A reply from an unrelated thread echoing the same re must not discharge.
+    enqueueRaw(dir, "a", {
+      id: "c/01ABCDEFGHIMPOSTOR000000001",
+      from: "c",
+      to: "a",
+      body: "done!",
+      sentAt: new Date().toISOString(),
+      re: id,
+    });
+    await c.call("thread_inbox");
+    assert.equal(
+      readState(dir, "a")!.obligations.length,
+      1,
+      "reply from the wrong thread must not clear the obligation",
+    );
+
+    // The real reply from b discharges it.
+    enqueueRaw(dir, "a", {
+      id: "b/01ABCDEFGHREALREPLY00000001",
+      from: "b",
+      to: "a",
+      body: "actually done",
+      sentAt: new Date().toISOString(),
+      re: id,
+    });
+    await c.call("thread_inbox");
+    assert.equal(readState(dir, "a")!.obligations.length, 0, "real reply discharges");
+  });
+
   it("deliverAfter in the future is not drained; drains once it passes", async () => {
     const c = await spawnClient("a");
     const now = Date.now();

@@ -46,9 +46,13 @@ function envelopeFileName(id: string): string {
  *  sees a partial envelope. Drain is sorted readdir → filter due → rename to
  *  processed/ → return. No internal awaits: every method runs its fs calls
  *  synchronously before returning. */
+/** How often drainInbox re-runs the processed/ GC per thread. A one-shot
+ *  flag would let a long-lived process outgrow PROCESSED_TTL_MS forever. */
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+
 export function createLocalFsAdapter(): StorageAdapter & JournalAdapter {
   let root = "";
-  const pruned = new Set<string>();
+  const lastPruned = new Map<string, number>();
 
   function threadDir(id: string): string {
     return path.join(root, id);
@@ -154,10 +158,12 @@ export function createLocalFsAdapter(): StorageAdapter & JournalAdapter {
         return [];
       }
       fs.mkdirSync(processedDir, { recursive: true });
-      // Best-effort GC of the pre-existing backlog, once per thread per
-      // process lifetime, done *before* anything from this drain is moved in.
-      if (!pruned.has(threadId)) {
-        pruned.add(threadId);
+      // Best-effort GC of the expired backlog, at most once per
+      // PRUNE_INTERVAL_MS per thread, done *before* anything from this
+      // drain is moved in.
+      const last = lastPruned.get(threadId) ?? 0;
+      if (Date.now() - last >= PRUNE_INTERVAL_MS) {
+        lastPruned.set(threadId, Date.now());
         pruneProcessed(processedDir);
       }
       const now = Date.now();

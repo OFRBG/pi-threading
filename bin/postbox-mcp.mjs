@@ -243,9 +243,14 @@ function drainAndRender() {
   const rendered = [];
   for (const msg of claimed) {
     if (msg.re) {
-      const before = state.obligations.length;
-      state.obligations = state.obligations.filter(o => o.id !== msg.re);
-      if (state.obligations.length !== before) stateChanged = true;
+      // Errata 1 gate, obligation side: only a reply from the thread the
+      // debt was recorded against clears it — a colliding `re` from anyone
+      // else renders as a plain note and leaves the ledger untouched.
+      const obMatch = state.obligations.find(o => o.id === msg.re);
+      if (obMatch && obMatch.to === msg.from) {
+        state.obligations = state.obligations.filter(o => o.id !== msg.re);
+        stateChanged = true;
+      }
     }
     if (msg.expects && !state.owed.some(o => o.id === msg.id)) {
       state.owed.push({
