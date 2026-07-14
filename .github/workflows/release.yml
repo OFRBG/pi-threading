@@ -3,9 +3,13 @@
 # Only the free suites run here (unit + MCP + typecheck + lint) — the e2e
 # suites need a model API key and real spend, so they stay local/manual.
 #
-# npmjs needs an automation token in the NPM_TOKEN repo secret; the step
-# is skipped with a warning until one exists. The GitHub publish uses the
-# built-in GITHUB_TOKEN. GH-registry consumers need a read:packages PAT:
+# The npmjs publish uses trusted publishing (OIDC) — no token secret, no
+# OTP, works with 2FA-for-writes enabled. One-time setup on npmjs.com:
+# package settings → Trusted Publisher → GitHub Actions → owner OFRBG,
+# repo pi-threading, workflow release.yml. The package must exist first
+# (initial version published manually). Requires npm >= 11.5.1, hence the
+# npm upgrade step. The GitHub publish uses the built-in GITHUB_TOKEN;
+# GH-registry consumers need a read:packages PAT:
 #   @ofrbg:registry=https://npm.pkg.github.com
 #   //npm.pkg.github.com/:_authToken=<token>
 name: release
@@ -18,6 +22,7 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write
 
 jobs:
   publish:
@@ -47,19 +52,12 @@ jobs:
             exit 1
           fi
 
-      - name: Publish pi-threading to npmjs
-        if: env.NPM_TOKEN != ''
+      # Trusted publishing: npm mints its own credential from the runner's
+      # OIDC identity — nothing to store, nothing for EOTP to block.
+      - name: Publish pi-threading to npmjs (OIDC)
         run: |
-          echo "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}" > .npmrc
+          npm install -g npm@latest
           npm publish --registry https://registry.npmjs.org --access public
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Warn when NPM_TOKEN is missing
-        if: env.NPM_TOKEN == ''
-        run: echo "::warning::NPM_TOKEN secret not set — skipped the npmjs publish"
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish @ofrbg/pi-threading to the GitHub registry
         run: |
