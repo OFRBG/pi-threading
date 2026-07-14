@@ -1,6 +1,6 @@
 {
-  "name": "@ofrbg/pi-threading",
-  "version": "0.3.1",
+  "name": "pi-threading",
+  "version": "0.3.2",
   "description": "Cross-thread communication extension for pi coding agent — independent threads that coordinate work, share state, and converse without losing context",
   "keywords": [
     "pi-package",
@@ -11,9 +11,6 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/OFRBG/pi-threading.git"
-  },
-  "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
   },
   "files": [
     "src",

@@ -1,16 +1,19 @@
-# Publish @ofrbg/pi-threading to the GitHub npm registry on every v* tag.
+# Publish on every v* tag: `pi-threading` to npmjs (primary — anonymous
+# installs) and `@ofrbg/pi-threading` to the GitHub npm registry (mirror).
 # Only the free suites run here (unit + MCP + typecheck + lint) — the e2e
 # suites need a model API key and real spend, so they stay local/manual.
 #
-# Consumers need a token even to install (GitHub Packages has no anonymous
-# read). In the consuming project or ~/.npmrc:
+# npmjs needs an automation token in the NPM_TOKEN repo secret; the step
+# is skipped with a warning until one exists. The GitHub publish uses the
+# built-in GITHUB_TOKEN. GH-registry consumers need a read:packages PAT:
 #   @ofrbg:registry=https://npm.pkg.github.com
-#   //npm.pkg.github.com/:_authToken=<a read:packages PAT>
+#   //npm.pkg.github.com/:_authToken=<token>
 name: release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -25,7 +28,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://npm.pkg.github.com
 
       - run: npm install
 
@@ -36,6 +38,7 @@ jobs:
 
       # Refuse to publish a tag that disagrees with package.json.
       - name: Check tag matches package version
+        if: github.ref_type == 'tag'
         run: |
           pkg="$(node -p "require('./package.json').version")"
           tag="${GITHUB_REF_NAME#v}"
@@ -44,6 +47,24 @@ jobs:
             exit 1
           fi
 
-      - run: npm publish
+      - name: Publish pi-threading to npmjs
+        if: env.NPM_TOKEN != ''
+        run: |
+          echo "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}" > .npmrc
+          npm publish --registry https://registry.npmjs.org --access public
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Warn when NPM_TOKEN is missing
+        if: env.NPM_TOKEN == ''
+        run: echo "::warning::NPM_TOKEN secret not set — skipped the npmjs publish"
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish @ofrbg/pi-threading to the GitHub registry
+        run: |
+          npm pkg set name=@ofrbg/pi-threading
+          echo "//npm.pkg.github.com/:_authToken=\${NODE_AUTH_TOKEN}" > .npmrc
+          npm publish --registry https://npm.pkg.github.com
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
