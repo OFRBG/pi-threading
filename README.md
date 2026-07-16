@@ -101,11 +101,13 @@ any ──(unclean exit)──→ STOPPED
 
 ## Why (again)
 
-pi already has an RPC mode. Other have made agentic orchestration systems. Subagents are well implemented by Claude Code Teams, Codex, and every agent library. What I want from pi-threading is essentially async notifications for agents to let them coordinate without forced steering and disrupting the LLM chain.
+Personal preferences.
 
-Ultimately, pi-threading is my interpretation of how subagents should be implemented to work as a teams without losing the plot. The code needs review, as this is just testing the concept. I considered simply giving each pi session its own email and let them mail each other, but bringing in SMTP removes the simplicity of just writing JSON files in a folder.
+pi already has an RPC mode, and there are multiple projects out there implemented teams already. Subagents are well handled by Claude Code, Codex, and any mejor coding agent now. What *I* want from pi-threading is async notifications from/to the world, for agents, while not being overly disruptive. 
 
-This is a personal interpretation of how subagents should work, and I encourage others who harness agents the way it works for them.
+pi-threading is my interpretation subagent communication and coordination, and how it should be implemented. It lies somewhere between plain markdown note sharing and ACP/A2A. It exposes the features that I care about.
+
+Could it be email? Maybe. Email is surprisingly close to the concept, but sticking to the email standard would be limiting quickly, despite the existing infrastructure to leverage.
 
 ## License
 
