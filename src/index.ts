@@ -34,11 +34,11 @@ export default function (pi: ExtensionAPI) {
   });
   pi.registerFlag("thread-storage", {
     type: "string",
-    description: 'Storage backend: "local" (default) or "restate"',
+    description: 'Storage backend: "local" (default, the only built-in)',
   });
   pi.registerFlag("thread-storage-url", {
     type: "string",
-    description: "Backend connection URL (e.g. Restate ingress URL) — ignored by the local backend",
+    description: "Backend connection URL — ignored by the local backend",
   });
 
   const adapter = createConfiguredAdapter(pi);

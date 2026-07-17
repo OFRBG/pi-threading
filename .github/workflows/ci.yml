@@ -19,4 +19,3 @@ jobs:
       - run: npx tsc --noEmit
       - run: npm run lint
       - run: npm run test:unit
-      - run: npm run test:mcp

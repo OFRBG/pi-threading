@@ -45,7 +45,6 @@ import {
   shouldJournal,
   JOURNAL_MIN_INTERVAL_MS,
 } from "../src/journal";
-import { buildWakeLaunch } from "../src/restate/wake-launch";
 import { createLocalFsAdapter } from "../src/adapter/local-fs";
 import type { StorageAdapter } from "../src/adapter/types";
 import type { StateFile, Envelope, ThreadSummary } from "../src/core/types";
@@ -1786,37 +1785,6 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
     const r = await tools["thread_journal"].execute("t", { id: "solo" }, undefined, undefined, ctx);
     assert.strictEqual(r.details.ok, false);
     assert.match(r.content[0].text, /no journal channel/);
-  });
-});
-
-describe("restate: buildWakeLaunch", () => {
-  it("spawns pi against the restate backend, in the thread's own cwd", () => {
-    const l = buildWakeLaunch(
-      "t1",
-      "[delayed envelope due #t1/01X] — drain your inbox.",
-      "/work/space",
-      {},
-    );
-    assert.strictEqual(l.cmd, "pi");
-    assert.strictEqual(l.cwd, "/work/space");
-    const args = l.args.join(" ");
-    assert.match(args, /--thread-id t1/);
-    assert.match(args, /--thread-storage restate/);
-    assert.match(args, /--thread-storage-url http:\/\/localhost:8080/);
-    assert.match(args, /--print \[delayed envelope due #t1\/01X\]/);
-    assert.doesNotMatch(args, /--extension/); // only when PI_THREAD_EXTENSION is set
-  });
-
-  it("honors RESTATE_INGRESS_URL, PI_THREAD_EXTENSION, and PI_BIN from the service environment", () => {
-    const l = buildWakeLaunch("t1", "wake up", "/w", {
-      RESTATE_INGRESS_URL: "http://restate.internal:8080",
-      PI_THREAD_EXTENSION: "/opt/pi-threading/src/index.ts",
-      PI_BIN: "/opt/pi/bin/pi",
-    });
-    assert.strictEqual(l.cmd, "/opt/pi/bin/pi");
-    const args = l.args.join(" ");
-    assert.match(args, /--thread-storage-url http:\/\/restate\.internal:8080/);
-    assert.match(args, /--extension \/opt\/pi-threading\/src\/index\.ts/);
   });
 });
 

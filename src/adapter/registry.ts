@@ -1,10 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createLocalFsAdapter } from "./local-fs";
 import type { ThreadAdapter } from "./types";
-import { createRestateAdapter } from "../restate/adapter";
 
 export interface AdapterOptions {
-  /** Backend-specific connection target, e.g. a Restate ingress URL. */
+  /** Backend-specific connection target, e.g. a DB or ingress URL. */
   url?: string;
 }
 
@@ -15,7 +14,6 @@ export type AdapterFactory = (opts: AdapterOptions) => ThreadAdapter;
  *  and registering it here; nothing else in src/ needs to change. */
 export const adapterRegistry: Record<string, AdapterFactory> = {
   local: () => createLocalFsAdapter(),
-  restate: opts => createRestateAdapter(opts),
 };
 
 /** Resolve the configured backend from CLI flags: `--thread-storage
