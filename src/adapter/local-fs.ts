@@ -3,9 +3,8 @@ import * as path from "node:path";
 import type { StateFile, Envelope, ThreadSummary } from "../core/types";
 import { PROCESSED_TTL_MS, toSummary } from "../core/types";
 import { ulid } from "../core/ids";
-import type { StorageAdapter, JournalAdapter } from "./types";
+import type { StorageAdapter, JournalAdapter, PiFlagParam, AdapterOptions } from "./types";
 
-/** Keep processed/ from growing forever — messages are audit trail, not archive. */
 function pruneProcessed(dir: string) {
   let files: string[];
   try {
@@ -25,32 +24,24 @@ function pruneProcessed(dir: string) {
   }
 }
 
-/** Envelope ids are `<from>/<ulid>` (§6.2); the filename is the ULID tail —
- *  time-sortable, so a sorted readdir IS FIFO order (Appendix B). Ids in a
- *  different (conforming) form are sanitized whole. */
 function envelopeFileName(id: string): string {
   const tail = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
   const safe = tail.replace(/[^A-Za-z0-9._-]/g, "_");
   return `${safe || ulid()}.json`;
 }
 
-/** The local-fs binding (PROTOCOL-FORMALISM.md Appendix B):
- *
- *  .thread/threads/<threadId>/
- *    state.json        presence + client state
- *    journal.md        journal stream (JournalAdapter extension)
- *    inbox/            one envelope per file, filename = sortable id
- *    inbox.tmp/        enqueue staging (same filesystem)
- *
- *  Enqueue is write-to-staging + rename — atomic on POSIX, so a reader never
- *  sees a partial envelope. Drain is sorted readdir → filter due → rename to
- *  processed/ → return. No internal awaits: every method runs its fs calls
- *  synchronously before returning. */
-/** How often drainInbox re-runs the processed/ GC per thread. A one-shot
- *  flag would let a long-lived process outgrow PROCESSED_TTL_MS forever. */
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
-export function createLocalFsAdapter(): StorageAdapter & JournalAdapter {
+export const options = {
+  'base-dir': {
+    type: "string",
+    description:
+      "(Storage: local) Base directory for local fs storage. Default: current working directory.",
+    default: ".",
+  },
+} satisfies Record<string, PiFlagParam>;
+
+export function createAdapter({"base-dir": baseDir}: AdapterOptions<typeof options>): StorageAdapter & JournalAdapter {
   let root = "";
   const lastPruned = new Map<string, number>();
 
@@ -71,7 +62,7 @@ export function createLocalFsAdapter(): StorageAdapter & JournalAdapter {
   }
 
   return {
-    async configure(baseDir: string) {
+    async configure() {
       root = path.join(baseDir, ".thread", "threads");
       fs.mkdirSync(root, { recursive: true });
     },

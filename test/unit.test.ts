@@ -30,22 +30,15 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { createThreadStore } from "../src/state";
+import { createStore } from "../src/state";
 import { createInbox } from "../src/inbox";
 import type { Injection } from "../src/inbox";
 import { registerLifecycle } from "../src/lifecycle";
 import { registerTools } from "../src/tools/index";
 import { registerCommands } from "../src/commands";
-import {
-  journalFingerprint,
-  isDuplicateOfLastEntry,
-  journalForkArgs,
-  journalSignature,
-  piSelfCommand,
-  shouldJournal,
-  JOURNAL_MIN_INTERVAL_MS,
-} from "../src/journal";
-import { createLocalFsAdapter } from "../src/adapter/local-fs";
+import type { ThreadingContext } from "../src/context";
+import { journalSignature, shouldJournal, JOURNAL_MIN_INTERVAL_MS } from "../src/journal";
+import { createAdapter } from "../src/adapter/local-fs";
 import type { StorageAdapter } from "../src/adapter/types";
 import type { StateFile, Envelope, ThreadSummary } from "../src/core/types";
 import { STALE_MS, PROCESSED_TTL_MS, CLIENT_CAPABILITIES, toSummary } from "../src/core/types";
@@ -89,19 +82,25 @@ function makeHarness(dir: string, id = "t1") {
     },
   } as unknown as ExtensionAPI;
 
-  const store = createThreadStore(stubPi);
+  const store = createStore(stubPi, createAdapter({ "base-dir": dir }));
   // No internal `await` in LocalFsAdapter.configure — this synchronously
   // sets its root before the call returns, same reasoning as persist()
   // below, so the harness doesn't need to become async just for this.
-  void store.adapter.configure(dir);
+  void store.adapter.configure();
   store.threadId = id;
   store.threadsRootDir = join(dir, ".thread", "threads");
   store.threadDir = join(store.threadsRootDir, id);
   mkdirSync(join(store.threadDir, "inbox", "processed"), { recursive: true });
 
   const inbox = createInbox(store, stubPi);
-  registerTools(stubPi, store, inbox);
-  registerCommands(stubPi, store, inbox);
+  const threading: ThreadingContext = {
+    pi: stubPi,
+    store,
+    inbox,
+    state: { active: true, toolUsedThisTurn: false },
+  };
+  registerTools(threading);
+  registerCommands(threading);
   // Fire-and-forget: LocalFsAdapter's writes have no internal `await`, so the
   // fs side effect (state.json existing, matching real session_start) has
   // already happened synchronously by the time this call returns, even
@@ -124,6 +123,7 @@ function makeHarness(dir: string, id = "t1") {
   return {
     store,
     inbox,
+    threading,
     tools,
     commands,
     ctx,
@@ -272,9 +272,15 @@ function makeLifecycleHarness(dir: string) {
     appendEntry: () => {},
   } as unknown as ExtensionAPI;
 
-  const store = createThreadStore(stubPi);
+  const store = createStore(stubPi, createAdapter({ "base-dir": dir }));
   const inbox = createInbox(store, stubPi);
-  registerLifecycle(stubPi, store, inbox);
+  const threading: ThreadingContext = {
+    pi: stubPi,
+    store,
+    inbox,
+    state: { active: false, toolUsedThisTurn: false },
+  };
+  registerLifecycle(threading);
 
   function makeCtx(entries: CustomEntry[] = []) {
     return {
@@ -649,14 +655,6 @@ describe("local-fs: processed/ GC (Appendix B)", () => {
 });
 
 describe("ids: envelope identity (§6.2)", () => {
-  it("ulid() is 26 chars and monotonic within a millisecond", () => {
-    const a = ulid(1000);
-    const b = ulid(1000);
-    assert.strictEqual(a.length, 26);
-    assert.strictEqual(b.length, 26);
-    assert.ok(b > a, "same-ms ulids must still sort in mint order");
-  });
-
   it("two sends in the same millisecond get distinct ids", async () => {
     const h = makeHarness(tmpDir);
     const a = await h.inbox.sendEnvelope("alice", "one");
@@ -1213,30 +1211,6 @@ describe("Errata 3: heartbeat coalesces its sources into one inject (§7.5)", ()
   });
 });
 
-describe("state: journal gating", () => {
-  it("journalFingerprint keeps only Working on / Done lines, case/whitespace-insensitive", () => {
-    const a = "Working on: X\nDone: y\nDoing: whatever\nNext: n1\nBlockers: none";
-    const b = "working on:  X\ndone: y\nDoing: different\nNext: n2\nBlockers: some";
-    assert.strictEqual(journalFingerprint(a), journalFingerprint(b));
-  });
-
-  it("isDuplicateOfLastEntry matches when Working on/Done are identical to the last entry", () => {
-    const journal = journalEntry(nowStamp(), "task A", "step 1");
-    const dupe = "Working on: task A\nDone: step 1\nDoing: x\nNext: y\nBlockers: none";
-    assert.strictEqual(isDuplicateOfLastEntry(journal, dupe), true);
-  });
-
-  it("isDuplicateOfLastEntry does not match genuinely different content", () => {
-    const journal = journalEntry(nowStamp(), "task A", "step 1");
-    const fresh = "Working on: task B\nDone: step 2\nDoing: x\nNext: y\nBlockers: none";
-    assert.strictEqual(isDuplicateOfLastEntry(journal, fresh), false);
-  });
-
-  it("isDuplicateOfLastEntry returns false when no journal content exists yet", () => {
-    assert.strictEqual(isDuplicateOfLastEntry(undefined, "Working on: x\nDone: y"), false);
-  });
-});
-
 describe("lifecycle: journalSignature / shouldJournal", () => {
   function bareStore() {
     const h = makeHarness(tmpDir);
@@ -1294,30 +1268,6 @@ describe("lifecycle: journalSignature / shouldJournal", () => {
     });
     assert.notStrictEqual(journalSignature(store), before);
   });
-
-  it("the journal fork opts out of extensions so it can never become a thread itself", () => {
-    const args = journalForkArgs("/ses/file.jsonl", "/tmp/x");
-    assert.ok(args.includes("--no-extensions"));
-    assert.ok(args.includes("--fork"));
-    assert.ok(!args.includes("--model"), "no model pinned unless configured");
-  });
-
-  it("piSelfCommand re-invokes pi the way this process was started", () => {
-    const nodeLaunch = piSelfCommand(["--print", "x"], "/usr/bin/node", "/opt/pi/cli.js");
-    assert.deepStrictEqual(nodeLaunch, {
-      cmd: "/usr/bin/node",
-      args: ["/opt/pi/cli.js", "--print", "x"],
-    });
-    const standalone = piSelfCommand(["--print", "x"], "/opt/pi/bin/pi", undefined);
-    assert.deepStrictEqual(standalone, { cmd: "/opt/pi/bin/pi", args: ["--print", "x"] });
-  });
-
-  it("the journal fork inherits the session's model unless one is pinned", () => {
-    assert.ok(!journalForkArgs("/s.jsonl", "/tmp/x").includes("--model"));
-    const pinned = journalForkArgs("/s.jsonl", "/tmp/x", "deepseek/deepseek-chat");
-    assert.ok(pinned.includes("--model"));
-    assert.ok(pinned.includes("deepseek/deepseek-chat"));
-  });
 });
 
 describe("lifecycle: opt-in gate (§2.3)", () => {
@@ -1339,13 +1289,14 @@ describe("lifecycle: opt-in gate (§2.3)", () => {
     h.store.stopWatcher();
   });
 
-  it("no flag but a prior thread-identity entry: stays active on a session resume", async () => {
+  it("no flag: a leftover thread-identity entry from an old session does not reactivate it (no recall)", async () => {
     const h = makeLifecycleHarness(tmpDir);
     const ctx = h.makeCtx([{ type: "custom", customType: "thread-identity", data: { id: "t7" } }]);
     await h.fire("session_start", ctx);
-    assert.ok(existsSync(join(tmpDir, ".thread", "threads", "t7", "state.json")));
-    h.store.stopHeartbeat();
-    h.store.stopWatcher();
+    assert.ok(
+      !existsSync(join(tmpDir, ".thread")),
+      "no .thread/ dir without an explicit --thread-id",
+    );
   });
 
   it("while inactive, every other lifecycle handler no-ops instead of touching an uninitialized store", async () => {
@@ -1454,7 +1405,7 @@ describe("lifecycle: silent-debtor nudge (§9.4)", () => {
 describe("commands: slash commands", () => {
   it("refuses to run when the thread never activated (opt-in gate never ran)", async () => {
     const h = makeHarness(tmpDir);
-    h.store.threadId = ""; // simulate: init() never ran
+    h.threading.state.active = false; // simulate: opt-in gate closed, init() never ran
     await callCommand(h, "/thread-status");
     assert.match(h.notifications[0].text, /hasn't opted into pi-threading/);
   });
@@ -1541,8 +1492,8 @@ function wireEnvelope(
 
 describe("adapter: LocalFsAdapter (Appendix B binding)", () => {
   it("saveState/loadState round-trips through state.json", async () => {
-    const adapter = createLocalFsAdapter();
-    await adapter.configure(tmpDir);
+    const adapter = createAdapter({ "base-dir": tmpDir });
+    await adapter.configure();
     await adapter.saveState("a", baseState("a"));
     const loaded = await adapter.loadState("a");
     assert.strictEqual(loaded?.id, "a");
@@ -1550,22 +1501,22 @@ describe("adapter: LocalFsAdapter (Appendix B binding)", () => {
   });
 
   it("loadState returns undefined for an unknown thread", async () => {
-    const adapter = createLocalFsAdapter();
-    await adapter.configure(tmpDir);
+    const adapter = createAdapter({ "base-dir": tmpDir });
+    await adapter.configure();
     assert.strictEqual(await adapter.loadState("ghost"), undefined);
   });
 
   it("threadExists reflects whether state.json is present", async () => {
-    const adapter = createLocalFsAdapter();
-    await adapter.configure(tmpDir);
+    const adapter = createAdapter({ "base-dir": tmpDir });
+    await adapter.configure();
     assert.strictEqual(await adapter.threadExists("a"), false);
     await adapter.saveState("a", baseState("a"));
     assert.strictEqual(await adapter.threadExists("a"), true);
   });
 
   it("enqueueMessage + drainInbox delivers everything exactly once, in FIFO ulid order", async () => {
-    const adapter = createLocalFsAdapter();
-    await adapter.configure(tmpDir);
+    const adapter = createAdapter({ "base-dir": tmpDir });
+    await adapter.configure();
     await adapter.enqueueMessage(wireEnvelope("alice", "bob", "first"));
     await adapter.enqueueMessage(wireEnvelope("alice", "bob", "second"));
     const claimed = await adapter.drainInbox("bob");
@@ -1578,8 +1529,8 @@ describe("adapter: LocalFsAdapter (Appendix B binding)", () => {
   });
 
   it("enqueue goes through inbox.tmp staging and leaves nothing behind", async () => {
-    const adapter = createLocalFsAdapter();
-    await adapter.configure(tmpDir);
+    const adapter = createAdapter({ "base-dir": tmpDir });
+    await adapter.configure();
     await adapter.enqueueMessage(wireEnvelope("alice", "bob", "hi"));
     const staging = join(tmpDir, ".thread", "threads", "bob", "inbox.tmp");
     assert.ok(existsSync(staging), "staging dir exists");
@@ -1593,8 +1544,8 @@ describe("adapter: LocalFsAdapter (Appendix B binding)", () => {
   });
 
   it("a retry with the same id overwrites its own file — enqueue idempotence (§7.6)", async () => {
-    const adapter = createLocalFsAdapter();
-    await adapter.configure(tmpDir);
+    const adapter = createAdapter({ "base-dir": tmpDir });
+    await adapter.configure();
     const msg = wireEnvelope("alice", "bob", "retry me");
     await adapter.enqueueMessage(msg);
     await adapter.enqueueMessage(msg);
@@ -1603,8 +1554,8 @@ describe("adapter: LocalFsAdapter (Appendix B binding)", () => {
   });
 
   it("drainInbox holds deliverAfter envelopes until due, then delivers them (§6)", async () => {
-    const adapter = createLocalFsAdapter();
-    await adapter.configure(tmpDir);
+    const adapter = createAdapter({ "base-dir": tmpDir });
+    await adapter.configure();
     await adapter.enqueueMessage(
       wireEnvelope("alice", "bob", "later", {
         deliverAfter: new Date(Date.now() + 150).toISOString(),
@@ -1618,8 +1569,8 @@ describe("adapter: LocalFsAdapter (Appendix B binding)", () => {
   });
 
   it("drainInbox leaves malformed JSON in place and never returns it", async () => {
-    const adapter = createLocalFsAdapter();
-    await adapter.configure(tmpDir);
+    const adapter = createAdapter({ "base-dir": tmpDir });
+    await adapter.configure();
     const dir = join(tmpDir, ".thread", "threads", "bob", "inbox");
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "1-bad.json"), "{not valid json");
@@ -1629,8 +1580,8 @@ describe("adapter: LocalFsAdapter (Appendix B binding)", () => {
   });
 
   it("listThreads reports a thread stale past STALE_MS as stopped", async () => {
-    const adapter = createLocalFsAdapter();
-    await adapter.configure(tmpDir);
+    const adapter = createAdapter({ "base-dir": tmpDir });
+    await adapter.configure();
     await adapter.saveState(
       "ghost",
       baseState("ghost", { lastSeen: new Date(Date.now() - STALE_MS - 1000).toISOString() }),
@@ -1640,8 +1591,8 @@ describe("adapter: LocalFsAdapter (Appendix B binding)", () => {
   });
 
   it("watchInbox doesn't throw for a thread that has never received a message (no inbox/ dir yet)", async () => {
-    const adapter = createLocalFsAdapter();
-    await adapter.configure(tmpDir);
+    const adapter = createAdapter({ "base-dir": tmpDir });
+    await adapter.configure();
     await adapter.saveState("fresh", baseState("fresh"));
     assert.ok(!existsSync(join(tmpDir, ".thread", "threads", "fresh", "inbox")));
     let fired = false;
@@ -1725,14 +1676,14 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
     const stubPi = stubPiWith(calls);
     const ctx = { ui: { setStatus: () => {} } } as unknown as ExtensionCommandContext;
 
-    const sender = createThreadStore(stubPi, fake);
+    const sender = createStore(stubPi, fake);
     sender.threadId = "sender";
     sender.threadsRootDir = "/virtual";
     sender.threadDir = "/virtual/sender";
     await sender.persist();
     const senderInbox = createInbox(sender, stubPi);
 
-    const receiver = createThreadStore(stubPi, fake);
+    const receiver = createStore(stubPi, fake);
     receiver.threadId = "receiver";
     receiver.threadsRootDir = "/virtual";
     receiver.threadDir = "/virtual/receiver";
@@ -1750,7 +1701,7 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
   it("transition persists through adapter.saveState, not raw fs", async () => {
     const fake = createFakeAdapter();
     const stubPi = stubPiWith([]);
-    const store = createThreadStore(stubPi, fake);
+    const store = createStore(stubPi, fake);
     store.threadId = "solo";
     store.threadDir = "/virtual/solo";
     await store.transition("open");
@@ -1761,7 +1712,7 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
   it("readJournal degrades to undefined on a backend without the JournalAdapter extension", async () => {
     const fake = createFakeAdapter();
     const stubPi = stubPiWith([]);
-    const store = createThreadStore(stubPi, fake);
+    const store = createStore(stubPi, fake);
     store.threadId = "solo";
     assert.strictEqual(await store.readJournal("solo"), undefined);
   });
@@ -1776,11 +1727,11 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
       },
       registerCommand: () => {},
     } as unknown as ExtensionAPI;
-    const store = createThreadStore(stubPi, fake);
+    const store = createStore(stubPi, fake);
     store.threadId = "solo";
     await store.persist();
     const inbox = createInbox(store, stubPi);
-    registerTools(stubPi, store, inbox);
+    registerTools({ pi: stubPi, store, inbox, state: { active: true, toolUsedThisTurn: false } });
     const ctx = { ui: { setStatus: () => {} } } as unknown as ExtensionCommandContext;
     const r = await tools["thread_journal"].execute("t", { id: "solo" }, undefined, undefined, ctx);
     assert.strictEqual(r.details.ok, false);
@@ -1895,8 +1846,8 @@ describe("core: toSummary / formatThreadLine coordination counts", () => {
 
 describe("state: restore rules (§11.2)", () => {
   it("done/stopped restore to idle; unknown legacy states settle to open", async () => {
-    const adapter = createLocalFsAdapter();
-    await adapter.configure(tmpDir);
+    const adapter = createAdapter({ "base-dir": tmpDir });
+    await adapter.configure();
     await adapter.saveState("a", baseState("a", { state: "done" }));
     // A state.json from a pre-Rev-8 file may carry a state this revision
     // no longer knows (e.g. "listening") — it must settle to open.
@@ -1919,22 +1870,22 @@ describe("state: restore rules (§11.2)", () => {
         sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
       }) as unknown as ExtensionContext;
 
-    const storeA = createThreadStore(stubPi);
-    await storeA.init(tmpDir, mkCtx());
+    const storeA = createStore(stubPi, createAdapter({ "base-dir": tmpDir }));
+    await storeA.init(mkCtx());
     assert.strictEqual(storeA.state, "idle");
 
     const stubPiB = {
       ...stubPi,
       getFlag: (name: string) => (name === "thread-id" ? "b" : undefined),
     } as unknown as ExtensionAPI;
-    const storeB = createThreadStore(stubPiB);
-    await storeB.init(tmpDir, mkCtx());
+    const storeB = createStore(stubPiB, createAdapter({ "base-dir": tmpDir }));
+    await storeB.init(mkCtx());
     assert.strictEqual(storeB.state, "open");
   });
 
   it("debts and barriers survive a restart unconditionally (§13.2)", async () => {
-    const adapter = createLocalFsAdapter();
-    await adapter.configure(tmpDir);
+    const adapter = createAdapter({ "base-dir": tmpDir });
+    await adapter.configure();
     await adapter.saveState(
       "a",
       baseState("a", {
@@ -1953,8 +1904,8 @@ describe("state: restore rules (§11.2)", () => {
       getFlag: (name: string) => (name === "thread-id" ? "a" : undefined),
       appendEntry: () => {},
     } as unknown as ExtensionAPI;
-    const store = createThreadStore(stubPi);
-    await store.init(tmpDir, {
+    const store = createStore(stubPi, createAdapter({ "base-dir": tmpDir }));
+    await store.init({
       cwd: tmpDir,
       ui: { setStatus: () => {} },
       sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
@@ -1980,7 +1931,7 @@ describe("state: watcher idempotency", () => {
       registerTool: () => {},
       registerCommand: () => {},
     } as unknown as ExtensionAPI;
-    const store = createThreadStore(stubPi, counting);
+    const store = createStore(stubPi, counting);
     store.threadId = "w1";
     const ctx = { ui: { setStatus: () => {} } } as unknown as ExtensionContext;
     store.startWatcher(() => {}, ctx);

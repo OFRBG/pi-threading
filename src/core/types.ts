@@ -165,7 +165,7 @@ export interface ThreadStore extends ThreadData {
   transition: (next: ThreadState, ctx?: ExtensionContext) => Promise<void>;
   /** Persist the current in-memory state through the storage adapter. */
   persist: () => Promise<void>;
-  init: (cwd: string, ctx: ExtensionContext) => Promise<void>;
+  init: (ctx: ExtensionContext) => Promise<void>;
   shutdown: (reason: string) => Promise<void>;
   listThreads: () => Promise<ThreadSummary[]>;
   /** Undefined on backends without the JournalAdapter extension. */

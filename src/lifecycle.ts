@@ -1,8 +1,10 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ThreadStore, ThreadState } from "./core/types";
-import type { Inbox, Injection } from "./inbox";
+import type { Injection } from "./inbox";
+import type { ThreadingContext } from "./context";
 import { threadModelPrompt } from "./core/system-prompt";
 import { journalMode, shouldJournal } from "./journal";
+import { ThreadingTool } from "./tools/index";
 
 /** Wiring into pi's event stream: state transitions across the turn cycle,
  *  the silent-debtor nudge, journal cadence triggers, and the thread-model
@@ -15,43 +17,24 @@ function restingState(store: ThreadStore, whenFree: ThreadState): ThreadState {
   return whenFree;
 }
 
-/** True once this session has stamped its own thread-identity entry — the
- *  signal that lets a later launch of the *same* session stay a thread
- *  without repassing --thread-id. Mirrors the lookup in state.ts's init(). */
-function hasThreadIdentity(ctx: ExtensionContext): boolean {
-  try {
-    for (const e of ctx.sessionManager.getEntries()) {
-      if (e.type === "custom" && e.customType === "thread-identity") return true;
-    }
-  } catch {
-    // --no-session or unreadable session — nothing to recover.
-  }
-  return false;
+function hasThreadId(pi: ExtensionAPI): boolean {
+  const id = pi.getFlag("thread-id");
+  return typeof id === "string" && id.length > 0;
 }
 
-export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox) {
-  let toolUsedThisTurn = false;
-  // Opt-in gate (§2.3 — participation is opt-in): this extension only turns
-  // a directory into a pi-threading workspace when explicitly asked —
-  // --thread-id on this launch, or a thread-identity entry already stamped
-  // into this session's own history from an earlier one. Every handler below
-  // no-ops while this is false, so an unrelated session (including forked
-  // children, which never inherit participation) never gets a .thread/ dir,
-  // a random identity, the thread_* tools, or the thread-model system prompt.
-  let active = false;
+export function registerLifecycle(threadingCtx: ThreadingContext) {
+  const { pi, store, inbox, state } = threadingCtx;
 
   pi.on("session_start", async (_event, ctx) => {
-    const flagId = pi.getFlag("thread-id");
-    active = (typeof flagId === "string" && flagId.length > 0) || hasThreadIdentity(ctx);
-    if (!active) {
-      // Keep the thread_* tools out of this session's active set entirely —
-      // an unrelated session shouldn't see them offered, let alone have the
-      // model attempt one against an uninitialized store.
-      pi.setActiveTools(pi.getActiveTools().filter(name => !name.startsWith("thread_")));
+    state.active = hasThreadId(threadingCtx.pi);
+
+    if (!state.active) {
+      const threadTools: string[] = Object.values(ThreadingTool);
+      pi.setActiveTools(pi.getActiveTools().filter(name => !threadTools.includes(name)));
       return;
     }
 
-    await store.init(ctx.cwd, ctx);
+    await store.init(ctx);
 
     // Defer initial drain to next tick — calling pi.sendUserMessage
     // synchronously from session_start deadlocks turn scheduling.
@@ -77,24 +60,24 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
   // agent run that races the context rewrite. Mirror the TUI: hold the
   // inbox during compaction, flush as soon as it ends.
   pi.on("session_before_compact", async () => {
-    if (active) inbox.noteCompactionStart();
+    if (state.active) inbox.noteCompactionStart();
   });
 
   pi.on("session_compact", async (_event, ctx) => {
-    if (!active) return;
+    if (!state.active) return;
     inbox.noteCompactionEnd();
     await inbox.drainInbox(ctx);
   });
 
   pi.on("session_shutdown", async event => {
-    if (active) await store.shutdown(event.reason);
+    if (state.active) await store.shutdown(event.reason);
   });
 
   pi.on("turn_start", async (_event, ctx) => {
-    if (!active) return;
+    if (!state.active) return;
     inbox.noteRunStarted();
     const wasOnHold = store.state === "on-hold";
-    toolUsedThisTurn = false;
+    state.toolUsedThisTurn = false;
     await store.transition("thinking", ctx);
     if (wasOnHold) {
       // A prompt landing on a suspended thread is an implicit resume.
@@ -105,13 +88,13 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
   });
 
   pi.on("tool_execution_start", async (_event, ctx) => {
-    if (!active) return;
-    toolUsedThisTurn = true;
+    if (!state.active) return;
+    state.toolUsedThisTurn = true;
     await store.transition("working", ctx);
   });
 
   pi.on("turn_end", async (_event, ctx) => {
-    if (!active) return;
+    if (!state.active) return;
     await store.transition(restingState(store, "open"), ctx);
 
     // Silent-debtor nudge (§9.4): a thread holding owed replies that ends a
@@ -124,7 +107,7 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
     // a persistently silent thread still gets one fresh, escalating nudge
     // per run rather than exactly one ever. The reminder solicits the
     // "Standing by" canary — an acknowledged hold is conforming (§9.4/§9.5).
-    if (toolUsedThisTurn) {
+    if (state.toolUsedThisTurn) {
       store.owedSilentStreak = 0;
       store.owedNudgePending = false;
     } else if (store.owed.length > 0) {
@@ -147,7 +130,7 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
       }
     }
 
-    if (journalMode(pi) === "turn" && shouldJournal(store, toolUsedThisTurn, "turn")) {
+    if (journalMode(pi) === "turn" && shouldJournal(store, state.toolUsedThisTurn, "turn")) {
       const sf = ctx.sessionManager.getSessionFile();
       if (sf) store.forkJournal(sf);
     }
@@ -158,7 +141,7 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
   });
 
   pi.on("agent_end", async (_event, ctx) => {
-    if (!active) return;
+    if (!state.active) return;
     await store.transition(restingState(store, "done"), ctx);
     // Re-arm the owed-reply nudge gate: each new run gets one fresh chance to
     // remind, while owedSilentStreak (untouched here) keeps climbing across
@@ -168,8 +151,8 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
     const mode = journalMode(pi);
     const write =
       mode === "done"
-        ? shouldJournal(store, toolUsedThisTurn, "done")
-        : mode === "turn" && shouldJournal(store, toolUsedThisTurn, "run-end");
+        ? shouldJournal(store, state.toolUsedThisTurn, "done")
+        : mode === "turn" && shouldJournal(store, state.toolUsedThisTurn, "run-end");
     if (write) {
       const sf = ctx.sessionManager.getSessionFile();
       if (sf) store.forkJournal(sf);
@@ -181,7 +164,7 @@ export function registerLifecycle(pi: ExtensionAPI, store: ThreadStore, inbox: I
   });
 
   pi.on("before_agent_start", async event => {
-    if (!active) return;
+    if (!state.active) return;
     return {
       systemPrompt: event.systemPrompt + "\n\n" + threadModelPrompt(store),
     };

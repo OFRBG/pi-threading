@@ -4,11 +4,12 @@ import type { ThreadStore } from "../core/types";
 import { barrierLines, formatThreadLine, obligationLines, owedLines } from "../core/format";
 import { splitJournalEntries } from "../journal";
 import { err } from "./shared";
+import { ThreadingTool } from "./index";
 
 /** Read-only tools: this thread's status, the workspace roster, journals. */
 export function registerIntrospectionTools(pi: ExtensionAPI, store: ThreadStore) {
   pi.registerTool({
-    name: "thread_status",
+    name: ThreadingTool.Status,
     label: "Thread Status",
     description:
       "Read this thread's own state and journal. Use this to understand what you were doing before a compaction, and to recover the envelope ids you owe replies to.",
@@ -38,7 +39,7 @@ export function registerIntrospectionTools(pi: ExtensionAPI, store: ThreadStore)
   });
 
   pi.registerTool({
-    name: "thread_list",
+    name: ThreadingTool.List,
     label: "Thread List",
     description:
       "List all known threads sharing this workspace and their last known state. Use this to find a valid `to` id before calling thread_send.",
@@ -59,7 +60,7 @@ export function registerIntrospectionTools(pi: ExtensionAPI, store: ThreadStore)
   });
 
   pi.registerTool({
-    name: "thread_journal",
+    name: ThreadingTool.Journal,
     label: "Thread Journal",
     description:
       "Read another thread's journal (or your own) without messaging it — the self-written status trail visible via thread_status, but for anyone. Use to check what a teammate has been doing before deciding whether to interrupt them.",
