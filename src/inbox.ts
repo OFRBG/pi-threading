@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ThreadStore, Envelope, Urgency } from "./core/types";
+import type { ThreadingState } from "./context";
 import { DEFAULT_OBLIGATION_DEADLINE_MS, STALE_MS } from "./core/types";
 import { mintEnvelopeId } from "./core/ids";
 import { nowIso } from "./core/time";
@@ -80,66 +81,82 @@ export interface Inbox {
   noteRunStarted(): void;
 }
 
-export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
-  // --- injection gate ----------------------------------------------------
-  // pi.sendUserMessage during a run queues safely (pi drains its queues at
-  // turn boundaries and after agent_end handlers). While idle it starts a
-  // new run after an async preflight, and two of those in flight race — the
-  // loser throws "Agent is already processing" and its message is dropped.
-  // Worse, during auto-compaction the agent *looks* idle, so an injection
-  // starts a run that races the compaction's context rewrite. The gate
-  // serializes idle injections and holds the drain shut during compaction;
-  // gated messages stay durable on disk and are retried from the watcher,
-  // turn boundaries, and the heartbeat.
-  let inFlightSince: number | null = null;
-  let compactingSince: number | null = null;
-
+export function createInbox(pi: ExtensionAPI, store: ThreadStore, state: ThreadingState): Inbox {
   function canInject(): boolean {
     const now = Date.now();
-    if (compactingSince !== null && now - compactingSince < COMPACTION_HOLD_MAX_MS) return false;
-    if (inFlightSince !== null && now - inFlightSince < INJECTION_GRACE_MS) return false;
+
+    if (state.compactingSince && now - state.compactingSince < COMPACTION_HOLD_MAX_MS) {
+      return false;
+    }
+
+    if (state.inFlightSince && now - state.inFlightSince < INJECTION_GRACE_MS) {
+      return false;
+    }
+
     return true;
   }
 
   function inject(parts: Injection[], ctx: ExtensionContext): void {
-    if (parts.length === 0) return;
-    // One coalesced message per batch (§7.5): a high-urgency part anywhere
-    // makes the whole batch steer; low parts just arrive a little earlier
-    // than they had to, which is harmless.
+    if (parts.length === 0) {
+      return;
+    }
+
     const steer = parts.some(p => p.urgency === "high");
-    if (ctx.isIdle?.() ?? false) inFlightSince = Date.now();
+
+    if (ctx.isIdle()) {
+      state.inFlightSince = Date.now();
+    }
+
     pi.sendUserMessage(parts.map(p => p.text).join("\n\n"), {
       deliverAs: steer ? "steer" : "followUp",
     });
   }
 
   function noteCompactionStart(): void {
-    compactingSince = Date.now();
+    state.compactingSince = Date.now();
   }
 
   function noteCompactionEnd(): void {
-    compactingSince = null;
+    state.compactingSince = null;
   }
 
   function noteRunStarted(): void {
-    inFlightSince = null;
-    compactingSince = null;
+    state.inFlightSince = null;
+    state.compactingSince = null;
   }
 
   async function isTargetLive(to: string): Promise<boolean> {
-    const s = await store.adapter.loadState(to);
-    if (!s) return false;
-    return s.status === "running" && Date.now() - new Date(s.lastSeen).getTime() < STALE_MS;
+    const threadState = await store.adapter.loadState(to);
+
+    if (!threadState) {
+      return false;
+    }
+
+    return (
+      threadState.status === "running" &&
+      Date.now() - new Date(threadState.lastSeen).getTime() < STALE_MS
+    );
   }
 
   async function resolveTargets(to: string): Promise<string[]> {
-    if (to !== "*" && !to.startsWith("role:") && !to.includes(",")) return [to];
-    const all = (await store.listThreads()).filter(t => t.id !== store.threadId);
-    if (to === "*") return all.map(t => t.id);
+    if (to !== "*" && !to.startsWith("role:") && !to.includes(",")) {
+      return [to];
+    }
+
+    const all = await store.listThreads();
+
+    if (to === "*") {
+      return all.map(t => t.id).filter(t => t !== store.threadId);
+    }
+
     if (to.startsWith("role:")) {
       const role = to.slice(5);
-      return all.filter(t => t.role === role).map(t => t.id);
+      return all
+        .filter(t => t.role === role)
+        .map(t => t.id)
+        .filter(t => t !== store.threadId);
     }
+
     return to
       .split(",")
       .map(s => s.trim())
@@ -214,17 +231,23 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     opts: SendOptions = {},
   ): Promise<(SendResult & { to: string })[]> {
     const sent: (SendResult & { to: string })[] = [];
+
     for (const to of targets) {
       sent.push({ to, ...(await sendEnvelope(to, body, opts)) });
     }
+
     return sent;
   }
 
   async function findMissingTargets(targets: string[]): Promise<string[]> {
     const missing: string[] = [];
+
     for (const t of targets) {
-      if (!(await store.threadExists(t))) missing.push(t);
+      if (!(await store.threadExists(t))) {
+        missing.push(t);
+      }
     }
+
     return missing;
   }
 
@@ -235,39 +258,47 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     const remaining: typeof store.barriers = [];
     const notes: string[] = [];
     const payloads: Injection[] = [];
+
     for (const b of store.barriers) {
       if (!b.pending.includes(re)) {
         remaining.push(b);
         continue;
       }
+
       const pending = b.pending.filter(id => id !== re);
       const done = b.mode === "any" || pending.length === 0;
+
       if (done) {
         notes.push(
-          `[barrier "${b.id}" resolved]: ${b.mode === "any" ? `first reply arrived (${re})` : "all awaited replies have arrived"}.`,
+          `[Barrier "${b.id}" resolved]: ${b.mode === "any" ? `first reply arrived (${re})` : "all awaited replies have arrived"}.`,
         );
-        if (b.message) payloads.push({ text: b.message, urgency: "high" });
+
+        if (b.message) {
+          payloads.push({ text: b.message, urgency: "high" });
+        }
       } else {
         remaining.push({ ...b, pending });
       }
     }
+
     store.barriers = remaining;
     return { notes, payloads };
   }
 
-  /** How the receiving agent sees an envelope. The id and the reply
-   *  affordance must travel with the message — the model has no other way
-   *  to learn the correlation id it must echo back. Kind is derived from
-   *  field presence (§6.1), never a tag. */
-  function renderEnvelope(msg: Envelope): string {
+  function renderEnvelope(m: Envelope): string {
     const kind =
-      msg.expects && msg.re ? "reply+request" : msg.expects ? "request" : msg.re ? "reply" : "note";
-    const reTag = msg.re ? ` re #${msg.re}` : "";
-    const header = `[${kind} from ${msg.from} #${msg.id}${reTag}]`;
-    const hint = msg.expects
-      ? `\n(this expects a reply — send it with: thread_send to="${msg.from}" re="${msg.id}")`
+      m.expects && m.re ? "Reply+Request" : m.expects ? "Request" : m.re ? "Reply" : "Note";
+
+    const originTag = `${kind} from ${m.from} (#${m.id})`;
+    const reTag = m.re ? ` reply to ${m.re}` : "";
+
+    const header = `[${originTag}${reTag}]`;
+
+    const hint = m.expects
+      ? `\n(This message expects an answer. Reply with thread_send to="${m.from}" re="${m.id}")`
       : "";
-    return `${header}\n${msg.body}${hint}`;
+
+    return `${header}\n---${m.body}---${hint}`;
   }
 
   async function deliver(msg: Envelope, _ctx: ExtensionContext): Promise<Injection[]> {
@@ -311,50 +342,69 @@ export function createInbox(store: ThreadStore, pi: ExtensionAPI): Inbox {
     return parts;
   }
 
-  /** Ship a gathered batch: push into the heartbeat's shared array when one is
-   *  given (so all sources coalesce into a single inject() per tick, §7.5),
-   *  otherwise inject it now (the standalone watcher/turn/command call sites). */
   function emit(parts: Injection[], ctx: ExtensionContext, collect?: Injection[]): void {
-    if (collect) collect.push(...parts);
-    else inject(parts, ctx);
+    if (collect) {
+      collect.push(...parts);
+    } else inject(parts, ctx);
   }
 
   async function drainInbox(ctx: ExtensionContext, collect?: Injection[]): Promise<void> {
     // On Hold means "don't wake me": messages stay queued until resume.
-    if (store.state === "on-hold") return;
-    // §7.7 declare-and-shrink: never claim an envelope we can't deliver in
-    // this same tick — while the gate is closed everything stays durable on
-    // disk; watcher/turn-end/heartbeat retry.
-    if (!canInject()) return;
+    if (store.state === "on-hold") {
+      return;
+    }
+
+    if (!canInject()) {
+      return;
+    }
+
     const messages = await store.adapter.drainInbox(store.threadId);
     const parts: Injection[] = [];
+
     for (const msg of messages) {
       parts.push(...(await deliver(msg, ctx)));
     }
+
     emit(parts, ctx, collect);
   }
 
   async function checkDeadlines(ctx: ExtensionContext, collect?: Injection[]): Promise<void> {
-    if (!canInject()) return; // nudges re-arm on a later heartbeat tick
+    if (!canInject()) {
+      return;
+    }
+
     const now = Date.now();
     const parts: Injection[] = [];
-    for (const ob of store.obligations) {
-      if (!ob.deadline || ob.nudged || new Date(ob.deadline).getTime() > now) continue;
-      ob.nudged = true;
+
+    for (const o of store.obligations) {
+      if (!o.deadline || o.nudged || new Date(o.deadline).getTime() > now) {
+        continue;
+      }
+
+      o.nudged = true;
       parts.push({
-        text: `[obligation overdue #${ob.id}]: your request to ${ob.to} ("${ob.summary}") passed its deadline with no reply. Follow up with ${ob.to}${store.parent ? `, or escalate to ${store.parent}` : ""}.`,
-        urgency: "high",
+        text: `[Obligation #${o.id} overdue] Your request to ${o.to} ("${o.summary}") passed its deadline with no reply. Check for status updates.`,
+        urgency: "low",
       });
     }
+
     for (const b of store.barriers) {
-      if (!b.deadline || b.nudged || new Date(b.deadline).getTime() > now) continue;
+      if (!b.deadline || b.nudged || new Date(b.deadline).getTime() > now) {
+        continue;
+      }
+
       b.nudged = true;
+      const replyText = b.pending.length === 1 ? "reply" : "replies";
       parts.push({
-        text: `[barrier overdue "${b.id}"]: still waiting on ${b.mode} of ${b.pending.length} repl${b.pending.length === 1 ? "y" : "ies"} (${b.pending.join(", ")}) — none arrived by the deadline. Check in with the target thread(s), or the barrier will keep waiting silently.`,
-        urgency: "high",
+        text: `[Barrier "${b.id}" pending] Still waiting on ${b.mode} of ${b.pending.length} ${replyText} (${b.pending.join(", ")}). Check for status updates.`,
+        urgency: "low",
       });
     }
-    if (parts.length === 0) return;
+
+    if (parts.length === 0) {
+      return;
+    }
+
     await store.persist();
     emit(parts, ctx, collect);
   }

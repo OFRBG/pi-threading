@@ -21,7 +21,10 @@ export async function resumeThread(
   drain: () => Promise<void>,
   ctx?: ExtensionContext,
 ): Promise<boolean> {
-  if (store.state !== "on-hold") return false;
+  if (store.state !== "on-hold") {
+    return false;
+  }
+
   store.holdReason = null;
   await store.transition("open", ctx);
   await drain();

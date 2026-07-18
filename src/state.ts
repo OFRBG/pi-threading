@@ -5,6 +5,7 @@ import { HEARTBEAT_MS, CLIENT_CAPABILITIES } from "./core/types";
 import { nowIso } from "./core/time";
 import { forkJournalEntry } from "./journal";
 import type { ThreadAdapter } from "./adapter/types";
+import type { ThreadingState } from "./context";
 
 /** The ThreadStore: this thread's identity and mutable coordination state,
  *  restored from the storage adapter at init, persisted on every change, kept
@@ -20,7 +21,11 @@ const KNOWN_STATES: readonly ThreadState[] = [
   "done",
 ];
 
-export function createStore(pi: ExtensionAPI, adapter: ThreadAdapter): ThreadStore {
+export function createStore(
+  pi: ExtensionAPI,
+  adapter: ThreadAdapter,
+  _: ThreadingState,
+): ThreadStore {
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   let stopWatching: (() => void) | null = null;
 

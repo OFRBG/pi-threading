@@ -8,21 +8,18 @@ import type { ThreadStore } from "./core/types";
 /** Everything journal: the fork prompt, entry parsing, duplicate detection,
  *  and the cadence policy deciding which moments deserve a forked entry. */
 
-const JOURNAL_PROMPT = `You are this thread's journal keeper. Based on the conversation above, write a brief status update in exactly this format:
+const JOURNAL_PROMPT = `
+You are this thread's journal keeper. Based on the conversation above, write a brief status update in exactly this format:
 
-Working on: <the main task in one line>
+Working on: <the main task>
 Done: <what was completed this turn>
 Doing: <what is in progress or will continue>
 Next: <planned next step>
 Blockers: <blockers or "none">
 
-No preamble. No extra text. Just the five lines.`;
+No preamble. No extra text. Just the five lines, one line per entry.
+`.trim();
 
-/** Minimum spacing between per-turn journal forks. Structural changes (new
- *  obligation, lock, barrier — the things teammates key off) still journal
- *  immediately; this only rate-limits the "another tool turn on the same
- *  task" entries that used to land once per turn, ~17 near-duplicates per
- *  work session. */
 export const JOURNAL_MIN_INTERVAL_MS = 120_000;
 
 /** Entries are separated by their `<!-- timestamp -->` headers. */
@@ -56,8 +53,8 @@ export function isDuplicateOfLastEntry(journalContent: string | undefined, entry
 }
 
 export function journalMode(pi: ExtensionAPI): "turn" | "done" | "off" {
-  const v = pi.getFlag("thread-journal");
-  return v === "done" || v === "off" ? v : "turn";
+  const mode = pi.getFlag("thread-journal");
+  return mode === "done" || mode === "off" ? mode : "turn";
 }
 
 /** Fingerprint of everything a journal entry could newly report. Unchanged

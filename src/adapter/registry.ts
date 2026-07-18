@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as localFs from "./local-fs";
 import type { AdapterDefinition, AdapterOptions, PiFlagParam, ThreadAdapter } from "./types";
+import type { ThreadingState } from "../context";
 
 function loadFlags<TFlags extends Record<string, PiFlagParam>>(
   pi: ExtensionAPI,
@@ -36,7 +37,7 @@ export function registerAdapter<TFlags extends Record<string, PiFlagParam>>(
 
 const adapterRegistry = new Map<string, AdapterDefinition>();
 
-export function createAdapter(pi: ExtensionAPI): ThreadAdapter {
+export function createAdapter(pi: ExtensionAPI, _: ThreadingState): ThreadAdapter {
   registerAdapter("local", localFs.options, localFs.createAdapter);
 
   registerAdapter(

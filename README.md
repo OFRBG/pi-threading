@@ -53,11 +53,11 @@ I recommend using tmux to manage teams.
 
 | Command                    | Purpose                                    |
 | -------------------------- | ------------------------------------------ |
-| `/thread-status`           | Show state and latest journal entry        |
-| `/thread-list`             | List all known threads                     |
-| `/thread-send <to> <body>` | Send a high-urgency note to another thread |
-| `/thread-suspend`          | Mark On Hold                               |
-| `/thread-resume`           | Resume from On Hold                        |
+| `thread-status`           | Show state and latest journal entry        |
+| `thread-list`             | List all known threads                     |
+| `thread-send <to> <body>` | Send a high-urgency note to another thread |
+| `thread-suspend`          | Mark On Hold                               |
+| `thread-resume`           | Resume from On Hold                        |
 
 ## Flags
 

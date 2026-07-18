@@ -1,11 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createStore as createStore } from "./state";
 import { createInbox } from "./inbox";
-import { registerLifecycle } from "./lifecycle";
+import { registerLifecycle } from "./lifecycle/lifecycle";
 import { registerTools } from "./tools/index";
-import { registerCommands } from "./commands";
+import { registerCommands } from "./commands/commands";
 import { createAdapter as createAdapter } from "./adapter/registry";
-import type { ThreadingContext } from "./context";
+import type { ThreadingContext, ThreadingState } from "./context";
 
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("thread-id", {
@@ -33,15 +33,22 @@ export default function (pi: ExtensionAPI) {
     description: 'Storage backend: "local" (default)',
   });
 
-  const adapter = createAdapter(pi);
-  const store = createStore(pi, adapter);
-  const inbox = createInbox(store, pi);
+  const state: ThreadingState = {
+    active: undefined,
+    toolUsedThisTurn: false,
+    inFlightSince: null,
+    compactingSince: null,
+  };
+
+  const adapter = createAdapter(pi, state);
+  const store = createStore(pi, adapter, state);
+  const inbox = createInbox(pi, store, state);
 
   const threading: ThreadingContext = {
     pi,
     store,
     inbox,
-    state: { active: false, toolUsedThisTurn: false },
+    state,
   };
 
   registerLifecycle(threading);

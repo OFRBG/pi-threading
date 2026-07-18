@@ -33,10 +33,10 @@ import type {
 import { createStore } from "../src/state";
 import { createInbox } from "../src/inbox";
 import type { Injection } from "../src/inbox";
-import { registerLifecycle } from "../src/lifecycle";
+import { registerLifecycle } from "../src/lifecycle/lifecycle";
 import { registerTools } from "../src/tools/index";
-import { registerCommands } from "../src/commands";
-import type { ThreadingContext } from "../src/context";
+import { registerCommands } from "../src/commands/commands";
+import type { ThreadingContext, ThreadingState } from "../src/context";
 import { journalSignature, shouldJournal, JOURNAL_MIN_INTERVAL_MS } from "../src/journal";
 import { createAdapter } from "../src/adapter/local-fs";
 import type { StorageAdapter } from "../src/adapter/types";
@@ -82,7 +82,13 @@ function makeHarness(dir: string, id = "t1") {
     },
   } as unknown as ExtensionAPI;
 
-  const store = createStore(stubPi, createAdapter({ "base-dir": dir }));
+  const state: ThreadingState = {
+    active: true,
+    toolUsedThisTurn: false,
+    inFlightSince: null,
+    compactingSince: null,
+  };
+  const store = createStore(stubPi, createAdapter({ "base-dir": dir }), state);
   // No internal `await` in LocalFsAdapter.configure — this synchronously
   // sets its root before the call returns, same reasoning as persist()
   // below, so the harness doesn't need to become async just for this.
@@ -92,12 +98,12 @@ function makeHarness(dir: string, id = "t1") {
   store.threadDir = join(store.threadsRootDir, id);
   mkdirSync(join(store.threadDir, "inbox", "processed"), { recursive: true });
 
-  const inbox = createInbox(store, stubPi);
+  const inbox = createInbox(stubPi, store, state);
   const threading: ThreadingContext = {
     pi: stubPi,
     store,
     inbox,
-    state: { active: true, toolUsedThisTurn: false },
+    state,
   };
   registerTools(threading);
   registerCommands(threading);
@@ -272,13 +278,19 @@ function makeLifecycleHarness(dir: string) {
     appendEntry: () => {},
   } as unknown as ExtensionAPI;
 
-  const store = createStore(stubPi, createAdapter({ "base-dir": dir }));
-  const inbox = createInbox(store, stubPi);
+  const state: ThreadingState = {
+    active: false,
+    toolUsedThisTurn: false,
+    inFlightSince: null,
+    compactingSince: null,
+  };
+  const store = createStore(stubPi, createAdapter({ "base-dir": dir }), state);
+  const inbox = createInbox(stubPi, store, state);
   const threading: ThreadingContext = {
     pi: stubPi,
     store,
     inbox,
-    state: { active: false, toolUsedThisTurn: false },
+    state,
   };
   registerLifecycle(threading);
 
@@ -848,7 +860,7 @@ describe("inbox: deliver (correlation, §9)", () => {
     h.inbox.inject(parts, h.ctx);
     assert.strictEqual(h.calls.length, 1);
     assert.match(h.calls[0].content, /done/);
-    assert.match(h.calls[0].content, /barrier "b1" resolved/);
+    assert.match(h.calls[0].content, /Barrier "b1" resolved/);
     assert.strictEqual(h.store.barriers.length, 0);
   });
 
@@ -906,8 +918,8 @@ describe("inbox: deliver (correlation, §9)", () => {
     const parts = await h.inbox.deliver(envelope({ from: "alice", body: "ok", re: a.id }), h.ctx);
     h.inbox.inject(parts, h.ctx);
     assert.strictEqual(h.calls.length, 1);
-    assert.match(h.calls[0].content, /barrier "b1" resolved/);
-    assert.match(h.calls[0].content, /barrier "b2" resolved/);
+    assert.match(h.calls[0].content, /Barrier "b1" resolved/);
+    assert.match(h.calls[0].content, /Barrier "b2" resolved/);
   });
 
   it("a resolved barrier's message payload is injected alongside the reply (§12.1)", async () => {
@@ -946,13 +958,13 @@ describe("inbox: deliver (correlation, §9)", () => {
     const parts = await h.inbox.deliver(req, h.ctx);
     assert.match(
       parts[0].text,
-      new RegExp(`\\[request from alice #${req.id.replace("/", "\\/")}\\]`),
+      new RegExp(`\\[Request from alice \\(#${req.id.replace("/", "\\/")}\\)\\]`),
     );
-    assert.match(parts[0].text, /this expects a reply/);
+    assert.match(parts[0].text, /expects an answer/);
     const note = envelope({ from: "alice", body: "fyi" });
     const noteParts = await h.inbox.deliver(note, h.ctx);
-    assert.match(noteParts[0].text, /\[note from alice/);
-    assert.doesNotMatch(noteParts[0].text, /expects a reply/);
+    assert.match(noteParts[0].text, /\[Note from alice/);
+    assert.doesNotMatch(noteParts[0].text, /expects an answer/);
   });
 });
 
@@ -1129,7 +1141,7 @@ describe("inbox: checkDeadlines (§9.2)", () => {
     });
     await h.inbox.checkDeadlines(h.ctx);
     assert.strictEqual(h.calls.length, 1);
-    assert.match(h.calls[0].content, /obligation overdue #t1\/late/);
+    assert.match(h.calls[0].content, /Obligation #t1\/late overdue/);
     await h.inbox.checkDeadlines(h.ctx);
     assert.strictEqual(h.calls.length, 1, "one-shot nudge");
   });
@@ -1145,7 +1157,7 @@ describe("inbox: checkDeadlines (§9.2)", () => {
     });
     await h.inbox.checkDeadlines(h.ctx);
     assert.strictEqual(h.calls.length, 1);
-    assert.match(h.calls[0].content, /barrier overdue "b\.late"/);
+    assert.match(h.calls[0].content, /Barrier "b\.late" pending/);
     await h.inbox.checkDeadlines(h.ctx);
     assert.strictEqual(h.calls.length, 1);
   });
@@ -1182,7 +1194,7 @@ describe("Errata 3: heartbeat coalesces its sources into one inject (§7.5)", ()
     h.inbox.inject(parts, h.ctx);
     assert.strictEqual(h.calls.length, 1, "one coalesced message");
     assert.match(h.calls[0].content, /queued envelope/);
-    assert.match(h.calls[0].content, /obligation overdue #t1\/late/);
+    assert.match(h.calls[0].content, /Obligation #t1\/late overdue/);
   });
 
   it("standalone idle calls still self-serialize — the tax the batch avoids", async () => {
@@ -1199,7 +1211,7 @@ describe("Errata 3: heartbeat coalesces its sources into one inject (§7.5)", ()
     await h.inbox.drainInbox(h.ctx); // injects, arms the preflight hold
     await h.inbox.checkDeadlines(h.ctx); // gated by that hold
     assert.strictEqual(h.calls.length, 1);
-    assert.doesNotMatch(h.calls[0].content, /obligation overdue/);
+    assert.doesNotMatch(h.calls[0].content, /Obligation #.*overdue/);
   });
 
   it("standalone (no shared array) still injects its own batch — unchanged callers", async () => {
@@ -1406,8 +1418,8 @@ describe("commands: slash commands", () => {
   it("refuses to run when the thread never activated (opt-in gate never ran)", async () => {
     const h = makeHarness(tmpDir);
     h.threading.state.active = false; // simulate: opt-in gate closed, init() never ran
-    await callCommand(h, "/thread-status");
-    assert.match(h.notifications[0].text, /hasn't opted into pi-threading/);
+    await callCommand(h, "thread-status");
+    assert.match(h.notifications[0].text, /pi-threading is disabled/);
   });
 
   it("/thread-status notification includes the coordination counts", async () => {
@@ -1419,30 +1431,30 @@ describe("commands: slash commands", () => {
       createdAt: new Date().toISOString(),
     });
     h.store.owed.push(owedRecord("boss", "boss/q1"));
-    await callCommand(h, "/thread-status");
+    await callCommand(h, "thread-status");
     assert.match(h.notifications[0].text, /Barriers: 1/);
     assert.match(h.notifications[0].text, /Owed: 1/);
   });
 
   it("/thread-suspend then /thread-resume round-trips on-hold state", async () => {
     const h = makeHarness(tmpDir);
-    await callCommand(h, "/thread-suspend", "coffee");
+    await callCommand(h, "thread-suspend", "coffee");
     assert.strictEqual(h.store.state, "on-hold");
     assert.strictEqual(h.store.holdReason, "coffee");
-    await callCommand(h, "/thread-resume");
+    await callCommand(h, "thread-resume");
     assert.strictEqual(h.store.state, "open");
   });
 
   it("/thread-send rejects sending to self", async () => {
     const h = makeHarness(tmpDir);
-    await callCommand(h, "/thread-send", "t1 hello");
+    await callCommand(h, "thread-send", "t1 hello");
     assert.match(h.notifications[0].text, /Cannot send to self/);
   });
 
   it("/thread-send writes a high-urgency envelope (operator sends interrupt)", async () => {
     const h = makeHarness(tmpDir);
     seedRemoteThread(h, "alice");
-    await callCommand(h, "/thread-send", "alice please pause");
+    await callCommand(h, "thread-send", "alice please pause");
     const written = readInboxFile(h, "alice");
     assert.strictEqual(written.body, "please pause");
     assert.strictEqual(written.urgency, "high");
@@ -1670,25 +1682,37 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
       registerCommand: () => {},
     }) as unknown as ExtensionAPI;
 
+  const freshState = (): ThreadingState => ({
+    active: true,
+    toolUsedThisTurn: false,
+    inFlightSince: null,
+    compactingSince: null,
+  });
+
   it("a note sent from one thread is drained and delivered on the other, with no fs involved", async () => {
     const fake = createFakeAdapter();
     const calls: Call[] = [];
     const stubPi = stubPiWith(calls);
-    const ctx = { ui: { setStatus: () => {} } } as unknown as ExtensionCommandContext;
+    const ctx = {
+      ui: { setStatus: () => {} },
+      isIdle: () => false,
+    } as unknown as ExtensionCommandContext;
 
-    const sender = createStore(stubPi, fake);
+    const senderState = freshState();
+    const sender = createStore(stubPi, fake, senderState);
     sender.threadId = "sender";
     sender.threadsRootDir = "/virtual";
     sender.threadDir = "/virtual/sender";
     await sender.persist();
-    const senderInbox = createInbox(sender, stubPi);
+    const senderInbox = createInbox(stubPi, sender, senderState);
 
-    const receiver = createStore(stubPi, fake);
+    const receiverState = freshState();
+    const receiver = createStore(stubPi, fake, receiverState);
     receiver.threadId = "receiver";
     receiver.threadsRootDir = "/virtual";
     receiver.threadDir = "/virtual/receiver";
     await receiver.persist();
-    const receiverInbox = createInbox(receiver, stubPi);
+    const receiverInbox = createInbox(stubPi, receiver, receiverState);
 
     const { delivered } = await senderInbox.sendEnvelope("receiver", "hi from fake adapter");
     assert.strictEqual(delivered, "live"); // receiver's state already exists and is fresh
@@ -1701,7 +1725,7 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
   it("transition persists through adapter.saveState, not raw fs", async () => {
     const fake = createFakeAdapter();
     const stubPi = stubPiWith([]);
-    const store = createStore(stubPi, fake);
+    const store = createStore(stubPi, fake, freshState());
     store.threadId = "solo";
     store.threadDir = "/virtual/solo";
     await store.transition("open");
@@ -1712,7 +1736,7 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
   it("readJournal degrades to undefined on a backend without the JournalAdapter extension", async () => {
     const fake = createFakeAdapter();
     const stubPi = stubPiWith([]);
-    const store = createStore(stubPi, fake);
+    const store = createStore(stubPi, fake, freshState());
     store.threadId = "solo";
     assert.strictEqual(await store.readJournal("solo"), undefined);
   });
@@ -1727,11 +1751,12 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
       },
       registerCommand: () => {},
     } as unknown as ExtensionAPI;
-    const store = createStore(stubPi, fake);
+    const state = freshState();
+    const store = createStore(stubPi, fake, state);
     store.threadId = "solo";
     await store.persist();
-    const inbox = createInbox(store, stubPi);
-    registerTools({ pi: stubPi, store, inbox, state: { active: true, toolUsedThisTurn: false } });
+    const inbox = createInbox(stubPi, store, state);
+    registerTools({ pi: stubPi, store, inbox, state });
     const ctx = { ui: { setStatus: () => {} } } as unknown as ExtensionCommandContext;
     const r = await tools["thread_journal"].execute("t", { id: "solo" }, undefined, undefined, ctx);
     assert.strictEqual(r.details.ok, false);
@@ -1870,7 +1895,14 @@ describe("state: restore rules (§11.2)", () => {
         sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
       }) as unknown as ExtensionContext;
 
-    const storeA = createStore(stubPi, createAdapter({ "base-dir": tmpDir }));
+    const freshState = (): ThreadingState => ({
+      active: true,
+      toolUsedThisTurn: false,
+      inFlightSince: null,
+      compactingSince: null,
+    });
+
+    const storeA = createStore(stubPi, createAdapter({ "base-dir": tmpDir }), freshState());
     await storeA.init(mkCtx());
     assert.strictEqual(storeA.state, "idle");
 
@@ -1878,7 +1910,7 @@ describe("state: restore rules (§11.2)", () => {
       ...stubPi,
       getFlag: (name: string) => (name === "thread-id" ? "b" : undefined),
     } as unknown as ExtensionAPI;
-    const storeB = createStore(stubPiB, createAdapter({ "base-dir": tmpDir }));
+    const storeB = createStore(stubPiB, createAdapter({ "base-dir": tmpDir }), freshState());
     await storeB.init(mkCtx());
     assert.strictEqual(storeB.state, "open");
   });
@@ -1904,7 +1936,11 @@ describe("state: restore rules (§11.2)", () => {
       getFlag: (name: string) => (name === "thread-id" ? "a" : undefined),
       appendEntry: () => {},
     } as unknown as ExtensionAPI;
-    const store = createStore(stubPi, createAdapter({ "base-dir": tmpDir }));
+    const store = createStore(
+      stubPi,
+      createAdapter({ "base-dir": tmpDir }),
+      { active: true, toolUsedThisTurn: false, inFlightSince: null, compactingSince: null },
+    );
     await store.init({
       cwd: tmpDir,
       ui: { setStatus: () => {} },
@@ -1931,7 +1967,12 @@ describe("state: watcher idempotency", () => {
       registerTool: () => {},
       registerCommand: () => {},
     } as unknown as ExtensionAPI;
-    const store = createStore(stubPi, counting);
+    const store = createStore(stubPi, counting, {
+      active: true,
+      toolUsedThisTurn: false,
+      inFlightSince: null,
+      compactingSince: null,
+    });
     store.threadId = "w1";
     const ctx = { ui: { setStatus: () => {} } } as unknown as ExtensionContext;
     store.startWatcher(() => {}, ctx);
