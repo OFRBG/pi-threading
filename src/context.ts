@@ -4,6 +4,8 @@ import type { Inbox } from "./inbox";
 
 export interface ThreadingState {
   active?: boolean;
+  /** Whether no thread warning has been shown */
+  noThreadIdWarningShown?: boolean;
   /** Reset false at turn_start, set true on tool_execution_start — drives
    *  journal cadence (journal.ts's shouldJournal) and the silent-debtor
    *  nudge gate in turn_end. */

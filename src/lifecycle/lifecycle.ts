@@ -17,7 +17,10 @@ const requireActive =
   <E, R>(threading: ThreadingContext, handler: ThreadingHookHandler<E, R>): HookHandler<E, R> =>
   async (event, ctx) => {
     if (!threading.state.active) {
-      ctx.ui.notify("pi-threading is disabled because no thread-id is set.", "warning");
+      if (!threading.state.noThreadIdWarningShown) {
+        threading.state.noThreadIdWarningShown = true;
+        ctx.ui.notify("pi-threading is disabled because no thread-id is set.", "warning");
+      }
       return;
     }
 
