@@ -30,8 +30,6 @@ async function armBarrier(
   return barrier;
 }
 
-/** Envelope messaging (PROTOCOL-FORMALISM.md §6): one send tool, one wait
- *  tool. Kind is structural — expects/re — never a type tag. */
 export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox) {
   pi.registerTool({
     name: ThreadingTool.Send,
@@ -133,15 +131,15 @@ export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inb
       // "*"/role: targets come from listThreads and exist by construction; a
       // direct id may be a typo. Queueing is a durable dead-drop (§7.1), so
       // this is a warning, never a refusal.
-      const missing = selfWake ? [] : await inbox.findMissingTargets(targets);
+      const missing = selfWake ? [] : await inbox.checkMissing(targets);
 
       const deadline = deadlineFromSeconds(params.deadlineSeconds);
 
-      let sent: Awaited<ReturnType<Inbox["sendToMany"]>>;
+      let sent: Awaited<ReturnType<Inbox["sendMany"]>>;
       try {
         // sendEnvelope mints a unique id per target, so fan-out replies stay
         // individually correlatable.
-        sent = await inbox.sendToMany(targets, params.body, {
+        sent = await inbox.sendMany(targets, params.body, {
           re: params.re,
           expects,
           urgency: params.urgency as Urgency | undefined,

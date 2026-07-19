@@ -40,11 +40,21 @@ import type { ThreadingContext, ThreadingState } from "../src/context";
 import { journalSignature, shouldJournal, JOURNAL_MIN_INTERVAL_MS } from "../src/journal";
 import { createAdapter } from "../src/adapter/local-fs";
 import type { StorageAdapter } from "../src/adapter/types";
-import type { StateFile, Envelope, ThreadSummary } from "../src/core/types";
+import type { StateFile, Mail, ThreadSummary } from "../src/core/types";
 import { STALE_MS, PROCESSED_TTL_MS, CLIENT_CAPABILITIES, toSummary } from "../src/core/types";
-import { ulid, mintEnvelopeId } from "../src/core/ids";
+import { ulid, mintMailId } from "../src/core/ids";
 
 // --- harness -----------------------------------------------------------
+
+/** LocalFsAdapter's on-disk layout (`src/adapter/local-fs.ts`) — the store
+ *  itself has no notion of a filesystem path, so tests that reach past the
+ *  adapter to poke at fixture files compute it here instead. */
+function threadsRoot(dir: string): string {
+  return join(dir, ".thread", "threads");
+}
+function threadDirFor(dir: string, id: string): string {
+  return join(threadsRoot(dir), id);
+}
 
 type Call = { content: string; options?: { deliverAs?: string } };
 type Notify = { text: string; level?: string };
@@ -94,9 +104,7 @@ function makeHarness(dir: string, id = "t1") {
   // below, so the harness doesn't need to become async just for this.
   void store.adapter.configure();
   store.threadId = id;
-  store.threadsRootDir = join(dir, ".thread", "threads");
-  store.threadDir = join(store.threadsRootDir, id);
-  mkdirSync(join(store.threadDir, "inbox", "processed"), { recursive: true });
+  mkdirSync(join(threadDirFor(dir, id), "inbox", "processed"), { recursive: true });
 
   const inbox = createInbox(stubPi, store, state);
   const threading: ThreadingContext = {
@@ -156,7 +164,7 @@ function callCommand(h: Harness, name: string, args = "") {
 }
 
 function seedRemoteThread(h: Harness, id: string, opts: { role?: string; stale?: boolean } = {}) {
-  const dir = join(h.store.threadsRootDir, id);
+  const dir = threadDirFor(h.dir, id);
   mkdirSync(join(dir, "inbox", "processed"), { recursive: true });
   const lastSeen = opts.stale
     ? new Date(Date.now() - 5 * 60_000).toISOString()
@@ -188,29 +196,29 @@ function seedRemoteThread(h: Harness, id: string, opts: { role?: string; stale?:
 function seedEnvelope(
   h: Harness,
   ownId: string,
-  msg: Partial<Envelope> & { from: string; body: string },
+  msg: Partial<Mail> & { from: string; body: string },
   name = `${ulid()}.json`,
 ) {
-  const dir = join(h.store.threadsRootDir, ownId, "inbox");
+  const dir = join(threadDirFor(h.dir, ownId), "inbox");
   mkdirSync(dir, { recursive: true });
-  const envelope: Envelope = {
-    id: msg.id ?? mintEnvelopeId(msg.from),
+  const envelope: Mail = {
+    id: msg.id ?? mintMailId(msg.from),
     to: ownId,
     sentAt: new Date().toISOString(),
     ...msg,
-  } as Envelope;
+  } as Mail;
   writeFileSync(join(dir, name), JSON.stringify(envelope));
   return envelope;
 }
 
 function inboxFileCount(h: Harness, id: string): number {
-  const dir = join(h.store.threadsRootDir, id, "inbox");
+  const dir = join(threadDirFor(h.dir, id), "inbox");
   if (!existsSync(dir)) return 0;
   return readdirSync(dir).filter(f => f.endsWith(".json")).length;
 }
 
-function readInboxFile(h: Harness, id: string, index = 0): Envelope {
-  const dir = join(h.store.threadsRootDir, id, "inbox");
+function readInboxFile(h: Harness, id: string, index = 0): Mail {
+  const dir = join(threadDirFor(h.dir, id), "inbox");
   const files = readdirSync(dir)
     .filter(f => f.endsWith(".json"))
     .sort();
@@ -227,7 +235,7 @@ function journalEntry(ts: string, workingOn: string, done = "did stuff"): string
   return `\n<!-- ${ts} -->\nWorking on: ${workingOn}\nDone: ${done}\nDoing: more\nNext: ship\nBlockers: none\n`;
 }
 function writeJournal(h: Harness, id: string, content: string) {
-  const dir = join(h.store.threadsRootDir, id);
+  const dir = threadDirFor(h.dir, id);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "journal.md"), content.trim() + "\n");
 }
@@ -547,7 +555,7 @@ describe("Errata 1: misdirected replies do not discharge the owed ledger (§9.1)
     await callTool(h, "thread_send", { to: "alice", body: "ok", re: "alice/q1" });
     assert.strictEqual(h.store.owed.length, 0);
     const onDisk = JSON.parse(
-      readFileSync(join(h.store.threadDir, "state.json"), "utf8"),
+      readFileSync(join(threadDirFor(h.dir, h.store.threadId), "state.json"), "utf8"),
     ) as StateFile;
     assert.strictEqual(onDisk.owed.length, 0);
   });
@@ -573,7 +581,7 @@ describe("Errata 1, obligation side: misdirected replies do not clear the sender
       createdAt: new Date().toISOString(),
     });
     seedEnvelope(h, "t1", { from: "bob", body: "done!", re: "t1/q1" });
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.store.obligations.length, 1, "wrong sender must not discharge");
     assert.strictEqual(h.store.barriers.length, 1, "wrong sender must not resolve the barrier");
     assert.deepStrictEqual(h.store.barriers[0].pending, ["t1/q1"]);
@@ -593,7 +601,7 @@ describe("Errata 1, obligation side: misdirected replies do not clear the sender
     });
     seedEnvelope(h, "t1", { from: "bob", body: "done!", re: "t1/q1" }, "0-bob.json");
     seedEnvelope(h, "t1", { from: "alice", body: "actually done", re: "t1/q1" }, "1-alice.json");
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.store.obligations.length, 0, "correct sender discharges");
     assert.strictEqual(h.store.barriers.length, 0, "correct sender resolves the barrier");
   });
@@ -608,7 +616,7 @@ describe("expiresAt: stale mail self-discards at drain (Rev 10 §6)", () => {
       expiresAt: new Date(Date.now() - 1000).toISOString(),
     });
     seedEnvelope(h, "t1", { from: "alice", body: "still relevant" });
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls.length, 1, "only the unexpired envelope delivers");
     assert.match(h.calls[0].content, /still relevant/);
     assert.doesNotMatch(h.calls[0].content, /standup/);
@@ -622,7 +630,7 @@ describe("expiresAt: stale mail self-discards at drain (Rev 10 §6)", () => {
       body: "hurry",
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
     });
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls.length, 1);
     assert.match(h.calls[0].content, /hurry/);
   });
@@ -643,7 +651,7 @@ describe("presence: capabilities and wake (Rev 10 §8.1)", () => {
     const h = makeHarness(tmpDir);
     await h.store.persist();
     const onDisk = JSON.parse(
-      readFileSync(join(h.store.threadDir, "state.json"), "utf8"),
+      readFileSync(join(threadDirFor(h.dir, h.store.threadId), "state.json"), "utf8"),
     ) as StateFile;
     assert.deepStrictEqual(onDisk.capabilities, [...CLIENT_CAPABILITIES]);
     assert.strictEqual(onDisk.wake, undefined, "no wake recipe unless the operator sets one");
@@ -653,14 +661,14 @@ describe("presence: capabilities and wake (Rev 10 §8.1)", () => {
 describe("local-fs: processed/ GC (Appendix B)", () => {
   it("drain prunes processed files older than PROCESSED_TTL_MS", async () => {
     const h = makeHarness(tmpDir, "gc1");
-    const processed = join(h.store.threadDir, "inbox", "processed");
+    const processed = join(threadDirFor(h.dir, h.store.threadId), "inbox", "processed");
     const oldFile = join(processed, "ancient.json");
     const freshFile = join(processed, "fresh.json");
     writeFileSync(oldFile, "{}");
     writeFileSync(freshFile, "{}");
     const past = new Date(Date.now() - PROCESSED_TTL_MS - 60_000);
     utimesSync(oldFile, past, past);
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(existsSync(oldFile), false, "expired file must be GC'd");
     assert.strictEqual(existsSync(freshFile), true, "fresh file must survive");
   });
@@ -669,8 +677,8 @@ describe("local-fs: processed/ GC (Appendix B)", () => {
 describe("ids: envelope identity (§6.2)", () => {
   it("two sends in the same millisecond get distinct ids", async () => {
     const h = makeHarness(tmpDir);
-    const a = await h.inbox.sendEnvelope("alice", "one");
-    const b = await h.inbox.sendEnvelope("alice", "two");
+    const [a] = await h.inbox.sendMany(["alice"], "one");
+    const [b] = await h.inbox.sendMany(["alice"], "two");
     assert.notStrictEqual(a.id, b.id);
   });
 
@@ -685,7 +693,7 @@ describe("ids: envelope identity (§6.2)", () => {
 
   it("envelope ids carry the sender scope: <from>/<ulid>", async () => {
     const h = makeHarness(tmpDir);
-    const { id } = await h.inbox.sendEnvelope("alice", "hi");
+    const [{ id }] = await h.inbox.sendMany(["alice"], "hi");
     assert.match(id, /^t1\/[0-9A-HJKMNP-TV-Z]{26}$/);
   });
 });
@@ -732,7 +740,7 @@ describe("tools: thread_suspend / thread_resume", () => {
     const h = makeHarness(tmpDir);
     await callTool(h, "thread_suspend", { reason: "wait" });
     seedEnvelope(h, "t1", { from: "alice", body: "queued while held" });
-    await h.inbox.drainInbox(h.ctx); // on-hold: must NOT deliver
+    await h.inbox.drain(h.ctx); // on-hold: must NOT deliver
     assert.strictEqual(h.calls.length, 0);
     await callTool(h, "thread_resume", {});
     assert.strictEqual(h.store.state, "open");
@@ -833,31 +841,19 @@ describe("tools: thread_journal", () => {
   });
 });
 
-describe("inbox: deliver (correlation, §9)", () => {
-  function envelope(partial: Partial<Envelope> & { from: string; body: string }): Envelope {
-    return {
-      id: mintEnvelopeId(partial.from),
-      to: "t1",
-      sentAt: new Date().toISOString(),
-      ...partial,
-    } as Envelope;
-  }
-
+describe("inbox: receive (correlation, §9)", () => {
   it("a reply that resolves a barrier ships as exactly one message", async () => {
     const h = makeHarness(tmpDir);
     seedRemoteThread(h, "alice");
-    const send = await h.inbox.sendEnvelope("alice", "do it", { expects: true });
+    const [sent] = await h.inbox.sendMany(["alice"], "do it", { expects: true });
     h.store.barriers.push({
       id: "b1",
-      pending: [send.id],
+      pending: [sent.id],
       mode: "all",
       createdAt: new Date().toISOString(),
     });
-    const parts = await h.inbox.deliver(
-      envelope({ from: "alice", body: "done", re: send.id }),
-      h.ctx,
-    );
-    h.inbox.inject(parts, h.ctx);
+    seedEnvelope(h, "t1", { from: "alice", body: "done", re: sent.id });
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls.length, 1);
     assert.match(h.calls[0].content, /done/);
     assert.match(h.calls[0].content, /Barrier "b1" resolved/);
@@ -866,9 +862,10 @@ describe("inbox: deliver (correlation, §9)", () => {
 
   it("a reply clears only the matching obligation", async () => {
     const h = makeHarness(tmpDir);
-    const a = await h.inbox.sendEnvelope("alice", "one", { expects: true });
-    const b = await h.inbox.sendEnvelope("bob", "two", { expects: true });
-    await h.inbox.deliver(envelope({ from: "alice", body: "ok", re: a.id }), h.ctx);
+    const [a] = await h.inbox.sendMany(["alice"], "one", { expects: true });
+    const [b] = await h.inbox.sendMany(["bob"], "two", { expects: true });
+    seedEnvelope(h, "t1", { from: "alice", body: "ok", re: a.id });
+    await h.inbox.drain(h.ctx);
     assert.deepStrictEqual(
       h.store.obligations.map(o => o.id),
       [b.id],
@@ -877,46 +874,49 @@ describe("inbox: deliver (correlation, §9)", () => {
 
   it('"any" mode resolves on the first reply, ignoring the rest', async () => {
     const h = makeHarness(tmpDir);
-    const a = await h.inbox.sendEnvelope("alice", "one", { expects: true });
-    const b = await h.inbox.sendEnvelope("bob", "two", { expects: true });
+    const [a] = await h.inbox.sendMany(["alice"], "one", { expects: true });
+    const [b] = await h.inbox.sendMany(["bob"], "two", { expects: true });
     h.store.barriers.push({
       id: "race",
       pending: [a.id, b.id],
       mode: "any",
       createdAt: new Date().toISOString(),
     });
-    const parts = await h.inbox.deliver(envelope({ from: "bob", body: "first!", re: b.id }), h.ctx);
+    seedEnvelope(h, "t1", { from: "bob", body: "first!", re: b.id });
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.store.barriers.length, 0);
-    assert.match(parts.map(p => p.text).join("\n"), /first reply arrived/);
+    assert.match(h.calls[0].content, /first reply arrived/);
   });
 
   it('"all" mode waits for every pending id before resolving', async () => {
     const h = makeHarness(tmpDir);
-    const a = await h.inbox.sendEnvelope("alice", "one", { expects: true });
-    const b = await h.inbox.sendEnvelope("bob", "two", { expects: true });
+    const [a] = await h.inbox.sendMany(["alice"], "one", { expects: true });
+    const [b] = await h.inbox.sendMany(["bob"], "two", { expects: true });
     h.store.barriers.push({
       id: "gate",
       pending: [a.id, b.id],
       mode: "all",
       createdAt: new Date().toISOString(),
     });
-    await h.inbox.deliver(envelope({ from: "alice", body: "ok", re: a.id }), h.ctx);
+    seedEnvelope(h, "t1", { from: "alice", body: "ok", re: a.id });
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.store.barriers.length, 1);
     assert.deepStrictEqual(h.store.barriers[0].pending, [b.id]);
-    const parts = await h.inbox.deliver(envelope({ from: "bob", body: "ok", re: b.id }), h.ctx);
+    seedEnvelope(h, "t1", { from: "bob", body: "ok", re: b.id });
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.store.barriers.length, 0);
-    assert.match(parts.map(p => p.text).join("\n"), /all awaited replies have arrived/);
+    assert.match(h.calls[1].content, /all awaited replies have arrived/);
   });
 
   it("multiple barriers resolved by one reply fold into one delivery", async () => {
     const h = makeHarness(tmpDir);
-    const a = await h.inbox.sendEnvelope("alice", "one", { expects: true });
+    const [a] = await h.inbox.sendMany(["alice"], "one", { expects: true });
     h.store.barriers.push(
       { id: "b1", pending: [a.id], mode: "all", createdAt: new Date().toISOString() },
       { id: "b2", pending: [a.id], mode: "any", createdAt: new Date().toISOString() },
     );
-    const parts = await h.inbox.deliver(envelope({ from: "alice", body: "ok", re: a.id }), h.ctx);
-    h.inbox.inject(parts, h.ctx);
+    seedEnvelope(h, "t1", { from: "alice", body: "ok", re: a.id });
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls.length, 1);
     assert.match(h.calls[0].content, /Barrier "b1" resolved/);
     assert.match(h.calls[0].content, /Barrier "b2" resolved/);
@@ -924,7 +924,7 @@ describe("inbox: deliver (correlation, §9)", () => {
 
   it("a resolved barrier's message payload is injected alongside the reply (§12.1)", async () => {
     const h = makeHarness(tmpDir);
-    const a = await h.inbox.sendEnvelope("alice", "one", { expects: true });
+    const [a] = await h.inbox.sendMany(["alice"], "one", { expects: true });
     h.store.barriers.push({
       id: "b1",
       pending: [a.id],
@@ -932,17 +932,17 @@ describe("inbox: deliver (correlation, §9)", () => {
       createdAt: new Date().toISOString(),
       message: "now merge the branches",
     });
-    const parts = await h.inbox.deliver(envelope({ from: "alice", body: "ok", re: a.id }), h.ctx);
-    h.inbox.inject(parts, h.ctx);
+    seedEnvelope(h, "t1", { from: "alice", body: "ok", re: a.id });
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls.length, 1);
     assert.match(h.calls[0].content, /now merge the branches/);
   });
 
   it("a reply+request discharges the pending wait AND records a new owed reply", async () => {
     const h = makeHarness(tmpDir);
-    const a = await h.inbox.sendEnvelope("alice", "do it", { expects: true });
-    const counter = envelope({ from: "alice", body: "which env?", re: a.id, expects: true });
-    await h.inbox.deliver(counter, h.ctx);
+    const [a] = await h.inbox.sendMany(["alice"], "do it", { expects: true });
+    const counter = seedEnvelope(h, "t1", { from: "alice", body: "which env?", re: a.id, expects: true });
+    await h.inbox.drain(h.ctx);
     // Their counter-request discharged our obligation...
     assert.strictEqual(h.store.obligations.length, 0);
     // ...and we now owe them a reply keyed by THEIR envelope id.
@@ -954,63 +954,62 @@ describe("inbox: deliver (correlation, §9)", () => {
 
   it("renders kind from field presence, with a reply hint on requests (§6.1)", async () => {
     const h = makeHarness(tmpDir);
-    const req = envelope({ from: "alice", body: "need this", expects: true });
-    const parts = await h.inbox.deliver(req, h.ctx);
+    const req = seedEnvelope(h, "t1", { from: "alice", body: "need this", expects: true });
+    await h.inbox.drain(h.ctx);
     assert.match(
-      parts[0].text,
+      h.calls[0].content,
       new RegExp(`\\[Request from alice \\(#${req.id.replace("/", "\\/")}\\)\\]`),
     );
-    assert.match(parts[0].text, /expects an answer/);
-    const note = envelope({ from: "alice", body: "fyi" });
-    const noteParts = await h.inbox.deliver(note, h.ctx);
-    assert.match(noteParts[0].text, /\[Note from alice/);
-    assert.doesNotMatch(noteParts[0].text, /expects an answer/);
+    assert.match(h.calls[0].content, /expects an answer/);
+    seedEnvelope(h, "t1", { from: "alice", body: "fyi" });
+    await h.inbox.drain(h.ctx);
+    assert.match(h.calls[1].content, /\[Note from alice/);
+    assert.doesNotMatch(h.calls[1].content, /expects an answer/);
   });
 });
 
 describe("inbox: owed replies (recipient-side durability)", () => {
-  function requestEnvelope(from: string, id: string, body = "do the thing"): Envelope {
-    return {
-      id,
-      from,
-      to: "t1",
-      body,
-      sentAt: new Date().toISOString(),
-      expects: true,
-    };
+  function requestEnvelope(
+    from: string,
+    id: string,
+    body = "do the thing",
+  ): Partial<Mail> & { from: string; body: string } {
+    return { id, from, body, expects: true };
   }
 
   it("delivering a request records a durable owed reply with the id to echo", async () => {
     const h = makeHarness(tmpDir);
-    await h.inbox.deliver(requestEnvelope("boss", "boss/b1"), h.ctx);
+    seedEnvelope(h, "t1", requestEnvelope("boss", "boss/b1"));
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.store.owed.length, 1);
     assert.strictEqual(h.store.owed[0].id, "boss/b1");
     const onDisk = JSON.parse(
-      readFileSync(join(h.store.threadDir, "state.json"), "utf8"),
+      readFileSync(join(threadDirFor(h.dir, h.store.threadId), "state.json"), "utf8"),
     ) as StateFile;
     assert.strictEqual(onDisk.owed[0]?.id, "boss/b1");
   });
 
   it("a note does not record an owed reply", async () => {
     const h = makeHarness(tmpDir);
-    await h.inbox.deliver(
-      { id: "boss/n1", from: "boss", to: "t1", body: "fyi", sentAt: new Date().toISOString() },
-      h.ctx,
-    );
+    seedEnvelope(h, "t1", { id: "boss/n1", from: "boss", body: "fyi" });
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.store.owed.length, 0);
   });
 
   it("redelivering the same id does not double-record", async () => {
     const h = makeHarness(tmpDir);
-    await h.inbox.deliver(requestEnvelope("boss", "boss/b1"), h.ctx);
-    await h.inbox.deliver(requestEnvelope("boss", "boss/b1"), h.ctx);
+    seedEnvelope(h, "t1", requestEnvelope("boss", "boss/b1"));
+    await h.inbox.drain(h.ctx);
+    seedEnvelope(h, "t1", requestEnvelope("boss", "boss/b1"));
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.store.owed.length, 1);
   });
 
   it("sending the matching reply settles the owed record", async () => {
     const h = makeHarness(tmpDir);
     seedRemoteThread(h, "boss");
-    await h.inbox.deliver(requestEnvelope("boss", "boss/b1"), h.ctx);
+    seedEnvelope(h, "t1", requestEnvelope("boss", "boss/b1"));
+    await h.inbox.drain(h.ctx);
     await callTool(h, "thread_send", { to: "boss", body: "done", re: "boss/b1" });
     assert.strictEqual(h.store.owed.length, 0);
   });
@@ -1018,19 +1017,20 @@ describe("inbox: owed replies (recipient-side durability)", () => {
   it("a reply with a different re leaves the owed record intact", async () => {
     const h = makeHarness(tmpDir);
     seedRemoteThread(h, "boss");
-    await h.inbox.deliver(requestEnvelope("boss", "boss/b1"), h.ctx);
+    seedEnvelope(h, "t1", requestEnvelope("boss", "boss/b1"));
+    await h.inbox.drain(h.ctx);
     await callTool(h, "thread_send", { to: "boss", body: "unrelated", re: "boss/other" });
     assert.strictEqual(h.store.owed.length, 1);
   });
 });
 
-describe("inbox: drainInbox", () => {
+describe("inbox: drain", () => {
   it("skips malformed JSON without crashing or redelivering it", async () => {
     const h = makeHarness(tmpDir);
-    const dir = join(h.store.threadsRootDir, "t1", "inbox");
+    const dir = join(threadDirFor(h.dir, "t1"), "inbox");
     writeFileSync(join(dir, "0-bad.json"), "{nope");
     seedEnvelope(h, "t1", { from: "alice", body: "good one" });
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls.length, 1);
     assert.match(h.calls[0].content, /good one/);
     assert.ok(existsSync(join(dir, "0-bad.json")), "malformed file stays put");
@@ -1040,7 +1040,7 @@ describe("inbox: drainInbox", () => {
     const h = makeHarness(tmpDir);
     seedEnvelope(h, "t1", { from: "alice", body: "FIRST" }, "1-a.json");
     seedEnvelope(h, "t1", { from: "bob", body: "SECOND" }, "2-b.json");
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls.length, 1);
     const text = h.calls[0].content;
     assert.ok(text.indexOf("FIRST") < text.indexOf("SECOND"), "FIFO order preserved");
@@ -1050,11 +1050,11 @@ describe("inbox: drainInbox", () => {
     const h = makeHarness(tmpDir);
     seedEnvelope(h, "t1", { from: "alice", body: "calm" }, "1-a.json");
     seedEnvelope(h, "t1", { from: "bob", body: "urgent!", urgency: "high" }, "2-b.json");
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls[0].options?.deliverAs, "steer");
 
     seedEnvelope(h, "t1", { from: "alice", body: "calm again" }, "3-c.json");
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls[1].options?.deliverAs, "followUp");
   });
 
@@ -1065,7 +1065,7 @@ describe("inbox: drainInbox", () => {
       body: "future",
       deliverAfter: new Date(Date.now() + 60_000).toISOString(),
     });
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls.length, 0, "not deliverable yet");
     assert.strictEqual(inboxFileCount(h, "t1"), 1, "still durably queued");
   });
@@ -1075,12 +1075,12 @@ describe("inbox: injection gate (§7.3/§7.7)", () => {
   it("holds the drain shut during compaction and flushes after it ends", async () => {
     const h = makeHarness(tmpDir);
     seedEnvelope(h, "t1", { from: "alice", body: "during compaction" });
-    h.inbox.noteCompactionStart();
-    await h.inbox.drainInbox(h.ctx);
+    h.inbox.markCompactionStart();
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls.length, 0);
     assert.strictEqual(inboxFileCount(h, "t1"), 1, "§7.7: not even claimed while gated");
-    h.inbox.noteCompactionEnd();
-    await h.inbox.drainInbox(h.ctx);
+    h.inbox.markCompactionEnd();
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls.length, 1);
   });
 
@@ -1088,14 +1088,14 @@ describe("inbox: injection gate (§7.3/§7.7)", () => {
     const h = makeHarness(tmpDir);
     h.idle = true;
     seedEnvelope(h, "t1", { from: "alice", body: "first" });
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls.length, 1);
     seedEnvelope(h, "t1", { from: "alice", body: "second" });
-    await h.inbox.drainInbox(h.ctx); // gated by the preflight hold
+    await h.inbox.drain(h.ctx); // gated by the preflight hold
     assert.strictEqual(h.calls.length, 1);
     assert.strictEqual(inboxFileCount(h, "t1"), 1, "second stays durable");
-    h.inbox.noteRunStarted();
-    await h.inbox.drainInbox(h.ctx);
+    h.inbox.markRunStarted();
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls.length, 2);
   });
 
@@ -1103,9 +1103,9 @@ describe("inbox: injection gate (§7.3/§7.7)", () => {
     const h = makeHarness(tmpDir);
     h.idle = false;
     seedEnvelope(h, "t1", { from: "alice", body: "one" });
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     seedEnvelope(h, "t1", { from: "alice", body: "two" });
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls.length, 2);
   });
 
@@ -1118,11 +1118,11 @@ describe("inbox: injection gate (§7.3/§7.7)", () => {
       sentAt: new Date().toISOString(),
       deadline: new Date(Date.now() - 1000).toISOString(),
     });
-    h.inbox.noteCompactionStart();
+    h.inbox.markCompactionStart();
     await h.inbox.checkDeadlines(h.ctx);
     assert.strictEqual(h.calls.length, 0);
     assert.strictEqual(h.store.obligations[0].nudged, undefined, "not consumed while gated");
-    h.inbox.noteCompactionEnd();
+    h.inbox.markCompactionEnd();
     await h.inbox.checkDeadlines(h.ctx);
     assert.strictEqual(h.calls.length, 1);
     assert.strictEqual(h.store.obligations[0].nudged, true);
@@ -1189,7 +1189,7 @@ describe("Errata 3: heartbeat coalesces its sources into one inject (§7.5)", ()
       deadline: new Date(Date.now() - 1000).toISOString(),
     });
     const parts: Injection[] = [];
-    await h.inbox.drainInbox(h.ctx, parts);
+    await h.inbox.drain(h.ctx, parts);
     await h.inbox.checkDeadlines(h.ctx, parts);
     h.inbox.inject(parts, h.ctx);
     assert.strictEqual(h.calls.length, 1, "one coalesced message");
@@ -1208,7 +1208,7 @@ describe("Errata 3: heartbeat coalesces its sources into one inject (§7.5)", ()
       sentAt: new Date().toISOString(),
       deadline: new Date(Date.now() - 1000).toISOString(),
     });
-    await h.inbox.drainInbox(h.ctx); // injects, arms the preflight hold
+    await h.inbox.drain(h.ctx); // injects, arms the preflight hold
     await h.inbox.checkDeadlines(h.ctx); // gated by that hold
     assert.strictEqual(h.calls.length, 1);
     assert.doesNotMatch(h.calls[0].content, /Obligation #.*overdue/);
@@ -1217,7 +1217,7 @@ describe("Errata 3: heartbeat coalesces its sources into one inject (§7.5)", ()
   it("standalone (no shared array) still injects its own batch — unchanged callers", async () => {
     const h = makeHarness(tmpDir);
     seedEnvelope(h, "t1", { from: "alice", body: "solo drain" });
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.calls.length, 1);
     assert.match(h.calls[0].content, /solo drain/);
   });
@@ -1490,10 +1490,10 @@ function wireEnvelope(
   from: string,
   to: string,
   body: string,
-  extra: Partial<Envelope> = {},
-): Envelope {
+  extra: Partial<Mail> = {},
+): Mail {
   return {
-    id: mintEnvelopeId(from),
+    id: mintMailId(from),
     from,
     to,
     body,
@@ -1526,24 +1526,24 @@ describe("adapter: LocalFsAdapter (Appendix B binding)", () => {
     assert.strictEqual(await adapter.threadExists("a"), true);
   });
 
-  it("enqueueMessage + drainInbox delivers everything exactly once, in FIFO ulid order", async () => {
+  it("sendMail + receiveMail delivers everything exactly once, in FIFO ulid order", async () => {
     const adapter = createAdapter({ "base-dir": tmpDir });
     await adapter.configure();
-    await adapter.enqueueMessage(wireEnvelope("alice", "bob", "first"));
-    await adapter.enqueueMessage(wireEnvelope("alice", "bob", "second"));
-    const claimed = await adapter.drainInbox("bob");
+    await adapter.sendMail(wireEnvelope("alice", "bob", "first"));
+    await adapter.sendMail(wireEnvelope("alice", "bob", "second"));
+    const claimed = await adapter.receiveMail("bob");
     // Monotonic ULIDs make FIFO exact even in the same millisecond.
     assert.deepStrictEqual(
       claimed.map(m => m.body),
       ["first", "second"],
     );
-    assert.deepStrictEqual(await adapter.drainInbox("bob"), []);
+    assert.deepStrictEqual(await adapter.receiveMail("bob"), []);
   });
 
   it("enqueue goes through inbox.tmp staging and leaves nothing behind", async () => {
     const adapter = createAdapter({ "base-dir": tmpDir });
     await adapter.configure();
-    await adapter.enqueueMessage(wireEnvelope("alice", "bob", "hi"));
+    await adapter.sendMail(wireEnvelope("alice", "bob", "hi"));
     const staging = join(tmpDir, ".thread", "threads", "bob", "inbox.tmp");
     assert.ok(existsSync(staging), "staging dir exists");
     assert.strictEqual(readdirSync(staging).length, 0, "no leftover temp files");
@@ -1559,34 +1559,34 @@ describe("adapter: LocalFsAdapter (Appendix B binding)", () => {
     const adapter = createAdapter({ "base-dir": tmpDir });
     await adapter.configure();
     const msg = wireEnvelope("alice", "bob", "retry me");
-    await adapter.enqueueMessage(msg);
-    await adapter.enqueueMessage(msg);
-    const claimed = await adapter.drainInbox("bob");
+    await adapter.sendMail(msg);
+    await adapter.sendMail(msg);
+    const claimed = await adapter.receiveMail("bob");
     assert.strictEqual(claimed.length, 1, "no duplicate delivery");
   });
 
-  it("drainInbox holds deliverAfter envelopes until due, then delivers them (§6)", async () => {
+  it("receiveMail holds deliverAfter envelopes until due, then delivers them (§6)", async () => {
     const adapter = createAdapter({ "base-dir": tmpDir });
     await adapter.configure();
-    await adapter.enqueueMessage(
+    await adapter.sendMail(
       wireEnvelope("alice", "bob", "later", {
         deliverAfter: new Date(Date.now() + 150).toISOString(),
       }),
     );
-    assert.deepStrictEqual(await adapter.drainInbox("bob"), [], "not due yet");
+    assert.deepStrictEqual(await adapter.receiveMail("bob"), [], "not due yet");
     await new Promise(r => setTimeout(r, 200));
-    const claimed = await adapter.drainInbox("bob");
+    const claimed = await adapter.receiveMail("bob");
     assert.strictEqual(claimed.length, 1);
     assert.strictEqual(claimed[0].body, "later");
   });
 
-  it("drainInbox leaves malformed JSON in place and never returns it", async () => {
+  it("receiveMail leaves malformed JSON in place and never returns it", async () => {
     const adapter = createAdapter({ "base-dir": tmpDir });
     await adapter.configure();
     const dir = join(tmpDir, ".thread", "threads", "bob", "inbox");
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "1-bad.json"), "{not valid json");
-    const claimed = await adapter.drainInbox("bob");
+    const claimed = await adapter.receiveMail("bob");
     assert.strictEqual(claimed.length, 0);
     assert.ok(existsSync(join(dir, "1-bad.json")));
   });
@@ -1602,13 +1602,13 @@ describe("adapter: LocalFsAdapter (Appendix B binding)", () => {
     assert.strictEqual(threads[0]?.status, "stopped");
   });
 
-  it("watchInbox doesn't throw for a thread that has never received a message (no inbox/ dir yet)", async () => {
+  it("watchMail doesn't throw for a thread that has never received a message (no inbox/ dir yet)", async () => {
     const adapter = createAdapter({ "base-dir": tmpDir });
     await adapter.configure();
     await adapter.saveState("fresh", baseState("fresh"));
     assert.ok(!existsSync(join(tmpDir, ".thread", "threads", "fresh", "inbox")));
     let fired = false;
-    const dispose = adapter.watchInbox("fresh", () => {
+    const dispose = adapter.watchMail("fresh", () => {
       fired = true;
     });
     // Dispose in finally: a leaked FSWatcher keeps the node:test process
@@ -1617,7 +1617,7 @@ describe("adapter: LocalFsAdapter (Appendix B binding)", () => {
     try {
       assert.ok(existsSync(join(tmpDir, ".thread", "threads", "fresh", "inbox")));
       // A message arriving after the (now-live) watch should still be observed.
-      await adapter.enqueueMessage(wireEnvelope("other", "fresh", "hi"));
+      await adapter.sendMail(wireEnvelope("other", "fresh", "hi"));
       for (let i = 0; i < 40 && !fired; i++) {
         await new Promise(resolve => setTimeout(resolve, 50));
       }
@@ -1635,7 +1635,7 @@ describe("adapter: LocalFsAdapter (Appendix B binding)", () => {
  *  which also exercises the journal channel's optionality (§5). */
 function createFakeAdapter(): StorageAdapter {
   const states = new Map<string, StateFile>();
-  const inboxes = new Map<string, Envelope[]>();
+  const inboxes = new Map<string, Mail[]>();
 
   return {
     async configure() {},
@@ -1651,12 +1651,12 @@ function createFakeAdapter(): StorageAdapter {
     async threadExists(id) {
       return states.has(id);
     },
-    async enqueueMessage(message) {
-      const arr = inboxes.get(message.to) ?? [];
-      arr.push(message);
-      inboxes.set(message.to, arr);
+    async sendMail(mail) {
+      const arr = inboxes.get(mail.to) ?? [];
+      arr.push(mail);
+      inboxes.set(mail.to, arr);
     },
-    async drainInbox(id) {
+    async receiveMail(id) {
       const arr = inboxes.get(id) ?? [];
       const now = Date.now();
       const due = arr.filter(m => !m.deliverAfter || new Date(m.deliverAfter).getTime() <= now);
@@ -1666,7 +1666,7 @@ function createFakeAdapter(): StorageAdapter {
       );
       return due;
     },
-    watchInbox() {
+    watchMail() {
       return () => {};
     },
   };
@@ -1701,23 +1701,19 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
     const senderState = freshState();
     const sender = createStore(stubPi, fake, senderState);
     sender.threadId = "sender";
-    sender.threadsRootDir = "/virtual";
-    sender.threadDir = "/virtual/sender";
     await sender.persist();
     const senderInbox = createInbox(stubPi, sender, senderState);
 
     const receiverState = freshState();
     const receiver = createStore(stubPi, fake, receiverState);
     receiver.threadId = "receiver";
-    receiver.threadsRootDir = "/virtual";
-    receiver.threadDir = "/virtual/receiver";
     await receiver.persist();
     const receiverInbox = createInbox(stubPi, receiver, receiverState);
 
-    const { delivered } = await senderInbox.sendEnvelope("receiver", "hi from fake adapter");
+    const [{ delivered }] = await senderInbox.sendMany(["receiver"], "hi from fake adapter");
     assert.strictEqual(delivered, "live"); // receiver's state already exists and is fresh
 
-    await receiverInbox.drainInbox(ctx as unknown as ExtensionContext);
+    await receiverInbox.drain(ctx as unknown as ExtensionContext);
     assert.strictEqual(calls.length, 1);
     assert.match(calls[0].content, /hi from fake adapter/);
   });
@@ -1727,7 +1723,6 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
     const stubPi = stubPiWith([]);
     const store = createStore(stubPi, fake, freshState());
     store.threadId = "solo";
-    store.threadDir = "/virtual/solo";
     await store.transition("open");
     const loaded = await fake.loadState("solo");
     assert.strictEqual(loaded?.state, "open");
@@ -1832,7 +1827,7 @@ describe("bin/thread-cli.mjs: external C1 actor", () => {
     assert.strictEqual(written.body, "what is the plan?");
     // The extension side delivers it and records the owed reply — the full
     // C1-to-C3 interop loop, files only.
-    await h.inbox.drainInbox(h.ctx);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.store.owed.length, 1);
     assert.strictEqual(h.store.owed[0].id, written.id);
     assert.strictEqual(h.store.owed[0].from, "user");
@@ -1840,9 +1835,9 @@ describe("bin/thread-cli.mjs: external C1 actor", () => {
 
   it("send --re settles the loop back: a human reply discharges the thread's obligation shape", async () => {
     const h = makeHarness(tmpDir);
-    const send = await h.inbox.sendEnvelope("user", "please review", { expects: true });
-    runCli(h.dir, "send", "t1", "looks", "good", "--from", "user", "--re", send.id);
-    await h.inbox.drainInbox(h.ctx);
+    const [sent] = await h.inbox.sendMany(["user"], "please review", { expects: true });
+    runCli(h.dir, "send", "t1", "looks", "good", "--from", "user", "--re", sent.id);
+    await h.inbox.drain(h.ctx);
     assert.strictEqual(h.store.obligations.length, 0, "obligation discharged by CLI reply");
   });
 });
@@ -1936,11 +1931,12 @@ describe("state: restore rules (§11.2)", () => {
       getFlag: (name: string) => (name === "thread-id" ? "a" : undefined),
       appendEntry: () => {},
     } as unknown as ExtensionAPI;
-    const store = createStore(
-      stubPi,
-      createAdapter({ "base-dir": tmpDir }),
-      { active: true, toolUsedThisTurn: false, inFlightSince: null, compactingSince: null },
-    );
+    const store = createStore(stubPi, createAdapter({ "base-dir": tmpDir }), {
+      active: true,
+      toolUsedThisTurn: false,
+      inFlightSince: null,
+      compactingSince: null,
+    });
     await store.init({
       cwd: tmpDir,
       ui: { setStatus: () => {} },
@@ -1957,7 +1953,7 @@ describe("state: watcher idempotency", () => {
     let active = 0;
     const counting: StorageAdapter = {
       ...createFakeAdapter(),
-      watchInbox() {
+      watchMail() {
         active++;
         return () => active--;
       },

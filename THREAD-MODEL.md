@@ -18,8 +18,8 @@ src/
   journal.ts          journal fork prompt, cadence policy, spawn plumbing
   commands.ts         human-facing /thread-* slash commands
   core/
-    types.ts          Envelope, Obligation, OwedReply, Barrier, StateFile, ThreadStore
-    ids.ts             mintId (barriers), ulid, mintEnvelopeId
+    types.ts          Mail, Obligation, OwedReply, Barrier, StateFile, ThreadStore
+    ids.ts             mintId (barriers), ulid, mintMailId
     format.ts          shared text rendering for thread_status/thread_list/commands
     thread-ops.ts       suspend/resume, shared by tools and slash commands
     system-prompt.ts    the injected "Thread Communication Model" system-prompt block
@@ -107,7 +107,7 @@ No hard interrupt mid-Thinking or mid-Working. Messages queue for the next Open.
 
 `src/state.ts`'s `createThreadStore()` is the single mutable object every other module reads and writes (`ThreadStore extends ThreadData`, `src/core/types.ts`): identity (`threadId`, `parent`, `role`), the current `state`, the three durable ledgers (`obligations`, `owed`, `barriers`), plus in-memory-only bookkeeping for the nudge and journal-cadence gates (`owedNudgePending`, `owedSilentStreak`, `lastJournalSignature`, `lastJournalAt`, `journalDebt`). It owns the heartbeat (`setInterval`, `HEARTBEAT_MS = 20_000`) and the inbox watcher subscription, and every mutation goes through `persist()`, which serializes a `StateFile` through `store.adapter.saveState`.
 
-All actual I/O is delegated to a `StorageAdapter` (`src/adapter/types.ts`) — a **domain-shaped** interface (`loadState`/`saveState`/`listThreads`/`threadExists`/`enqueueMessage`/`drainInbox`/`watchInbox`), not a generic filesystem shim. That's deliberate: it has to map cleanly onto both a local directory tree and any future remote backend whose durable state is addressed per-key, and there's no timer/wake member on the interface at all — a delayed delivery is just an envelope carrying `deliverAfter`, held by whichever backend stores it until due. An optional `JournalAdapter` extension (`appendJournal`/`readJournal`) is layered on top (`ThreadAdapter = StorageAdapter & Partial<JournalAdapter>`); backends that skip it simply have no journal channel and callers degrade gracefully (`readJournal` returns `undefined`, `forkJournalEntry` no-ops).
+All actual I/O is delegated to a `StorageAdapter` (`src/adapter/types.ts`) — a **domain-shaped** interface (`loadState`/`saveState`/`listThreads`/`threadExists`/`sendMail`/`receiveMail`/`watchMail`), not a generic filesystem shim. That's deliberate: it has to map cleanly onto both a local directory tree and any future remote backend whose durable state is addressed per-key, and there's no timer/wake member on the interface at all — a delayed delivery is just an envelope carrying `deliverAfter`, held by whichever backend stores it until due. An optional `JournalAdapter` extension (`appendJournal`/`readJournal`) is layered on top (`ThreadAdapter = StorageAdapter & Partial<JournalAdapter>`); backends that skip it simply have no journal channel and callers degrade gracefully (`readJournal` returns `undefined`, `forkJournalEntry` no-ops).
 
 `--thread-storage` (default `local`, currently the only built-in) selects the backend via a factory registry (`src/adapter/registry.ts`); adding a backend means writing one factory function and adding one line there — nothing else in `src/` changes.
 
@@ -122,23 +122,23 @@ All actual I/O is delegated to a `StorageAdapter` (`src/adapter/types.ts`) — a
   inbox.tmp/               enqueue staging (same filesystem as inbox/)
 ```
 
-Each thread only ever writes its own `state.json`; other threads only ever *create* files in its `inbox/` — so no cross-process file locking is needed anywhere. Envelope filenames are the id's ULID tail (`mintEnvelopeId` → `<from>/<ulid>`, `src/core/ids.ts`), so a sorted `readdir` **is** FIFO order, and a retried send with the same id overwrites its own file — enqueue idempotence for free.
+Each thread only ever writes its own `state.json`; other threads only ever *create* files in its `inbox/` — so no cross-process file locking is needed anywhere. Mail filenames are the id's ULID tail (`mintMailId` → `<from>/<ulid>`, `src/core/ids.ts`), so a sorted `readdir` **is** FIFO order, and a retried send with the same id overwrites its own file — enqueue idempotence for free.
 
-`enqueueMessage` writes into `inbox.tmp/`, then `fs.renameSync`s into `inbox/` — atomic on the same filesystem, so a reader never observes a partial envelope. `drainInbox` does a sorted `readdir`, skips anything whose `deliverAfter` is still in the future, and — **before** returning each envelope as claimed — renames it into `inbox/processed/`; if the caller throws after that, the message is already moved and won't be redelivered (favors "never deliver twice" over "never lose one", per the spec's §7.7 drain gate).
+`sendMail` writes into `inbox.tmp/`, then `fs.renameSync`s into `inbox/` — atomic on the same filesystem, so a reader never observes a partial envelope. `receiveMail` does a sorted `readdir`, skips anything whose `deliverAfter` is still in the future, and — **before** returning each envelope as claimed — renames it into `inbox/processed/`; if the caller throws after that, the message is already moved and won't be redelivered (favors "never deliver twice" over "never lose one", per the spec's §7.7 drain gate).
 
 **processed/ GC (v0.3.2):** `pruneProcessed()` deletes files older than `PROCESSED_TTL_MS` (7 days, `src/core/types.ts`), but only runs **at most once per `PRUNE_INTERVAL_MS` (1 hour) per thread** — a `Map<threadId, lastPrunedAt>` inside the adapter closure gates it. This replaced an earlier once-per-process one-shot GC: a one-shot would let a long-lived process's `processed/` directory outgrow the 7-day retention window forever once the single GC pass had already happened.
 
-`watchInbox` creates the thread's `inbox/` directory eagerly (an `fs.watch` on a not-yet-existing path throws `ENOENT`, which would otherwise leave a never-messaged thread with a silently no-op watch until its next restart), then wraps `fs.watch`.
+`watchMail` creates the thread's `inbox/` directory eagerly (an `fs.watch` on a not-yet-existing path throws `ENOENT`, which would otherwise leave a never-messaged thread with a silently no-op watch until its next restart), then wraps `fs.watch`.
 
 ---
 
 ## Message lifecycle, end to end
 
-1. **Mint.** `inbox.ts`'s `sendEnvelope(to, body, opts)` mints an id via `mintEnvelopeId(store.threadId)` (`<from>/<ulid>`) and builds the `Envelope` — `re`/`expects`/`urgency`/`deliverAfter` included only when set (absence is meaningful on the wire: unset urgency reads as `"low"`).
-2. **Enqueue.** `store.adapter.enqueueMessage(msg)` — on local-fs, write-to-staging (`inbox.tmp/`) then `renameSync` into the target's `inbox/` (atomic). `sendEnvelope` also checks `isTargetLive(to)` first (fresh `lastSeen` + `status: "running"`) purely to report `"live"` vs `"queued"` back to the caller — delivery itself doesn't depend on liveness; a queued message sits durably until drained.
+1. **Mint.** `inbox.ts`'s `send(to, body, opts)` mints an id via `mintMailId(store.threadId)` (`<from>/<ulid>`) and builds the `Mail` — `re`/`expects`/`urgency`/`deliverAfter` included only when set (absence is meaningful on the wire: unset urgency reads as `"low"`).
+2. **Enqueue.** `store.adapter.sendMail(msg)` — on local-fs, write-to-staging (`inbox.tmp/`) then `renameSync` into the target's `inbox/` (atomic). `Inbox.sendMany` also checks `isTargetLive(to)` first (fresh `lastSeen` + `status: "running"`) purely to report `"live"` vs `"queued"` back to the caller — delivery itself doesn't depend on liveness; a queued message sits durably until drained.
 3. **Bookkeeping at send time.** If `opts.re` is set, `sendEnvelope` looks for a matching entry in `store.owed` and only clears it **if `owedMatch.from === to`** (Errata 1 gate on this ledger — see "Dual ledgers" below). If `opts.expects` is set, a new `Obligation` is pushed with a deadline (explicit or the 15-minute default) and persisted.
-4. **Drain claim.** The receiving process's `store.adapter.drainInbox(threadId)` runs — triggered by (a) `session_start`'s deferred initial drain, (b) the `fs.watch`/poll-driven live watcher, (c) `turn_end`, (d) the 20s heartbeat, (e) `session_compact`. On local-fs this is a sorted `readdir` → filter due → rename-to-`processed/` → return; the rename-before-delivery ordering is what makes "claimed but crashed before injection" the protocol's one declared loss window (spec §7.7, Erratum 5).
-5. **Deliver.** `inbox.ts`'s `deliver(msg, ctx)` runs the receive-side ledger updates (below) and renders the envelope into an `Injection` (`renderEnvelope` → `[<kind> from <sender> #<id>]` + body + an explicit reply hint when `expects` is set).
+4. **Drain claim.** The receiving process's `store.adapter.receiveMail(threadId)` runs — triggered by (a) `session_start`'s deferred initial drain, (b) the `fs.watch`/poll-driven live watcher, (c) `turn_end`, (d) the 20s heartbeat, (e) `session_compact`. On local-fs this is a sorted `readdir` → filter due → rename-to-`processed/` → return; the rename-before-delivery ordering is what makes "claimed but crashed before injection" the protocol's one declared loss window (spec §7.7, Erratum 5).
+5. **Receive.** `inbox.ts`'s `receive(msg, ctx)` runs the receive-side ledger updates (below) and renders the envelope into an `Injection` (`renderMail` → `[<kind> from <sender> #<id>]` + body + an explicit reply hint when `expects` is set).
 6. **Injection.** `drainInbox` batches every delivered envelope's `Injection` parts and hands them to `inject()`, which is gated by `canInject()` (the §7.7 declare-and-shrink gate — see below) and, when clear, calls `pi.sendUserMessage` exactly once for the whole batch.
 
 ## Dual ledgers and both discharge gates (Erratum 6, v0.3.1/v0.3.2)

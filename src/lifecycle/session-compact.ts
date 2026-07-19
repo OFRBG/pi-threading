@@ -6,6 +6,6 @@ export const sessionCompact: ThreadingHookHandler<SessionCompactEvent> = async (
   _,
   ctx,
 ) => {
-  inbox.noteCompactionEnd();
-  await inbox.drainInbox(ctx);
+  inbox.markCompactionEnd();
+  await inbox.drain(ctx);
 };

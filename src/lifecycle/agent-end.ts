@@ -31,5 +31,5 @@ export const agentEnd: ThreadingHookHandler<AgentEndEvent> = async (
 
   // Messages steered from agent_end handlers are still consumed: pi checks
   // its queues once more after these handlers settle and continues the run.
-  await inbox.drainInbox(ctx);
+  await inbox.drain(ctx);
 };

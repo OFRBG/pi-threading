@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { StateFile, Envelope, ThreadSummary } from "../core/types";
+import type { StateFile, Mail, ThreadSummary } from "../core/types";
 
 export type ThreadingFlagKey<TParam extends string> = `thread-storage-${TParam}`;
 export type AdapterOptionKey<TFlag = string> =
@@ -30,9 +30,9 @@ export interface StorageAdapter {
   listThreads(): Promise<ThreadSummary[]>;
   threadExists(threadId: string): Promise<boolean>;
 
-  enqueueMessage(message: Envelope): Promise<void>;
-  drainInbox(threadId: string): Promise<Envelope[]>;
-  watchInbox(threadId: string, cb: () => void): () => void;
+  sendMail(mail: Mail): Promise<void>;
+  receiveMail(threadId: string): Promise<Mail[]>;
+  watchMail(threadId: string, cb: () => void): () => void;
 }
 
 export interface JournalAdapter {

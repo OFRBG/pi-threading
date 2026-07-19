@@ -1,5 +1,4 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import * as path from "node:path";
 import type { ThreadStore, ThreadState, ThreadSummary, StateFile } from "./core/types";
 import { HEARTBEAT_MS, CLIENT_CAPABILITIES } from "./core/types";
 import { nowIso } from "./core/time";
@@ -33,8 +32,6 @@ export function createStore(
     // --- mutable data ---
     adapter,
     threadId: "",
-    threadDir: "",
-    threadsRootDir: "",
     parent: null,
     role: null,
     sessionFile: null,
@@ -88,7 +85,6 @@ export function createStore(
 
     async init(ctx: ExtensionContext) {
       await store.adapter.configure();
-      store.threadsRootDir = path.join(ctx.cwd, ".thread", "threads");
 
       // Identity is flag-only, every launch (§2.3 — no auto-generated ids):
       // lifecycle.ts's opt-in gate already requires --thread-id before this
@@ -104,8 +100,6 @@ export function createStore(
       store.parent = typeof flagParent === "string" && flagParent ? flagParent : null;
       const flagRole = pi.getFlag("thread-role");
       store.role = typeof flagRole === "string" && flagRole ? flagRole : null;
-
-      store.threadDir = path.join(store.threadsRootDir, store.threadId);
 
       // Restore previous state if present. Debts and barriers are durable
       // waits — restored unconditionally (§13.2): a reply may arrive while
@@ -190,9 +184,9 @@ export function createStore(
       heartbeat = null;
     },
 
-    startWatcher(drainInbox, ctx) {
+    startWatcher(drain, ctx) {
       stopWatching?.();
-      stopWatching = store.adapter.watchInbox(store.threadId, () => drainInbox(ctx));
+      stopWatching = store.adapter.watchMail(store.threadId, () => drain(ctx));
     },
 
     stopWatcher() {

@@ -8,5 +8,5 @@ import type { ThreadingHookHandler } from "./shared";
 export const sessionBeforeCompact: ThreadingHookHandler<SessionBeforeCompactEvent> = async ({
   inbox,
 }) => {
-  inbox.noteCompactionStart();
+  inbox.markCompactionStart();
 };

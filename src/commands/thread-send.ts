@@ -29,9 +29,9 @@ export const threadSend: CommandDefinition = {
         return;
       }
 
-      const sent = await inbox.sendToMany(targets, body, { urgency });
+      const sent = await inbox.sendMany(targets, body, { urgency });
 
-      const missing = new Set(await inbox.findMissingTargets(targets));
+      const missing = new Set(await inbox.checkMissing(targets));
 
       for (const s of sent) {
         const unseen = missing.has(s.to);

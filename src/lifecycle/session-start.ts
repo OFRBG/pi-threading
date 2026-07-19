@@ -23,17 +23,17 @@ export const sessionStart: Handler<SessionStartEvent> = async (
 
   await store.init(ctx);
 
-  setImmediate(() => void inbox.drainInbox(ctx));
+  setImmediate(() => void inbox.drain(ctx));
 
-  store.startWatcher(inbox.drainInbox, ctx);
+  store.startWatcher(inbox.drain, ctx);
 
   store.startHeartbeat(async () => {
     // Coalesce both heartbeat-driven sources into ONE inject() per tick
-    // (§7.5, Errata 3): if drainInbox injected on its own here, its
+    // (§7.5, Errata 3): if drain injected on its own here, its
     // idle-time inFlightSince write would gate out the deadline check for
     // a full heartbeat interval.
     const parts: Injection[] = [];
-    await inbox.drainInbox(ctx, parts);
+    await inbox.drain(ctx, parts);
     await inbox.checkDeadlines(ctx, parts);
     inbox.inject(parts, ctx);
   });

@@ -1,7 +1,5 @@
 #!/usr/bin/env node
 // thread-cli.mjs — zero-dependency CLI to monitor and steer a multi-agent thread system.
-// A C1 postbox actor (PROTOCOL-FORMALISM.md §2.2): speaks the local-fs
-// binding (Appendix B) directly — no extension required on either side.
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";

@@ -37,7 +37,7 @@ export function registerControlTools(pi: ExtensionAPI, store: ThreadStore, inbox
     description: "Resume this thread from On Hold back to Open.",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, ctx) {
-      if (!(await resumeThread(store, () => inbox.drainInbox(ctx), ctx))) {
+      if (!(await resumeThread(store, () => inbox.drain(ctx), ctx))) {
         return {
           content: [
             {

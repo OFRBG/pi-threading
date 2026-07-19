@@ -1,13 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { ThreadStore, Envelope, Urgency } from "./core/types";
+import type { ThreadStore, Mail, Urgency } from "./core/types";
 import type { ThreadingState } from "./context";
 import { DEFAULT_OBLIGATION_DEADLINE_MS, STALE_MS } from "./core/types";
-import { mintEnvelopeId } from "./core/ids";
+import { mintMailId } from "./core/ids";
 import { nowIso } from "./core/time";
-
-/** The messaging engine (PROTOCOL-FORMALISM.md §§6–9): envelope sends and
- *  their bookkeeping (obligations, owed replies), delivery of incoming
- *  envelopes with barrier resolution, and the heartbeat's deadline checks. */
 
 /** How long after an idle-time injection we assume pi's prompt preflight is
  *  still running (it ends at turn_start, which clears the hold early). */
@@ -42,47 +38,53 @@ export interface SendOptions {
   deadline?: string;
 }
 
+export type TargetSpec = "*" | `role:${string}` | (`${string}` & {});
+
 export interface Inbox {
-  sendEnvelope(to: string, body: string, opts?: SendOptions): Promise<SendResult>;
-  /** sendEnvelope over a resolved target list, collecting per-target results.
-   *  Each target gets its own minted id, so fan-out replies stay
-   *  individually correlatable. */
-  sendToMany(
+  /**
+   * Send a message to multiple targets. Returns the envelope id and whether
+   * it was delivered live or queued for each target.
+   */
+  sendMany(
     targets: string[],
     body: string,
     opts?: SendOptions,
   ): Promise<(SendResult & { to: string })[]>;
-  /** Expand a `to` spec — "*", "role:<role>", or comma-separated ids — into thread ids. */
-  resolveTargets(to: string): Promise<string[]>;
-  /** Which of these ids have never run in this workspace (likely typos). */
-  findMissingTargets(targets: string[]): Promise<string[]>;
-  /** Bookkeeping for one envelope (debts, barriers) — returns the
-   *  injection parts; the caller batches them into one inject(). */
-  deliver(msg: Envelope, ctx: ExtensionContext): Promise<Injection[]>;
-  /** Drain queued envelopes. Standalone (no `collect`) it injects its own
-   *  batch; when the heartbeat passes a shared `collect` array it pushes its
-   *  parts there instead, so both heartbeat sources ship in one inject(). */
-  drainInbox(ctx: ExtensionContext, collect?: Injection[]): Promise<void>;
-  isTargetLive(to: string): Promise<boolean>;
-  /** Called from the heartbeat: a one-time reminder per overdue obligation
-   *  or barrier. With `collect`, pushes parts into the shared batch. */
+
+  /**
+   * Resolve a target spec to one or more thread ids. `"*"` and `"role:<role>"`
+   * expand to all matching threads, comma-separated lists are split, and a
+   * plain thread id resolves to itself.
+   */
+  resolveTargets(to: TargetSpec): Promise<string[]>;
+
+  /** Check which of the given target threads do not exist. */
+  checkMissing(targets: string[]): Promise<string[]>;
+
+  /**
+   * Drain the inbox, injecting any messages that have arrived.
+   *
+   * If `collect` is provided, the messages are collected instead of injected.
+   */
+  drain(ctx: ExtensionContext, collect?: Injection[]): Promise<void>;
+
+  /**
+   * Check for any obligations or barriers that have passed their deadlines, and inject notices for them.
+   *
+   * If `collect` is provided, the notices are collected instead of injected.
+   */
   checkDeadlines(ctx: ExtensionContext, collect?: Injection[]): Promise<void>;
-  /** Push parts into this session as ONE user message (steer if any part is
-   *  urgency=high). */
+
+  /** Inject the given parts into the session. */
   inject(parts: Injection[], ctx: ExtensionContext): void;
-  /** False while an idle-time injection is in preflight or a compaction is
-   *  running — drains and nudges wait (messages stay durable on disk). This
-   *  is the §7.7 declare-and-shrink gate: we only claim envelopes when we
-   *  can deliver them in the same tick. */
-  canInject(): boolean;
-  noteCompactionStart(): void;
-  noteCompactionEnd(): void;
-  /** A turn started: pi is streaming, so injections queue safely again. */
-  noteRunStarted(): void;
+
+  markCompactionStart(): void;
+  markCompactionEnd(): void;
+  markRunStarted(): void;
 }
 
 export function createInbox(pi: ExtensionAPI, store: ThreadStore, state: ThreadingState): Inbox {
-  function canInject(): boolean {
+  function isSafeToInject(): boolean {
     const now = Date.now();
 
     if (state.compactingSince && now - state.compactingSince < COMPACTION_HOLD_MAX_MS) {
@@ -101,26 +103,25 @@ export function createInbox(pi: ExtensionAPI, store: ThreadStore, state: Threadi
       return;
     }
 
-    const steer = parts.some(p => p.urgency === "high");
-
     if (ctx.isIdle()) {
       state.inFlightSince = Date.now();
     }
 
-    pi.sendUserMessage(parts.map(p => p.text).join("\n\n"), {
-      deliverAs: steer ? "steer" : "followUp",
-    });
+    const text = parts.map(p => p.text).join("\n\n");
+    const deliverAs = parts.some(p => p.urgency === "high") ? "steer" : "followUp";
+
+    pi.sendUserMessage(text, { deliverAs });
   }
 
-  function noteCompactionStart(): void {
+  function markCompactionStart(): void {
     state.compactingSince = Date.now();
   }
 
-  function noteCompactionEnd(): void {
+  function markCompactionEnd(): void {
     state.compactingSince = null;
   }
 
-  function noteRunStarted(): void {
+  function markRunStarted(): void {
     state.inFlightSince = null;
     state.compactingSince = null;
   }
@@ -163,18 +164,14 @@ export function createInbox(pi: ExtensionAPI, store: ThreadStore, state: Threadi
       .filter(s => s && s !== store.threadId);
   }
 
-  async function sendEnvelope(
-    to: string,
-    body: string,
-    opts: SendOptions = {},
-  ): Promise<SendResult> {
-    if (!store.threadId || !store.threadsRootDir) {
-      // Without an identity the message would land at a cwd-relative path
-      // nothing ever drains (observed in the wild as <cwd>/<to>/inbox/).
+  async function send(to: string, body: string, opts: SendOptions = {}): Promise<SendResult> {
+    if (!store.threadId) {
       throw new Error("Thread system not initialized yet — cannot send.");
     }
-    const id = mintEnvelopeId(store.threadId);
-    const msg: Envelope = {
+
+    const id = mintMailId(store.threadId);
+
+    const msg: Mail = {
       id,
       from: store.threadId,
       to,
@@ -182,37 +179,27 @@ export function createInbox(pi: ExtensionAPI, store: ThreadStore, state: Threadi
       sentAt: nowIso(),
       ...(opts.re ? { re: opts.re } : {}),
       ...(opts.expects ? { expects: true as const } : {}),
-      // Absence means "low" on the wire (§6) — only high is written.
       ...(opts.urgency === "high" ? { urgency: "high" as const } : {}),
       ...(opts.deliverAfter ? { deliverAfter: opts.deliverAfter } : {}),
       ...(opts.expiresAt ? { expiresAt: opts.expiresAt } : {}),
     };
 
     const delivered = (await isTargetLive(to)) ? "live" : "queued";
-    await store.adapter.enqueueMessage(msg);
+    await store.adapter.sendMail(msg);
 
     if (opts.re) {
-      // Sending the reply settles the durable owed-reply record made when the
-      // expects envelope was delivered (see deliver()) — but ONLY when it
-      // actually reaches the thread the debt is owed to (§9.1, Errata 1). A
-      // misdirected or stale reply whose `re` merely collides with an
-      // unrelated owed entry must not discharge it: the owed record stays put
-      // so thread_status and the owed-reply nudge keep surfacing it.
-      // (thread_send layers a soft warning on top; this is the real gate.)
-      const owedMatch = store.owed.find(o => o.id === opts.re);
-      if (owedMatch && owedMatch.from === to) {
+      const owed = store.owed.find(o => o.id === opts.re);
+
+      if (owed && owed.from === to) {
         store.owed = store.owed.filter(o => o.id !== opts.re);
         await store.persist();
       }
     }
 
     if (opts.expects) {
-      // Every expects send SHOULD carry a deadline; when the caller omits
-      // one the client MUST apply the fallback (§9.2) — without it,
-      // checkDeadlines never fires and a silent counterparty means zero
-      // automatic recovery.
       const deadline =
         opts.deadline ?? new Date(Date.now() + DEFAULT_OBLIGATION_DEADLINE_MS).toISOString();
+
       store.obligations.push({
         id,
         to,
@@ -222,10 +209,11 @@ export function createInbox(pi: ExtensionAPI, store: ThreadStore, state: Threadi
       });
       await store.persist();
     }
+
     return { id, delivered };
   }
 
-  async function sendToMany(
+  async function sendMany(
     targets: string[],
     body: string,
     opts: SendOptions = {},
@@ -233,13 +221,13 @@ export function createInbox(pi: ExtensionAPI, store: ThreadStore, state: Threadi
     const sent: (SendResult & { to: string })[] = [];
 
     for (const to of targets) {
-      sent.push({ to, ...(await sendEnvelope(to, body, opts)) });
+      sent.push({ to, ...(await send(to, body, opts)) });
     }
 
     return sent;
   }
 
-  async function findMissingTargets(targets: string[]): Promise<string[]> {
+  async function checkMissing(targets: string[]): Promise<string[]> {
     const missing: string[] = [];
 
     for (const t of targets) {
@@ -285,7 +273,7 @@ export function createInbox(pi: ExtensionAPI, store: ThreadStore, state: Threadi
     return { notes, payloads };
   }
 
-  function renderEnvelope(m: Envelope): string {
+  function renderMail(m: Mail): string {
     const kind =
       m.expects && m.re ? "Reply+Request" : m.expects ? "Request" : m.re ? "Reply" : "Note";
 
@@ -301,7 +289,7 @@ export function createInbox(pi: ExtensionAPI, store: ThreadStore, state: Threadi
     return `${header}\n---${m.body}---${hint}`;
   }
 
-  async function deliver(msg: Envelope, _ctx: ExtensionContext): Promise<Injection[]> {
+  async function receive(msg: Mail, _ctx: ExtensionContext): Promise<Injection[]> {
     const parts: Injection[] = [];
     let barrierNotes: string[] = [];
 
@@ -337,7 +325,7 @@ export function createInbox(pi: ExtensionAPI, store: ThreadStore, state: Threadi
     }
 
     const extra = barrierNotes.length ? "\n\n" + barrierNotes.join("\n") : "";
-    parts.push({ text: renderEnvelope(msg) + extra, urgency: msg.urgency ?? "low" });
+    parts.push({ text: renderMail(msg) + extra, urgency: msg.urgency ?? "low" });
     await store.persist();
     return parts;
   }
@@ -345,31 +333,33 @@ export function createInbox(pi: ExtensionAPI, store: ThreadStore, state: Threadi
   function emit(parts: Injection[], ctx: ExtensionContext, collect?: Injection[]): void {
     if (collect) {
       collect.push(...parts);
-    } else inject(parts, ctx);
+    } else {
+      inject(parts, ctx);
+    }
   }
 
-  async function drainInbox(ctx: ExtensionContext, collect?: Injection[]): Promise<void> {
+  async function drain(ctx: ExtensionContext, collect?: Injection[]): Promise<void> {
     // On Hold means "don't wake me": messages stay queued until resume.
     if (store.state === "on-hold") {
       return;
     }
 
-    if (!canInject()) {
+    if (!isSafeToInject()) {
       return;
     }
 
-    const messages = await store.adapter.drainInbox(store.threadId);
+    const messages = await store.adapter.receiveMail(store.threadId);
     const parts: Injection[] = [];
 
     for (const msg of messages) {
-      parts.push(...(await deliver(msg, ctx)));
+      parts.push(...(await receive(msg, ctx)));
     }
 
     emit(parts, ctx, collect);
   }
 
   async function checkDeadlines(ctx: ExtensionContext, collect?: Injection[]): Promise<void> {
-    if (!canInject()) {
+    if (!isSafeToInject()) {
       return;
     }
 
@@ -410,18 +400,14 @@ export function createInbox(pi: ExtensionAPI, store: ThreadStore, state: Threadi
   }
 
   return {
-    sendEnvelope,
-    sendToMany,
+    sendMany,
     resolveTargets,
-    findMissingTargets,
-    deliver,
-    drainInbox,
-    isTargetLive,
+    checkMissing,
+    drain,
     checkDeadlines,
     inject,
-    canInject,
-    noteCompactionStart,
-    noteCompactionEnd,
-    noteRunStarted,
+    markCompactionStart,
+    markCompactionEnd,
+    markRunStarted,
   };
 }

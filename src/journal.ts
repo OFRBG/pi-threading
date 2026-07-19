@@ -31,7 +31,7 @@ export function splitJournalEntries(content: string): string[] {
  *  restated every idle turn even when nothing happened, so they're excluded
  *  from the comparison — otherwise a re-forked entry with fresh phrasing of
  *  the same wait would never match and noise would keep accumulating. */
-export function journalFingerprint(entry: string): string {
+function journalFingerprint(entry: string): string {
   return entry
     .split("\n")
     .filter(l => /^(Working on|Done):/i.test(l.trim()))
@@ -43,7 +43,7 @@ export function journalFingerprint(entry: string): string {
 
 /** Pure comparison against the last entry in an existing journal's content
  *  (or `undefined` when no journal exists yet). */
-export function isDuplicateOfLastEntry(journalContent: string | undefined, entry: string): boolean {
+function isDuplicateOfLastEntry(journalContent: string | undefined, entry: string): boolean {
   const content = journalContent?.trim();
   if (!content) return false;
   const entries = splitJournalEntries(content);
@@ -119,7 +119,7 @@ export function shouldJournal(
  *  resolve to `node.exe <entry.js>` by the time this code runs) re-invoke
  *  `execPath entryScript`, standalone pi binaries re-invoke `execPath`
  *  directly. */
-export function piSelfCommand(
+function piSelfCommand(
   args: string[],
   execPath: string = process.execPath,
   entryScript: string | undefined = process.argv[1],
@@ -147,7 +147,7 @@ export function piSelfCommand(
  *  construction. A hardcoded cheap model looks free until the extension runs
  *  on a machine whose provider can't serve it — then every fork dies before
  *  printing and the journal silently never exists. */
-export function journalForkArgs(sessionFile: string, sessionDir: string, model?: string): string[] {
+function journalForkArgs(sessionFile: string, sessionDir: string, model?: string): string[] {
   return [
     "--fork",
     sessionFile,
@@ -166,9 +166,6 @@ export function journalForkArgs(sessionFile: string, sessionDir: string, model?:
  *  Fire-and-forget: runs in the background after turn_end/agent_end, the
  *  main thread never pauses on it. */
 export function forkJournalEntry(store: ThreadStore, sessionFile: string, model?: string): void {
-  // The journal channel is an optional backend extension (PROTOCOL-FORMALISM
-  // §5) — on a backend without it there is nowhere to append, so don't pay
-  // for the forked model call either.
   if (!store.adapter.appendJournal) return;
   const tmpSes = fs.mkdtempSync(path.join(os.tmpdir(), "pi-journal-"));
   let out = "";

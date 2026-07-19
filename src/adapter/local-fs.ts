@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { StateFile, Envelope, ThreadSummary } from "../core/types";
+import type { StateFile, Mail, ThreadSummary } from "../core/types";
 import { PROCESSED_TTL_MS, toSummary } from "../core/types";
 import { ulid } from "../core/ids";
 import type { StorageAdapter, JournalAdapter, PiFlagParam, AdapterOptions } from "./types";
@@ -24,7 +24,7 @@ function pruneProcessed(dir: string) {
   }
 }
 
-function envelopeFileName(id: string): string {
+function mailFileName(id: string): string {
   const tail = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
   const safe = tail.replace(/[^A-Za-z0-9._-]/g, "_");
   return `${safe || ulid()}.json`;
@@ -122,21 +122,21 @@ export function createAdapter({"base-dir": baseDir}: AdapterOptions<typeof optio
       return fs.existsSync(statePath(threadId));
     },
 
-    async enqueueMessage(message: Envelope) {
-      const dir = inboxDir(message.to);
-      const staging = stagingDir(message.to);
+    async sendMail(mail: Mail) {
+      const dir = inboxDir(mail.to);
+      const staging = stagingDir(mail.to);
       fs.mkdirSync(dir, { recursive: true });
       fs.mkdirSync(staging, { recursive: true });
       // Filename = the id's ULID tail: unique per sender by construction,
       // and a retry with the same id overwrites its own file — enqueue
       // idempotence (§7.6) for free.
-      const fname = envelopeFileName(message.id);
+      const fname = mailFileName(mail.id);
       const tmp = path.join(staging, fname);
-      fs.writeFileSync(tmp, JSON.stringify(message, null, 2));
+      fs.writeFileSync(tmp, JSON.stringify(mail, null, 2));
       fs.renameSync(tmp, path.join(dir, fname));
     },
 
-    async drainInbox(threadId: string): Promise<Envelope[]> {
+    async receiveMail(threadId: string): Promise<Mail[]> {
       const dir = inboxDir(threadId);
       const processedDir = path.join(dir, "processed");
       let files: string[];
@@ -158,10 +158,10 @@ export function createAdapter({"base-dir": baseDir}: AdapterOptions<typeof optio
         pruneProcessed(processedDir);
       }
       const now = Date.now();
-      const claimed: Envelope[] = [];
+      const claimed: Mail[] = [];
       for (const f of files) {
         const full = path.join(dir, f);
-        let msg: Envelope;
+        let msg: Mail;
         try {
           msg = JSON.parse(fs.readFileSync(full, "utf8"));
         } catch {
@@ -192,7 +192,7 @@ export function createAdapter({"base-dir": baseDir}: AdapterOptions<typeof optio
       return claimed;
     },
 
-    watchInbox(threadId: string, cb: () => void): () => void {
+    watchMail(threadId: string, cb: () => void): () => void {
       try {
         // A thread that has never received a message has no inbox/ dir yet —
         // fs.watch throws ENOENT on a path that doesn't exist, so create it

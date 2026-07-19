@@ -50,5 +50,5 @@ export const turnEnd: ThreadingHookHandler<TurnEndEvent> = async (
 
   // The turn boundary is the documented "Open" moment — pick up anything
   // the watcher couldn't deliver while the injection gate was closed.
-  await inbox.drainInbox(ctx);
+  await inbox.drain(ctx);
 };

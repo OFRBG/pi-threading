@@ -6,7 +6,7 @@ export const turnStart: ThreadingHookHandler<TurnStartEvent> = async (
   _,
   ctx,
 ) => {
-  inbox.noteRunStarted();
+  inbox.markRunStarted();
   const wasOnHold = store.state === "on-hold";
   state.toolUsedThisTurn = false;
   await store.transition("thinking", ctx);
@@ -14,6 +14,6 @@ export const turnStart: ThreadingHookHandler<TurnStartEvent> = async (
     // A prompt landing on a suspended thread is an implicit resume.
     store.holdReason = null;
     await store.persist();
-    await inbox.drainInbox(ctx);
+    await inbox.drain(ctx);
   }
 };

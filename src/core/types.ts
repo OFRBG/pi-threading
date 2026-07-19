@@ -1,24 +1,11 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ThreadAdapter } from "../adapter/types";
 
-/** The domain model per PROTOCOL-FORMALISM.md Rev 8: the wire envelope
- *  (Layer 1), the durable Layer-2 records (obligations, owed replies,
- *  barriers) and the two shared views of a thread — its own StateFile
- *  (presence source) and the ThreadSummary others see. */
-
 export type ThreadState = "idle" | "thinking" | "working" | "open" | "on-hold" | "stopped" | "done";
 
-/** Wire urgency level (§6). Deliberately abstract: this client maps `high`
- *  to a steering injection and `low` (the default when absent) to delivery
- *  at idle; other implementations may map levels differently. Receivers
- *  treat unknown levels as `low` (§6, must-ignore discipline). */
 export type Urgency = "high" | "low";
 
-/** The one wire record (PROTOCOL-FORMALISM.md §6). Self-contained: `to` is
- *  consumed at enqueue to place the envelope; receivers never branch on it
- *  (position is authoritative). Kind is structural — `expects` and `re`
- *  presence — never a tag. */
-export interface Envelope {
+export interface Mail {
   /** Own identity — always minted, never echoed. Form: `<from>/<ulid>`. */
   id: string;
   from: string;
@@ -45,14 +32,6 @@ export const HEARTBEAT_MS = 20_000;
 export const STALE_MS = 60_000;
 export const PROCESSED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** Fallback obligation deadline for any `expects` send when the caller
- *  passes no explicit deadlineSeconds (PROTOCOL-FORMALISM.md §9.2). Without
- *  it, checkDeadlines skips the obligation forever (it only fires on
- *  obligations with a set deadline), so a forgotten deadline leaves the
- *  sender with zero automatic recovery. 15 minutes is a deliberately
- *  generous agent-to-agent reply SLA — long enough not to nag a partner
- *  doing real work, short enough that a stuck obligation gets one nudge
- *  before a human has to notice it. */
 export const DEFAULT_OBLIGATION_DEADLINE_MS = 15 * 60_000;
 
 /** Sender-side debt record: an `expects` envelope this thread sent, keyed
@@ -174,15 +153,13 @@ export interface ThreadStore extends ThreadData {
   forkJournal: (sessionFile: string) => void;
   startHeartbeat: (onTick?: () => void | Promise<void>) => void;
   stopHeartbeat: () => void;
-  startWatcher: (drainInbox: (ctx: ExtensionContext) => void, ctx: ExtensionContext) => void;
+  startWatcher: (drain: (ctx: ExtensionContext) => void, ctx: ExtensionContext) => void;
   stopWatcher: () => void;
 }
 
 /** Mutable data that multiple modules read and write. */
 export interface ThreadData {
   threadId: string;
-  threadDir: string;
-  threadsRootDir: string;
   parent: string | null;
   role: string | null;
   sessionFile: string | null;
