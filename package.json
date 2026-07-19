@@ -13,15 +13,19 @@
     "url": "git+https://github.com/OFRBG/pi-threading.git"
   },
   "files": [
+    "index.ts",
     "src",
     "bin",
     "examples",
     "THREAD-MODEL.md"
   ],
   "type": "module",
+  "bin": {
+    "pi-threading": "./bin/thread-cli.mjs"
+  },
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./index.ts"
     ]
   },
   "peerDependencies": {
@@ -33,7 +37,7 @@
     "test:unit": "node --import tsx --test test/unit.test.ts",
     "test:e2e": "node --import tsx --test test/e2e.test.ts",
     "live": "bash live.sh",
-    "lint": "eslint src test",
+    "lint": "eslint src test index.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },

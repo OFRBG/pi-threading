@@ -70,23 +70,23 @@ I recommend using tmux to manage teams.
 
 ## Human monitoring & steering
 
-`bin/thread-cli.mjs` lets a human act on the thread system without running pi. Anyone can interact with the message system.
+`bin/thread-cli.mjs` lets a human act on the thread system without running pi. Anyone can interact with the message system — via `npx pi-threading` (no install needed) or `node bin/thread-cli.mjs` from inside this repo.
 
 ```bash
-node bin/thread-cli.mjs list                      # table of all threads incl. coordination counts
-node bin/thread-cli.mjs status link               # one thread's full coordination state:
-                                                  #   obligations, owed replies, barriers,
-                                                  #   pending inbox, last journal entry
-node bin/thread-cli.mjs status link --json        # same, as machine-readable JSON
-node bin/thread-cli.mjs watch                     # live coordination board
-node bin/thread-cli.mjs tail link                 # follow one thread's state/journal/messages
-                                                  #   (incl. +/- diffs of obligations/barriers)
-node bin/thread-cli.mjs inbox link                # pending + recent messages
-node bin/thread-cli.mjs send link "status?" --expects       # ask, tracked — thread owes you a reply
-node bin/thread-cli.mjs send link "looks good" --re link/01ABC…  # reply, settles the debt
-node bin/thread-cli.mjs send '*' "standup in 5"             # broadcast note
-node bin/thread-cli.mjs delete link                         # remove a thread (refuses if it looks live)
-node bin/thread-cli.mjs delete --stale --yes                # prune every stopped/stale thread
+npx pi-threading list                      # table of all threads incl. coordination counts
+npx pi-threading status link               # one thread's full coordination state:
+                                           #   obligations, owed replies, barriers,
+                                           #   pending inbox, last journal entry
+npx pi-threading status link --json        # same, as machine-readable JSON
+npx pi-threading watch                     # live coordination board
+npx pi-threading tail link                 # follow one thread's state/journal/messages
+                                           #   (incl. +/- diffs of obligations/barriers)
+npx pi-threading inbox link                # pending + recent messages
+npx pi-threading send link "status?" --expects       # ask, tracked — thread owes you a reply
+npx pi-threading send link "looks good" --re link/01ABC…  # reply, settles the debt
+npx pi-threading send '*' "standup in 5"             # broadcast note
+npx pi-threading delete link                         # remove a thread (refuses if it looks live)
+npx pi-threading delete --stale --yes                # prune every stopped/stale thread
 ```
 
 ## State machine
