@@ -53,11 +53,11 @@ I recommend using tmux to manage teams.
 
 | Command                    | Purpose                                    |
 | -------------------------- | ------------------------------------------ |
-| `/thread-status`           | Show state and latest journal entry        |
-| `/thread-list`             | List all known threads                     |
-| `/thread-send <to> <body>` | Send a high-urgency note to another thread |
-| `/thread-suspend`          | Mark On Hold                               |
-| `/thread-resume`           | Resume from On Hold                        |
+| `thread-status`           | Show state and latest journal entry        |
+| `thread-list`             | List all known threads                     |
+| `thread-send <to> <body>` | Send a high-urgency note to another thread |
+| `thread-suspend`          | Mark On Hold                               |
+| `thread-resume`           | Resume from On Hold                        |
 
 ## Flags
 
@@ -67,7 +67,6 @@ I recommend using tmux to manage teams.
 - `--thread-journal <turn|done|off>` — journal cadence (default `turn`; each entry is one forked model call, rate-limited to one entry per ~2 minutes of same-task tool turns, plus a wrap-up entry when a run ends with unjournaled work; structural changes — new obligations, barriers — always journal immediately)
 - `--thread-journal-model <model>` — model for the journal fork (e.g. `deepseek/deepseek-chat` to keep entries cheap). Default: the thread's own model. A pinned model must resolve on the machine the thread runs on, or journaling fails (loudly, on stderr)
 - `--thread-storage <local|restate>` — storage backend (default `local`, the filesystem; see [Running with the Restate adapter](#running-with-the-restate-adapter))
-- `--thread-storage-url <url>` — backend connection URL (e.g. a Restate ingress URL); ignored by the local backend
 
 ## Human monitoring & steering
 

@@ -1,12 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import * as crypto from "node:crypto";
-import * as path from "node:path";
 import type { ThreadStore, ThreadState, ThreadSummary, StateFile } from "./core/types";
 import { HEARTBEAT_MS, CLIENT_CAPABILITIES } from "./core/types";
 import { nowIso } from "./core/time";
 import { forkJournalEntry } from "./journal";
 import type { ThreadAdapter } from "./adapter/types";
-import { createLocalFsAdapter } from "./adapter/local-fs";
+import type { ThreadingState } from "./context";
 
 /** The ThreadStore: this thread's identity and mutable coordination state,
  *  restored from the storage adapter at init, persisted on every change, kept
@@ -22,9 +20,10 @@ const KNOWN_STATES: readonly ThreadState[] = [
   "done",
 ];
 
-export function createThreadStore(
+export function createStore(
   pi: ExtensionAPI,
-  adapter: ThreadAdapter = createLocalFsAdapter(),
+  adapter: ThreadAdapter,
+  _: ThreadingState,
 ): ThreadStore {
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   let stopWatching: (() => void) | null = null;
@@ -33,8 +32,6 @@ export function createThreadStore(
     // --- mutable data ---
     adapter,
     threadId: "",
-    threadDir: "",
-    threadsRootDir: "",
     parent: null,
     role: null,
     sessionFile: null,
@@ -86,37 +83,23 @@ export function createThreadStore(
       await store.adapter.saveState(store.threadId, payload);
     },
 
-    async init(cwd: string, ctx: ExtensionContext) {
-      await store.adapter.configure(cwd);
-      store.threadsRootDir = path.join(cwd, ".thread", "threads");
+    async init(ctx: ExtensionContext) {
+      await store.adapter.configure();
 
-      // Resolve thread identity.
+      // Identity is flag-only, every launch (§2.3 — no auto-generated ids):
+      // lifecycle.ts's opt-in gate already requires --thread-id before this
+      // runs, so a missing flag here means the gate and init() have gone
+      // out of sync, not a normal runtime path.
       const flagId = pi.getFlag("thread-id");
-      if (typeof flagId === "string" && flagId) {
-        store.threadId = flagId;
-      } else {
-        let existingId: string | undefined;
-        try {
-          const entries = ctx.sessionManager.getEntries();
-          for (const e of entries) {
-            if (e.type === "custom" && e.customType === "thread-identity") {
-              const entry = e as { data?: { id?: string } };
-              if (entry.data?.id) existingId = entry.data.id;
-            }
-          }
-        } catch {
-          // --no-session or unreadable session — generate a new id.
-        }
-        store.threadId = existingId ?? `thread-${crypto.randomUUID().slice(0, 8)}`;
-        if (!existingId) pi.appendEntry("thread-identity", { id: store.threadId });
+      if (typeof flagId !== "string" || !flagId) {
+        throw new Error("pi-threading requires --thread-id (no auto-generated ids)");
       }
+      store.threadId = flagId;
 
       const flagParent = pi.getFlag("thread-parent");
       store.parent = typeof flagParent === "string" && flagParent ? flagParent : null;
       const flagRole = pi.getFlag("thread-role");
       store.role = typeof flagRole === "string" && flagRole ? flagRole : null;
-
-      store.threadDir = path.join(store.threadsRootDir, store.threadId);
 
       // Restore previous state if present. Debts and barriers are durable
       // waits — restored unconditionally (§13.2): a reply may arrive while
@@ -201,9 +184,9 @@ export function createThreadStore(
       heartbeat = null;
     },
 
-    startWatcher(drainInbox, ctx) {
+    startWatcher(drain, ctx) {
       stopWatching?.();
-      stopWatching = store.adapter.watchInbox(store.threadId, () => drainInbox(ctx));
+      stopWatching = store.adapter.watchMail(store.threadId, () => drain(ctx));
     },
 
     stopWatcher() {

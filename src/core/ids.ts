@@ -46,6 +46,6 @@ export function ulid(now = Date.now()): string {
 /** The RECOMMENDED envelope-id form (§6.2): `<from>/<ulid>` — globally
  *  unique by construction (sender scope + monotonic ULID), time-sortable,
  *  self-describing about origin. Opaque to receivers. */
-export function mintEnvelopeId(from: string): string {
+export function mintMailId(from: string): string {
   return `${from}/${ulid()}`;
 }

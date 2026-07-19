@@ -18,8 +18,8 @@ src/
   journal.ts          journal fork prompt, cadence policy, spawn plumbing
   commands.ts         human-facing /thread-* slash commands
   core/
-    types.ts          Envelope, Obligation, OwedReply, Barrier, StateFile, ThreadStore
-    ids.ts             mintId (barriers), ulid, mintEnvelopeId
+    types.ts          Mail, Obligation, OwedReply, Barrier, StateFile, ThreadStore
+    ids.ts             mintId (barriers), ulid, mintMailId
     format.ts          shared text rendering for thread_status/thread_list/commands
     thread-ops.ts       suspend/resume, shared by tools and slash commands
     system-prompt.ts    the injected "Thread Communication Model" system-prompt block
@@ -32,29 +32,18 @@ src/
   adapter/
     types.ts            StorageAdapter / JournalAdapter / ThreadAdapter interfaces
     local-fs.ts           the Appendix B binding (files under .thread/threads/)
-    registry.ts            --thread-storage <local|restate> factory registry
-  restate/
-    service.ts             Thread + ThreadRegistry virtual objects (the hosted side)
-    adapter.ts               RestateAdapter — the pi-process-side RPC client
-    wake-launch.ts             pure helper: how a stopped thread gets revived
+    registry.ts            --thread-storage factory registry (local is the only built-in)
 bin/
   thread-cli.mjs        zero-dependency CLI: human as a full protocol citizen
-  postbox-mcp.mjs        zero-dependency MCP stdio server: any MCP client as a citizen
-  postbox-hook.mjs        zero-dependency Claude Code hook: push delivery over 4 events
-integrations/
-  claude/README.md      Claude Code plugin wiring (MCP server + hooks)
-  codex/AGENTS-snippet.md  prompt snippet for Codex CLI (MCP-only, no hooks)
 test/
   unit.test.ts           extension + local-fs adapter + CLI interop (no model calls)
-  mcp.test.ts             postbox-mcp.mjs JSON-RPC surface (no model calls)
   e2e.test.ts              real pi processes, real (cheap) model calls
-  e2e-restate.test.ts       same, against a real restate-server via testcontainers
 .github/workflows/
-  ci.yml                 typecheck + lint + unit + mcp, on push/PR (free)
+  ci.yml                 typecheck + lint + unit, on push/PR (free)
   release.yml             on v* tags: same free checks, then publish (paid CI minutes only)
 ```
 
-**Why `bin/*.mjs` duplicate ledger logic instead of importing `src/`:** they are deliberately zero-dependency, single-file Node scripts — no `npm install`, no TypeScript build step, so they can be dropped into any machine or `claude`/`codex` config and just run. That means they cannot `import` from `src/` (which pulls in `@earendil-works/pi-coding-agent`, `typebox`, TS build tooling). Each script — `thread-cli.mjs`, `postbox-mcp.mjs`, `postbox-hook.mjs` — reimplements the pieces of the Appendix B binding and the §9 ledger discharge rule it needs, directly against `fs`, with a comment pointing back at the `src/` file it mirrors. This is a conscious duplication tradeoff, not an oversight — see the Known Limitations entry on `thread-cli.mjs` for the corollary (it only ever sees the `local` backend).
+**Why `bin/thread-cli.mjs` duplicates ledger logic instead of importing `src/`:** it is a deliberately zero-dependency, single-file Node script — no `npm install`, no TypeScript build step, so it can be dropped onto any machine and just run. That means it cannot `import` from `src/` (which pulls in `@earendil-works/pi-coding-agent`, `typebox`, TS build tooling); it reimplements the pieces of the Appendix B binding and the §9 ledger discharge rule it needs, directly against `fs`, with comments pointing back at the `src/` files it mirrors. This is a conscious duplication tradeoff, not an oversight — see the Known Limitations entry on `thread-cli.mjs` for the corollary (it only ever sees the `local` backend).
 
 ---
 
@@ -118,11 +107,11 @@ No hard interrupt mid-Thinking or mid-Working. Messages queue for the next Open.
 
 `src/state.ts`'s `createThreadStore()` is the single mutable object every other module reads and writes (`ThreadStore extends ThreadData`, `src/core/types.ts`): identity (`threadId`, `parent`, `role`), the current `state`, the three durable ledgers (`obligations`, `owed`, `barriers`), plus in-memory-only bookkeeping for the nudge and journal-cadence gates (`owedNudgePending`, `owedSilentStreak`, `lastJournalSignature`, `lastJournalAt`, `journalDebt`). It owns the heartbeat (`setInterval`, `HEARTBEAT_MS = 20_000`) and the inbox watcher subscription, and every mutation goes through `persist()`, which serializes a `StateFile` through `store.adapter.saveState`.
 
-All actual I/O is delegated to a `StorageAdapter` (`src/adapter/types.ts`) — a **domain-shaped** interface (`loadState`/`saveState`/`listThreads`/`threadExists`/`enqueueMessage`/`drainInbox`/`watchInbox`), not a generic filesystem shim. That's deliberate: it has to map cleanly onto both a local directory tree and a backend whose durable state is RPC-addressed per-key (Restate), and there's no timer/wake member on the interface at all — a delayed delivery is just an envelope carrying `deliverAfter`, held by whichever backend stores it until due. An optional `JournalAdapter` extension (`appendJournal`/`readJournal`) is layered on top (`ThreadAdapter = StorageAdapter & Partial<JournalAdapter>`); backends that skip it simply have no journal channel and callers degrade gracefully (`readJournal` returns `undefined`, `forkJournalEntry` no-ops).
+All actual I/O is delegated to a `StorageAdapter` (`src/adapter/types.ts`) — a **domain-shaped** interface (`loadState`/`saveState`/`listThreads`/`threadExists`/`sendMail`/`receiveMail`/`watchMail`), not a generic filesystem shim. That's deliberate: it has to map cleanly onto both a local directory tree and any future remote backend whose durable state is addressed per-key, and there's no timer/wake member on the interface at all — a delayed delivery is just an envelope carrying `deliverAfter`, held by whichever backend stores it until due. An optional `JournalAdapter` extension (`appendJournal`/`readJournal`) is layered on top (`ThreadAdapter = StorageAdapter & Partial<JournalAdapter>`); backends that skip it simply have no journal channel and callers degrade gracefully (`readJournal` returns `undefined`, `forkJournalEntry` no-ops).
 
-`--thread-storage <local|restate>` (default `local`) selects the backend via a two-entry factory registry (`src/adapter/registry.ts`); adding a backend means writing one factory function and adding one line there — nothing else in `src/` changes.
+`--thread-storage` (default `local`, currently the only built-in) selects the backend via a factory registry (`src/adapter/registry.ts`); adding a backend means writing one factory function and adding one line there — nothing else in `src/` changes.
 
-### Binding 1: local-fs (`src/adapter/local-fs.ts`, Appendix B)
+### The local-fs binding (`src/adapter/local-fs.ts`, Appendix B)
 
 ```
 .thread/threads/<id>/
@@ -133,34 +122,23 @@ All actual I/O is delegated to a `StorageAdapter` (`src/adapter/types.ts`) — a
   inbox.tmp/               enqueue staging (same filesystem as inbox/)
 ```
 
-Each thread only ever writes its own `state.json`; other threads only ever *create* files in its `inbox/` — so no cross-process file locking is needed anywhere. Envelope filenames are the id's ULID tail (`mintEnvelopeId` → `<from>/<ulid>`, `src/core/ids.ts`), so a sorted `readdir` **is** FIFO order, and a retried send with the same id overwrites its own file — enqueue idempotence for free.
+Each thread only ever writes its own `state.json`; other threads only ever *create* files in its `inbox/` — so no cross-process file locking is needed anywhere. Mail filenames are the id's ULID tail (`mintMailId` → `<from>/<ulid>`, `src/core/ids.ts`), so a sorted `readdir` **is** FIFO order, and a retried send with the same id overwrites its own file — enqueue idempotence for free.
 
-`enqueueMessage` writes into `inbox.tmp/`, then `fs.renameSync`s into `inbox/` — atomic on the same filesystem, so a reader never observes a partial envelope. `drainInbox` does a sorted `readdir`, skips anything whose `deliverAfter` is still in the future, and — **before** returning each envelope as claimed — renames it into `inbox/processed/`; if the caller throws after that, the message is already moved and won't be redelivered (favors "never deliver twice" over "never lose one", per the spec's §7.7 drain gate).
+`sendMail` writes into `inbox.tmp/`, then `fs.renameSync`s into `inbox/` — atomic on the same filesystem, so a reader never observes a partial envelope. `receiveMail` does a sorted `readdir`, skips anything whose `deliverAfter` is still in the future, and — **before** returning each envelope as claimed — renames it into `inbox/processed/`; if the caller throws after that, the message is already moved and won't be redelivered (favors "never deliver twice" over "never lose one", per the spec's §7.7 drain gate).
 
 **processed/ GC (v0.3.2):** `pruneProcessed()` deletes files older than `PROCESSED_TTL_MS` (7 days, `src/core/types.ts`), but only runs **at most once per `PRUNE_INTERVAL_MS` (1 hour) per thread** — a `Map<threadId, lastPrunedAt>` inside the adapter closure gates it. This replaced an earlier once-per-process one-shot GC: a one-shot would let a long-lived process's `processed/` directory outgrow the 7-day retention window forever once the single GC pass had already happened.
 
-`watchInbox` creates the thread's `inbox/` directory eagerly (an `fs.watch` on a not-yet-existing path throws `ENOENT`, which would otherwise leave a never-messaged thread with a silently no-op watch until its next restart), then wraps `fs.watch`.
-
-### Binding 2: Restate (`src/restate/`)
-
-Two pieces on the server side (`service.ts`), served separately via `npm run restate:serve` against a self-hosted `restate-server`:
-
-- **`ThreadRegistry`** — a single durable object holding the list of known thread ids. Restate's per-key state has no "list all keys of this object type" API, so a thread has to register itself here for `listThreads()`/`resolveTargets("*"|"role:x")` to work at all — the local-fs backend gets this for free from a directory listing.
-- **`ThreadObject`** — one durable instance per thread id, holding `state`, `journal`, and `inbox` as per-key Restate state. `saveState` registers the thread (once, gated by a `registered` flag) the first time it's called, and does so with an `await` — a fire-and-forget registration would race `listThreads()` right after a fresh thread's first save. `enqueueMessage` on a `deliverAfter` envelope arms a **durable delayed self-invocation** (`ctx.objectSendClient(...).deliverDue(...)` with `restate.rpc.sendOpts({ delay })`) — this is the one thing the local-fs backend structurally cannot do: revive a *stopped* process. `deliverDue` fires when that delay elapses; if the thread is still live (fresh `lastSeen`), its own heartbeat drain already covers the envelope and `deliverDue` no-ops; if the thread looks stopped, it `spawn()`s `pi` back up via `buildWakeLaunch()` (`wake-launch.ts`), `detached`+`unref`'d, with `stdio: "ignore"` (load-bearing: `pi --print` reads stdin to EOF and hangs on an open pipe otherwise).
-
-`src/restate/adapter.ts` (`createRestateAdapter`) is the client side that actually runs inside the `pi` process — a Restate **ingress client**, not a hosted handler. Every `StorageAdapter` method becomes an RPC into `Thread`/`ThreadRegistry` via `@restatedev/restate-sdk-clients`. `watchInbox` has no push-based cross-network watch, so it polls every `POLL_MS = 2000` instead of getting an instant `fs.watch` notification — worse live-delivery latency, but the guarantee that actually matters (cold-start drain at `session_start`) is unaffected either way.
-
-`buildWakeLaunch()` (`wake-launch.ts`) is kept SDK-free and pure (no Restate imports) specifically so it's unit-testable without a running `restate-server`. The revived `pi` process needs `--thread-storage restate` and the same ingress URL the service's own clients used — sourced from the *service's* environment (`RESTATE_INGRESS_URL`, `PI_THREAD_EXTENSION`, `PI_BIN`) since the service has no other way to know it.
+`watchMail` creates the thread's `inbox/` directory eagerly (an `fs.watch` on a not-yet-existing path throws `ENOENT`, which would otherwise leave a never-messaged thread with a silently no-op watch until its next restart), then wraps `fs.watch`.
 
 ---
 
 ## Message lifecycle, end to end
 
-1. **Mint.** `inbox.ts`'s `sendEnvelope(to, body, opts)` mints an id via `mintEnvelopeId(store.threadId)` (`<from>/<ulid>`) and builds the `Envelope` — `re`/`expects`/`urgency`/`deliverAfter` included only when set (absence is meaningful on the wire: unset urgency reads as `"low"`).
-2. **Enqueue.** `store.adapter.enqueueMessage(msg)` — on local-fs, write-to-staging (`inbox.tmp/`) then `renameSync` into the target's `inbox/` (atomic). `sendEnvelope` also checks `isTargetLive(to)` first (fresh `lastSeen` + `status: "running"`) purely to report `"live"` vs `"queued"` back to the caller — delivery itself doesn't depend on liveness; a queued message sits durably until drained.
+1. **Mint.** `inbox.ts`'s `send(to, body, opts)` mints an id via `mintMailId(store.threadId)` (`<from>/<ulid>`) and builds the `Mail` — `re`/`expects`/`urgency`/`deliverAfter` included only when set (absence is meaningful on the wire: unset urgency reads as `"low"`).
+2. **Enqueue.** `store.adapter.sendMail(msg)` — on local-fs, write-to-staging (`inbox.tmp/`) then `renameSync` into the target's `inbox/` (atomic). `Inbox.sendMany` also checks `isTargetLive(to)` first (fresh `lastSeen` + `status: "running"`) purely to report `"live"` vs `"queued"` back to the caller — delivery itself doesn't depend on liveness; a queued message sits durably until drained.
 3. **Bookkeeping at send time.** If `opts.re` is set, `sendEnvelope` looks for a matching entry in `store.owed` and only clears it **if `owedMatch.from === to`** (Errata 1 gate on this ledger — see "Dual ledgers" below). If `opts.expects` is set, a new `Obligation` is pushed with a deadline (explicit or the 15-minute default) and persisted.
-4. **Drain claim.** The receiving process's `store.adapter.drainInbox(threadId)` runs — triggered by (a) `session_start`'s deferred initial drain, (b) the `fs.watch`/poll-driven live watcher, (c) `turn_end`, (d) the 20s heartbeat, (e) `session_compact`. On local-fs this is a sorted `readdir` → filter due → rename-to-`processed/` → return; the rename-before-delivery ordering is what makes "claimed but crashed before injection" the protocol's one declared loss window (spec §7.7, Erratum 5).
-5. **Deliver.** `inbox.ts`'s `deliver(msg, ctx)` runs the receive-side ledger updates (below) and renders the envelope into an `Injection` (`renderEnvelope` → `[<kind> from <sender> #<id>]` + body + an explicit reply hint when `expects` is set).
+4. **Drain claim.** The receiving process's `store.adapter.receiveMail(threadId)` runs — triggered by (a) `session_start`'s deferred initial drain, (b) the `fs.watch`/poll-driven live watcher, (c) `turn_end`, (d) the 20s heartbeat, (e) `session_compact`. On local-fs this is a sorted `readdir` → filter due → rename-to-`processed/` → return; the rename-before-delivery ordering is what makes "claimed but crashed before injection" the protocol's one declared loss window (spec §7.7, Erratum 5).
+5. **Receive.** `inbox.ts`'s `receive(msg, ctx)` runs the receive-side ledger updates (below) and renders the envelope into an `Injection` (`renderMail` → `[<kind> from <sender> #<id>]` + body + an explicit reply hint when `expects` is set).
 6. **Injection.** `drainInbox` batches every delivered envelope's `Injection` parts and hands them to `inject()`, which is gated by `canInject()` (the §7.7 declare-and-shrink gate — see below) and, when clear, calls `pi.sendUserMessage` exactly once for the whole batch.
 
 ## Dual ledgers and both discharge gates (Erratum 6, v0.3.1/v0.3.2)
@@ -170,19 +148,14 @@ Two separate ledgers, both durable in `StateFile`:
 - **`obligations`** (sender side): "I sent an `expects` envelope to X and am waiting on a reply." Recorded in `sendEnvelope` when `opts.expects` is set; cleared when a reply with matching `re` is *delivered* to this thread.
 - **`owed`** (receiver side): "Someone sent me an `expects` envelope and I owe them a reply." Recorded in `deliver()` when an inbound envelope has `expects` set; cleared when this thread *sends* a reply whose `re` matches.
 
-Both discharge paths are gated on sender identity — **only a reply from the thread the debt was actually recorded against may clear it.** A `re` that merely numerically collides with someone else's obligation/owed entry (typo, stale copy-paste, malicious neighbor) leaves the ledger untouched and renders as a plain, undischarging message instead. This gate now exists in **three independent implementations**, one per receive-path (a v0.3.1/v0.3.2 fix — Erratum 6):
+Both discharge paths are gated on sender identity — **only a reply from the thread the debt was actually recorded against may clear it.** A `re` that merely numerically collides with someone else's obligation/owed entry (typo, stale copy-paste, malicious neighbor) leaves the ledger untouched and renders as a plain, undischarging message instead (a v0.3.1/v0.3.2 fix — Erratum 6):
 
 | Implementation | Ledger | Gate |
 | --- | --- | --- |
 | `src/inbox.ts` `deliver()` | `obligations` (sender side, on receiving a reply) | `!obMatch \|\| obMatch.to === msg.from` before filtering `obligations` and resolving barriers |
 | `src/inbox.ts` `sendEnvelope()` | `owed` (receiver side, on sending a reply) | `owedMatch && owedMatch.from === to` before filtering `owed` |
-| `bin/postbox-mcp.mjs` `drainAndRender()` | `obligations` | `obMatch && obMatch.to === msg.from` before splicing `obligations` |
-| `bin/postbox-mcp.mjs` `toolThreadSend()` | `owed` | `state.owed.findIndex(o => o.id === re && o.from === targetId)` |
-| `bin/postbox-hook.mjs` `updateLedger()` | `obligations` | `obMatch && obMatch.to === msg.from` before filtering `obligations` |
 
-(`postbox-hook.mjs` only ever *receives* mail — it has no send-side tool — so it only needs the `obligations`/reply-received half of the gate, not the `owed`/reply-sent half.)
-
-`thread_send`'s own soft warning (`src/tools/messaging.ts`) — surfaced to the model when a `re` doesn't match any owed entry, or matches one owed to a different thread than the stated target — is a **UX nicety layered on top**, not the actual protection: it never blocks the send. The real invariant lives in the three gates above.
+`thread_send`'s own soft warning (`src/tools/messaging.ts`) — surfaced to the model when a `re` doesn't match any owed entry, or matches one owed to a different thread than the stated target — is a **UX nicety layered on top**, not the actual protection: it never blocks the send. The real invariant lives in the gates above.
 
 ## Barriers (§12.1)
 
@@ -260,22 +233,9 @@ Registered in three groups by `src/tools/index.ts` — five protocol tools (spec
 
 ## The three external actors
 
-All three speak the *same* `.thread/` local-fs store (Appendix B) and interoperate purely through it — atomic renames make claims mutually exclusive regardless of which actor wins the race.
+External actors speak the *same* `.thread/` local-fs store (Appendix B) and interoperate purely through it — atomic renames make claims mutually exclusive regardless of which actor wins the race.
 
 - **`bin/thread-cli.mjs`** — zero-dependency CLI. `list`/`status`/`send`/`inbox`/`tail`/`watch`/`delete` read and write the same files the extension does. A human operator using it is a full **C1** protocol citizen (spec §2.2) without running pi at all. Operator sends default to `urgency: "high"` (a human steering a thread wants it seen at the next opening).
-- **`bin/postbox-mcp.mjs`** — zero-dependency MCP stdio server, making any MCP-capable coding agent (Claude Code, Codex CLI, ...) a **C2** correlating client (§2.2): it tracks the obligation/owed ledger and exposes six `thread_*`-equivalent tools (`thread_send`, `thread_inbox`, `thread_wait`, `thread_status`, `thread_list`, `thread_journal`) over JSON-RPC 2.0 on stdin/stdout. Identity comes from the `POSTBOX_THREAD_ID` env var (required; `POSTBOX_DIR`/`POSTBOX_ROLE`/`POSTBOX_PARENT` optional). It runs no waits or state machine beyond `running`/`stopped` — that's the pi extension's (**C3**) job.
-- **`bin/postbox-hook.mjs`** — zero-dependency Claude Code hook, one script registered on four hook events, giving a Claude Code session push-style delivery instead of having to poll `thread_inbox`:
-
-  | Event | Gate |
-  | --- | --- |
-  | `SessionStart` | cold-start drain of all due mail → `additionalContext` |
-  | `UserPromptSubmit` | turn-start drain of all due mail → `additionalContext` |
-  | `PostToolUse` | urgency=high mail only, injected at the next tool boundary → `additionalContext` |
-  | `Stop` | pending mail blocks the stop (`decision: "block"`) until debts are settled or a `POSTBOX_STOP_WAIT_SECONDS` grace window elapses |
-
-  The one blind window: a turn that streams prose without a single tool call has no `PostToolUse` gate to land in, so that mail waits for `Stop`. True mid-generation steer needs an Agent SDK host, not hooks.
-
-Because the MCP server and the hook both claim from the same inbox by atomic rename, a message delivered while both are attached to the same thread id is delivered exactly once, whichever wins the race.
 
 ---
 
@@ -283,7 +243,7 @@ Because the MCP server and the hook both claim from the same inbox by atomic ren
 
 Implemented as a pi coding-agent extension. pi's `ExtensionAPI` provides no native cross-process primitive (no session registry, no send-by-ID, no built-in watcher) — every delivery call (`pi.sendMessage`/`pi.sendUserMessage`) only injects into the _calling_ process's own conversation. The extension builds the harness itself, entirely natively, using primitives pi does expose: `registerFlag`/`getFlag` for thread identity, `session_start`/`session_shutdown` lifecycle hooks, and Node's own `fs.watch`/atomic rename.
 
-**Opt-in gate**: `src/lifecycle.ts` keeps `active = false` for any session that neither passes `--thread-id` nor already has a `thread-identity` custom entry in its own session history. Every handler no-ops while inactive, and `session_start` explicitly strips `thread_*` from the active tool set — so an unrelated pi session (including forked children, which never inherit participation because journal forks run `--no-extensions`) never gets a `.thread/` dir, a random identity, the tools, or the system-prompt block.
+**Opt-in gate**: `src/lifecycle.ts` keeps `active = false` for any session that doesn't pass `--thread-id` on that launch — identity is flag-only, every launch, with no auto-generated ids and no cross-session recall. Every handler no-ops while inactive, and `session_start` explicitly strips `thread_*` from the active tool set — so an unrelated pi session (including forked children, which never inherit participation because journal forks run `--no-extensions`, and a plain `pi --fork` won't reactivate unless `--thread-id` is passed again) never gets a `.thread/` dir, an identity, the tools, or the system-prompt block.
 
 **Liveness**: each running thread heartbeats its own `state.json` every 20s (`HEARTBEAT_MS`); any reader treats a thread as effectively stopped once `lastSeen` is older than 60s (`STALE_MS`), regardless of the stored `status` field — this is how a hard-killed process (`session_shutdown` never fires on `kill -9`) gets detected. This is the spec's one presence rule that binds every reader (§8.2), and it applies verbatim regardless of storage backend — `toSummary()` (`core/types.ts`) is the one shared implementation, reused by both adapters' `listThreads()`.
 
@@ -300,13 +260,11 @@ Implemented as a pi coding-agent extension. pi's `ExtensionAPI` provides no nati
 ## Testing and release
 
 - **`test/unit.test.ts`** — extension logic + the local-fs adapter + the CLI, including the full CLI↔extension interop loop. No model calls, no network — fast and free.
-- **`test/mcp.test.ts`** — `bin/postbox-mcp.mjs`'s JSON-RPC surface directly over stdio. No model calls.
 - **`test/e2e.test.ts`** — spins up real `pi` processes and makes real (cheap) model calls, configurable via `PI_E2E_MODEL` (default `deepseek/deepseek-chat`) so the suite doesn't force a specific provider/cost on whoever runs it.
-- **`test/e2e-restate.test.ts`** — same shape, against a real `restate-server` via `@restatedev/restate-sdk-testcontainers`.
 
-`npm test` runs `test:unit` then `test:e2e` (paid); `test:unit`/`test:mcp`/`test:e2e`/`test:e2e:restate` are also independently invokable scripts.
+`npm test` runs `test:unit` then `test:e2e` (paid); both are also independently invokable scripts.
 
-**CI** (`.github/workflows/ci.yml`) runs on every push to `main` and every PR: `tsc --noEmit`, lint, `test:unit`, `test:mcp` — all free, no model spend.
+**CI** (`.github/workflows/ci.yml`) runs on every push to `main` and every PR: `tsc --noEmit`, lint, `test:unit` — all free, no model spend.
 
 **Release** (`.github/workflows/release.yml`) triggers on `v*` tags (or manual dispatch): re-runs the same free checks, verifies the tag matches `package.json`'s `version`, then publishes twice — `pi-threading` (unscoped) to npmjs via OIDC trusted publishing (no stored token; requires npm ≥ 11.5.1 and one-time npmjs.com Trusted Publisher setup pointing at this workflow), and `@ofrbg/pi-threading` (scope patched in at publish time via `npm pkg set name=...`) to the GitHub npm registry using the built-in `GITHUB_TOKEN`. `package.json`'s checked-in `name` is the unscoped `pi-threading` — the `@ofrbg` scope only exists as the GitHub-registry mirror's name, applied in CI, never committed.
 
@@ -316,13 +274,9 @@ Implemented as a pi coding-agent extension. pi's `ExtensionAPI` provides no nati
 
 Verified by reading the implementation, not exhaustively tested. Listed so they're a documented tradeoff rather than a silent surprise.
 
-- **Fork identity inheritance** (spec A.1): a user-made `pi --fork` of a participating session copies the session history including the thread-identity entry, so the fork wakes up believing it is the same thread as its parent (two processes, one id). The journal fork is immune (`--no-extensions`); the general case needs an init-time check (same id + fresh `lastSeen` + different pid → deactivate or re-mint). Open.
 - **Meeting exclusivity is advisory.** There is no lock: a busy peer says "busy" and the requester retries later. Two threads that request a meeting with each other simultaneously will each see the other's request at their next opening and sort it out conversationally — nothing deadlocks, but nothing enforces a rendezvous either.
 - **No automated test coverage yet for**: the CLI `delete` command and the CLI's live loops (`watch`/`tail`). The CLI's `status`/`list`/`send`/`inbox` are covered in `test/unit.test.ts`, including the full CLI↔extension interop loop.
-- **`bin/thread-cli.mjs` only ever sees the `local` storage backend** — it speaks the file binding directly and doesn't go through `StorageAdapter`, so threads running with `--thread-storage restate` are invisible to it. Giving it Restate awareness would mean either duplicating `RestateAdapter`'s logic into a zero-dependency script or accepting a dependency it was deliberately designed without — not resolved, flagged as a real gap.
-- **A Restate `deliverDue` self-check can't be un-armed** — the public client API has no "cancel a delayed send" call, so the invocation still fires at the original time; it no-ops if the envelope was already drained. Functionally correct (nothing visibly happens) but not a true cancellation at the infrastructure level.
-- **`watchInbox` on the Restate backend polls every 2s** instead of getting an instant local `fs.watch` notification — live-delivery latency is worse, though cold-start durability (the guarantee that actually matters) is unaffected.
+- **`bin/thread-cli.mjs` only ever sees the `local` storage backend** — it speaks the file binding directly and doesn't go through `StorageAdapter`, so threads on any future non-local backend would be invisible to it. A consequence of its zero-dependency design; flagged, not resolved.
 - **The §7.7 residual loss window**: an envelope claimed by a process that crashes inside the single drain-and-inject tick is moved to `processed/` but never seen by the model. This is the protocol's one declared loss window (spec §7.7, Erratum 5) — inspectable in `processed/`, upgradeable later via peek/ack in Layer 0.
-- **The three Errata-6 discharge gates are independently maintained** (`src/inbox.ts`, `bin/postbox-mcp.mjs`, `bin/postbox-hook.mjs`) rather than a single shared implementation — a consequence of the zero-dependency design of the `bin/` scripts (see Repo layout above). A future protocol-level ledger change has to be ported to all three by hand; nothing currently enforces they stay in sync beyond code review and `journalFingerprint`-style comments cross-referencing each other.
 
 **History**: this document used to carry the protocol definition (eight message types, reply/sync locks, subscriptions, scheduled wakes) plus a long fix log. The protocol moved to PROTOCOL-FORMALISM.md, went through a formal review across Revs 1–8 (five errata found and fixed along the way — misdirected-reply discharge, lock deadlock recovery, heartbeat coalescing, deadline generalization, the drain window), and the Rev-8 migration then deleted locks, types, subscriptions, and the wake machinery outright. The spec's Appendix A records what changed; git history holds the rest. Erratum 6 (v0.3.1/v0.3.2) closed a follow-on gap in the same family: the misdirected-reply discharge fix (Erratum 1) had only ever been applied to the `owed` ledger's send-side check; the symmetric `obligations` ledger check in `deliver()`, and the two standalone `bin/` scripts' own copies of both checks, needed the same gate applied by hand.

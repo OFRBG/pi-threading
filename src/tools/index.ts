@@ -1,15 +1,19 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { ThreadStore } from "../core/types";
-import type { Inbox } from "../inbox";
+import type { ThreadingContext } from "../context";
 import { registerIntrospectionTools } from "./introspection";
 import { registerMessagingTools } from "./messaging";
 import { registerControlTools } from "./control";
 
-/** The model-facing thread_* tools: the five protocol tools (§14 — send,
- *  wait, status, list, journal) plus the two client-local on-hold controls
- *  (suspend/resume, Layer-2 only). */
+export enum ThreadingTool {
+  Status = "thread_status",
+  List = "thread_list",
+  Journal = "thread_journal",
+  Send = "thread_send",
+  Wait = "thread_wait",
+  Suspend = "thread_suspend",
+  Resume = "thread_resume",
+}
 
-export function registerTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox) {
+export function registerTools({ pi, store, inbox }: ThreadingContext) {
   registerIntrospectionTools(pi, store);
   registerMessagingTools(pi, store, inbox);
   registerControlTools(pi, store, inbox);

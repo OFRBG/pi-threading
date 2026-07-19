@@ -8,21 +8,18 @@ import type { ThreadStore } from "./core/types";
 /** Everything journal: the fork prompt, entry parsing, duplicate detection,
  *  and the cadence policy deciding which moments deserve a forked entry. */
 
-const JOURNAL_PROMPT = `You are this thread's journal keeper. Based on the conversation above, write a brief status update in exactly this format:
+const JOURNAL_PROMPT = `
+You are this thread's journal keeper. Based on the conversation above, write a brief status update in exactly this format:
 
-Working on: <the main task in one line>
+Working on: <the main task>
 Done: <what was completed this turn>
 Doing: <what is in progress or will continue>
 Next: <planned next step>
 Blockers: <blockers or "none">
 
-No preamble. No extra text. Just the five lines.`;
+No preamble. No extra text. Just the five lines, one line per entry.
+`.trim();
 
-/** Minimum spacing between per-turn journal forks. Structural changes (new
- *  obligation, lock, barrier — the things teammates key off) still journal
- *  immediately; this only rate-limits the "another tool turn on the same
- *  task" entries that used to land once per turn, ~17 near-duplicates per
- *  work session. */
 export const JOURNAL_MIN_INTERVAL_MS = 120_000;
 
 /** Entries are separated by their `<!-- timestamp -->` headers. */
@@ -34,7 +31,7 @@ export function splitJournalEntries(content: string): string[] {
  *  restated every idle turn even when nothing happened, so they're excluded
  *  from the comparison — otherwise a re-forked entry with fresh phrasing of
  *  the same wait would never match and noise would keep accumulating. */
-export function journalFingerprint(entry: string): string {
+function journalFingerprint(entry: string): string {
   return entry
     .split("\n")
     .filter(l => /^(Working on|Done):/i.test(l.trim()))
@@ -46,7 +43,7 @@ export function journalFingerprint(entry: string): string {
 
 /** Pure comparison against the last entry in an existing journal's content
  *  (or `undefined` when no journal exists yet). */
-export function isDuplicateOfLastEntry(journalContent: string | undefined, entry: string): boolean {
+function isDuplicateOfLastEntry(journalContent: string | undefined, entry: string): boolean {
   const content = journalContent?.trim();
   if (!content) return false;
   const entries = splitJournalEntries(content);
@@ -56,8 +53,8 @@ export function isDuplicateOfLastEntry(journalContent: string | undefined, entry
 }
 
 export function journalMode(pi: ExtensionAPI): "turn" | "done" | "off" {
-  const v = pi.getFlag("thread-journal");
-  return v === "done" || v === "off" ? v : "turn";
+  const mode = pi.getFlag("thread-journal");
+  return mode === "done" || mode === "off" ? mode : "turn";
 }
 
 /** Fingerprint of everything a journal entry could newly report. Unchanged
@@ -122,7 +119,7 @@ export function shouldJournal(
  *  resolve to `node.exe <entry.js>` by the time this code runs) re-invoke
  *  `execPath entryScript`, standalone pi binaries re-invoke `execPath`
  *  directly. */
-export function piSelfCommand(
+function piSelfCommand(
   args: string[],
   execPath: string = process.execPath,
   entryScript: string | undefined = process.argv[1],
@@ -150,7 +147,7 @@ export function piSelfCommand(
  *  construction. A hardcoded cheap model looks free until the extension runs
  *  on a machine whose provider can't serve it — then every fork dies before
  *  printing and the journal silently never exists. */
-export function journalForkArgs(sessionFile: string, sessionDir: string, model?: string): string[] {
+function journalForkArgs(sessionFile: string, sessionDir: string, model?: string): string[] {
   return [
     "--fork",
     sessionFile,
@@ -169,9 +166,6 @@ export function journalForkArgs(sessionFile: string, sessionDir: string, model?:
  *  Fire-and-forget: runs in the background after turn_end/agent_end, the
  *  main thread never pauses on it. */
 export function forkJournalEntry(store: ThreadStore, sessionFile: string, model?: string): void {
-  // The journal channel is an optional backend extension (PROTOCOL-FORMALISM
-  // §5) — on a backend without it there is nowhere to append, so don't pay
-  // for the forked model call either.
   if (!store.adapter.appendJournal) return;
   const tmpSes = fs.mkdtempSync(path.join(os.tmpdir(), "pi-journal-"));
   let out = "";

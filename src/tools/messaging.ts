@@ -5,6 +5,7 @@ import { mintId } from "../core/ids";
 import { deadlineFromSeconds, nowIso } from "../core/time";
 import type { Inbox } from "../inbox";
 import { err } from "./shared";
+import { ThreadingTool } from "./index";
 
 /** Shared by thread_send(wait=true) and thread_wait — arm a barrier that
  *  wakes this thread (passively, at next Open) once its envelope ids
@@ -29,11 +30,9 @@ async function armBarrier(
   return barrier;
 }
 
-/** Envelope messaging (PROTOCOL-FORMALISM.md §6): one send tool, one wait
- *  tool. Kind is structural — expects/re — never a type tag. */
 export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox) {
   pi.registerTool({
-    name: "thread_send",
+    name: ThreadingTool.Send,
     label: "Thread Send",
     description:
       'Send a message to other thread(s). `to` accepts a thread id, a comma-separated list, `*` (all known threads), or `role:<role>` — see thread_list. Set expects=true when you need a reply (a "request" — tracked as an obligation until the reply lands). Set re=<id> to reply to a message you received (this discharges the debt). Both together = a reply that asks a follow-up. Neither = a plain note. To your parent with expects=true and urgency="high" = an escalation. A future-dated send to your OWN id (deliverAfterSeconds) is a scheduled self-wake.',
@@ -132,15 +131,15 @@ export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inb
       // "*"/role: targets come from listThreads and exist by construction; a
       // direct id may be a typo. Queueing is a durable dead-drop (§7.1), so
       // this is a warning, never a refusal.
-      const missing = selfWake ? [] : await inbox.findMissingTargets(targets);
+      const missing = selfWake ? [] : await inbox.checkMissing(targets);
 
       const deadline = deadlineFromSeconds(params.deadlineSeconds);
 
-      let sent: Awaited<ReturnType<Inbox["sendToMany"]>>;
+      let sent: Awaited<ReturnType<Inbox["sendMany"]>>;
       try {
         // sendEnvelope mints a unique id per target, so fan-out replies stay
         // individually correlatable.
-        sent = await inbox.sendToMany(targets, params.body, {
+        sent = await inbox.sendMany(targets, params.body, {
           re: params.re,
           expects,
           urgency: params.urgency as Urgency | undefined,
@@ -187,7 +186,7 @@ export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inb
   });
 
   pi.registerTool({
-    name: "thread_wait",
+    name: ThreadingTool.Wait,
     label: "Thread Wait",
     description:
       "Wait for replies to outstanding requests (envelope ids from thread_send results / thread_status). When all (or any) of them receive a reply, you get a wake-up message — optionally with your own `message` payload injected alongside it. Non-blocking: end your turn after calling this.",
