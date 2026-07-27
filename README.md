@@ -12,9 +12,9 @@ Threading is lightweight enough to be molded into a framework, while providing t
 
 ## How it works
 
-Each `pi` process becomes a **thread** with a stable identity. Threads communicate through mailboxes. The extension runs a watcher that will inject messages with steer or queue, depending on message urgency. 
+Each `pi` process becomes a **thread** with a stable identity. Threads communicate through mailboxes. The extension runs a watcher that will inject messages with steer or queue, depending on message urgency.
 
-All messages get dropped into `.thread`, where state and message history is recorded. 
+All messages get dropped into `.thread`, where state and message history is recorded.
 
 The model implementation notes live in [THREAD-MODEL.md](THREAD-MODEL.md).
 
@@ -51,8 +51,8 @@ I recommend using tmux to manage teams.
 
 ### Slash commands
 
-| Command                    | Purpose                                    |
-| -------------------------- | ------------------------------------------ |
+| Command                   | Purpose                                    |
+| ------------------------- | ------------------------------------------ |
 | `thread-status`           | Show state and latest journal entry        |
 | `thread-list`             | List all known threads                     |
 | `thread-send <to> <body>` | Send a high-urgency note to another thread |
@@ -102,7 +102,7 @@ any ──(unclean exit)──→ STOPPED
 
 Personal preferences.
 
-pi already has an RPC mode, and there are multiple projects out there implemented teams already. Subagents are well handled by Claude Code, Codex, and any mejor coding agent now. What *I* want from pi-threading is async notifications from/to the world, for agents, while not being overly disruptive. 
+pi already has an RPC mode, and there are multiple projects out there implemented teams already. Subagents are well handled by Claude Code, Codex, and any major coding agent now. What _I_ want from pi-threading is async notifications from/to the world, for agents, while not being overly disruptive.
 
 pi-threading is my interpretation subagent communication and coordination, and how it should be implemented. It lies somewhere between plain markdown note sharing and ACP/A2A. It exposes the features that I care about.
 

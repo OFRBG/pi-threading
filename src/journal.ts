@@ -20,6 +20,38 @@ Blockers: <blockers or "none">
 No preamble. No extra text. Just the five lines, one line per entry.
 `.trim();
 
+/** The fork prints this token alone when the turn added nothing worth
+ *  recording (a pure "still waiting" restatement of the previous entry). The
+ *  close handler recognizes it and appends nothing — a skip the model itself
+ *  decides, ahead of the fingerprint dedup that only catches exact repeats. */
+const JOURNAL_SKIP = "SKIP";
+
+/** True when the fork chose to skip: its whole output is just the sentinel
+ *  (case-insensitive, tolerating a trailing period). */
+function isSkip(entry: string): boolean {
+  return new RegExp(`^${JOURNAL_SKIP}\\.?$`, "i").test(entry.trim());
+}
+
+/** Append the prior entry so the fork writes a *continuation* — reporting
+ *  what changed since, not re-describing the whole session cold — and so it
+ *  can carry forward a still-accurate "Doing/Next" instead of inventing fresh
+ *  phrasing for the same state (which would also dodge duplicate detection). */
+function buildJournalPrompt(previousEntry?: string): string {
+  if (!previousEntry) {
+    return JOURNAL_PROMPT;
+  }
+
+  return `
+${JOURNAL_PROMPT}
+
+This is the previous journal entry. If the turn added nothing worth recording — the same task, still waiting, no real progress — do NOT write a new entry: output the single word ${JOURNAL_SKIP} and nothing else. Otherwise write the five lines as usual, reporting what changed relative to it.
+
+<previous>
+${previousEntry}
+</previous>
+`.trim();
+}
+
 export const JOURNAL_MIN_INTERVAL_MS = 120_000;
 
 /** Entries are separated by their `<!-- timestamp -->` headers. */
@@ -41,14 +73,34 @@ function journalFingerprint(entry: string): string {
     .trim();
 }
 
+/** The most recent entry's body (its `<!-- timestamp -->` header stripped),
+ *  or `undefined` when the journal is empty. Fed to the fork as continuity
+ *  context. */
+function lastJournalEntry(journalContent: string | undefined): string | undefined {
+  const content = journalContent?.trim();
+  if (!content) {
+    return undefined;
+  }
+  const entries = splitJournalEntries(content);
+  const last = entries[entries.length - 1];
+  if (!last) {
+    return undefined;
+  }
+  return last.replace(/^<!--.*?-->\s*/s, "").trim() || undefined;
+}
+
 /** Pure comparison against the last entry in an existing journal's content
  *  (or `undefined` when no journal exists yet). */
 function isDuplicateOfLastEntry(journalContent: string | undefined, entry: string): boolean {
   const content = journalContent?.trim();
-  if (!content) return false;
+  if (!content) {
+    return false;
+  }
   const entries = splitJournalEntries(content);
   const last = entries[entries.length - 1];
-  if (!last) return false;
+  if (!last) {
+    return false;
+  }
   return journalFingerprint(last) === journalFingerprint(entry);
 }
 
@@ -94,20 +146,34 @@ export function shouldJournal(
   const sig = journalSignature(store);
   const changed = sig !== store.lastJournalSignature;
   let write: boolean;
-  if (phase === "run-end") {
-    write = store.journalDebt;
-  } else if (phase === "done") {
-    write = changed || toolUsedThisTurn;
-  } else {
-    if (!changed && !toolUsedThisTurn) return false;
-    write = changed || Date.now() - store.lastJournalAt >= JOURNAL_MIN_INTERVAL_MS;
-    if (!write) store.journalDebt = true;
+
+  switch (phase) {
+    case "run-end":
+      write = store.journalDebt;
+      break;
+
+    case "done":
+      write = changed || toolUsedThisTurn;
+      break;
+
+    default:
+      if (!changed && !toolUsedThisTurn) {
+        return false;
+      }
+      write = changed || Date.now() - store.lastJournalAt >= JOURNAL_MIN_INTERVAL_MS;
+
+      if (!write) {
+        store.journalDebt = true;
+      }
+      break;
   }
+
   if (write) {
     store.lastJournalSignature = sig;
     store.lastJournalAt = Date.now();
     store.journalDebt = false;
   }
+
   return write;
 }
 
@@ -125,10 +191,15 @@ function piSelfCommand(
   entryScript: string | undefined = process.argv[1],
 ): { cmd: string; args: string[] } {
   const exe = (execPath.split(/[\\/]/).pop() ?? "").toLowerCase();
+
   if (exe.startsWith("node")) {
-    if (entryScript) return { cmd: execPath, args: [entryScript, ...args] };
+    if (entryScript) {
+      return { cmd: execPath, args: [entryScript, ...args] };
+    }
+
     return { cmd: "pi", args }; // no identifiable entry — PATH as a last resort
   }
+
   return { cmd: execPath, args }; // pi is a standalone executable
 }
 
@@ -147,7 +218,12 @@ function piSelfCommand(
  *  construction. A hardcoded cheap model looks free until the extension runs
  *  on a machine whose provider can't serve it — then every fork dies before
  *  printing and the journal silently never exists. */
-function journalForkArgs(sessionFile: string, sessionDir: string, model?: string): string[] {
+function journalForkArgs(
+  sessionFile: string,
+  sessionDir: string,
+  prompt: string,
+  model?: string,
+): string[] {
   return [
     "--fork",
     sessionFile,
@@ -158,22 +234,38 @@ function journalForkArgs(sessionFile: string, sessionDir: string, model?: string
     "--thinking",
     "off",
     "--print",
-    JOURNAL_PROMPT,
+    prompt,
   ];
 }
 
 /** Fork the session into a throwaway run that writes one journal entry.
  *  Fire-and-forget: runs in the background after turn_end/agent_end, the
  *  main thread never pauses on it. */
-export function forkJournalEntry(store: ThreadStore, sessionFile: string, model?: string): void {
-  if (!store.adapter.appendJournal) return;
-  const tmpSes = fs.mkdtempSync(path.join(os.tmpdir(), "pi-journal-"));
+export async function forkJournalEntry(
+  store: ThreadStore,
+  sessionFile: string,
+  model?: string,
+): Promise<void> {
+  if (!store.adapter.appendJournal) {
+    return;
+  }
+
+  // Read the prior entry up front so the fork can continue the narrative
+  // rather than summarize the session cold. Best-effort: a read failure just
+  // means the fork gets the base prompt (close-time dup detection still uses
+  // its own fresh read).
+  const previousEntry = lastJournalEntry(await store.adapter.readJournal?.(store.threadId));
+
   let out = "";
   let errOut = "";
-  const launch = piSelfCommand(journalForkArgs(sessionFile, tmpSes, model));
-  const proc = spawn(launch.cmd, launch.args, {
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  const tmpSes = fs.mkdtempSync(path.join(os.tmpdir(), "pi-journal-"));
+
+  const launch = piSelfCommand(
+    journalForkArgs(sessionFile, tmpSes, buildJournalPrompt(previousEntry), model),
+  );
+
+  const proc = spawn(launch.cmd, launch.args, { stdio: ["ignore", "pipe", "pipe"] });
+
   proc.on("error", err => {
     console.error("[thread] journal fork failed to spawn:", err);
     fs.rmSync(tmpSes, { recursive: true, force: true });
@@ -184,10 +276,12 @@ export function forkJournalEntry(store: ThreadStore, sessionFile: string, model?
   proc.stderr!.on("data", (d: Buffer) => {
     errOut += d.toString();
   });
+
   proc.on("close", code => {
     void (async () => {
       fs.rmSync(tmpSes, { recursive: true, force: true });
       const entry = out.trim();
+
       if (!entry) {
         // A fork that never produces an entry must not fail silently — this
         // is exactly how a misconfigured journal model reads as "journal.md
@@ -197,8 +291,19 @@ export function forkJournalEntry(store: ThreadStore, sessionFile: string, model?
         );
         return;
       }
+
+      // The fork judged the turn had nothing new to record and asked to skip
+      // — a deliberate no-op, distinct from the empty-output error above.
+      if (isSkip(entry)) {
+        return;
+      }
+
       const existing = await store.adapter.readJournal?.(store.threadId);
-      if (isDuplicateOfLastEntry(existing, entry)) return;
+
+      if (isDuplicateOfLastEntry(existing, entry)) {
+        return;
+      }
+
       const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
       await store.adapter.appendJournal?.(store.threadId, `\n<!-- ${ts} -->\n${entry}\n`);
     })();

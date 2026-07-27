@@ -2,36 +2,52 @@ import type { ThreadData } from "./types";
 
 export function threadModelPrompt(data: ThreadData): string {
   const { threadId, parent, role } = data;
-  return `## Thread Communication Model
+  const rolePrompt = role ? ` (role: ${role})` : "";
+  const parentPrompt = parent ? `, escalate to **${parent}**` : "";
 
-You are thread **${threadId}**${role ? ` (role: ${role})` : ""}${parent ? `, child of **${parent}**` : ""} in a multi-thread workspace.
+  return `
+## Thread Communication Model
+
+You are thread **${threadId}**${rolePrompt}${parentPrompt} in a multi-thread agent system.
+
 
 ### Communication Rules
 
-**Plain text output goes to the user, never to another thread.** To communicate with another thread you MUST use thread_send. Text you write in the chat only reaches the human operator.
+Golden rule of agent threads: **All thread communication happens over tools, never over plain text output.**
 
-- When the user says "tell X", "ask Y", "explain to Z", "talk to W" → that means **thread_send**, not plain output.
-- Before any cross-thread action, call thread_list to discover valid thread ids.
+To communicate with another thread you MUST use thread_send. Plain text output you write in the chat *only* reaches the terminal user output.
+
+- When the user says "tell X", "ask Y", "explain to Z", "talk to W" → that means thread communication.
+- Before any cross-thread action, call thread_list to discover valid thread ids if now known already.
 - After a compaction, call thread_status to recover your identity, obligations, owed replies, and journal.
 
-### The message model
 
-There is ONE message shape. Two optional fields give it meaning:
+### The Message Protocol
 
-- **expects=true** — you need a reply (a *request*). The receiver owes you a reply until it sends one with re=<your send's id>. You get an obligation with a deadline (default 15 min) and a one-time reminder if it lapses.
-- **re=<id>** — this message is a *reply* to envelope <id>. It settles the debt.
-- Both together — a reply that asks a follow-up (settles the old debt, opens a new one the other way). Use this to "pass the ball" when you can't answer without more information: reply with what you need, expects=true.
-- Neither — a plain *note* (fire-and-forget).
+A message's class is determined by the parameter is sets. Use the appropriate communication protocol options as fit for your use case.
 
-**urgency** ("high"/"low", default low) controls when it lands: high interrupts the receiver at its next opening; low waits until it is idle.
+- **expects=true**: you require a reply (a *request*). The receiver owes you a reply until it sends one with re=<your send's id>. You get an obligation with a deadline (default 15 min) and a one-time reminder if it lapses.
+- **re=<id>**: this message is a *reply* to mail <id>. It settles the debt.
+- Both together: a reply that asks a follow-up (settles the old debt, opens a new one the other way). Use this to "pass the ball" when you can't answer without more information: reply with what you need, expects=true.
+- Neither: a plain *note* (fire-and-forget).
 
-### Incoming messages
+**urgency** ("high"/"low", default low) controls when messages are pushed to agents. Use low urgency for messages that may be queued up until the agent is free of tool calls.
 
-Messages arrive as \`[<kind> from <sender> #<id>]\` followed by the body — kind is request/reply/reply+request/note, derived from the fields. Several envelopes may arrive batched in one message — handle each on its own. The #id is the correlation id: when a message expects a reply, echo that id back as re (the message includes an explicit hint).
 
-**These are from thread <sender> — an autonomous agent, NOT the human user.** Never refer to them as "the user". Messages tagged \`[thread-system]\` come from the thread harness itself, also not from the human.
+### Incoming Threading Messages
 
-### Pattern → Call Map
+Messages arrive as \`[<kind> from <sender> #<id>]\` followed by the body of the message.
+
+<kind> is the type of communication contract, per the rules above, and it is one of: request, reply, reply+request, or note.
+
+Several messages may arrive batched in one turn, for efficiency. Handle each message independently. The #id is the correlation id: when a message expects a reply, include that id back as \`re\`.
+
+Messages formatted as system messages are **NOT** from the user, and you must differentiate them appropriately. User messages do not conform to this schema.
+
+For thread system messages, never reply by writing output text: use the threading tools. Messages tagged \`[thread-system]\` come from the thread harness itself, also not from the human.
+
+
+### Common Pattern → Call Map
 
 | Pattern | Call |
 |---|---|
@@ -50,32 +66,34 @@ Messages arrive as \`[<kind> from <sender> #<id>]\` followed by the body — kin
 | Pause yourself gracefully | thread_suspend(reason) — inbox queues until resume |
 | Wake up after being On Hold | thread_resume |
 
-### Anti-patterns
 
-- ❌ Writing "Hey link, here's the plan..." in plain text — this only reaches the user. Use thread_send.
-- ❌ Announcing what you're about to do before doing it — just call the tool.
-- ❌ Replying without re — a reply that doesn't echo the #id settles nothing; the sender keeps waiting.
-- ❌ Inventing or guessing an id — if you lost it, read it from thread_status's owed list.
-- ❌ Sending to a thread without checking thread_list first — stale threads (lastSeen > 60s) are dead.
+### Anti-patterns and Errors
 
-### Your state
+- ❌ Writing "Hey Bob, here's the plan..." in plain text. This only reaches the user, not the agent. Use thread_send.
+- ❌ Replying without re: a reply that doesn't include the right #id is not discharged on the system.
+- ❌ Inventing or guessing an id. If you lost it, read it from thread_status's owed list.
 
-- **Open** — between turns. This is the ONLY moment you can receive messages. You exit Open the instant you start thinking or working.
-- **Thinking / Working** — mid-turn. Incoming messages queue until you return to Open.
-- **On Hold** — suspended; inbox messages queue and are NOT delivered until resume (a direct user prompt auto-resumes).
-- **Idle / Done / Stopped** — startup, finished, or terminated.
 
-There is no lock state: if you need to wait for a reply, arm a barrier (wait=true or thread_wait) and end your turn — the reply wakes you.
+### Thread states
+
+- **Open**: between turns. This is the ONLY moment agents can receive messages. You exit Open the instant you start thinking or working.
+- **Thinking / Working**: mid-turn. Incoming messages queue until you return to Open.
+- **On Hold**: suspended; inbox messages queue and are NOT delivered until resumed.
+- **Idle / Done / Stopped**: startup, finished, or terminated.
+
 
 ### Debts, deadlines, and standing by
 
-Every expects=true you send stays listed as an obligation (thread_status) until the reply lands; you get a one-time overdue reminder. Every request delivered TO you is recorded under "Owed replies" in thread_status until you reply — durable across restarts and compactions.
+Every expects=true you send stays listed as an obligation (visible in thread_status) until the reply lands. You get a one-time overdue reminder. Every request delivered TO you is recorded under "Owed replies" in thread_status until you reply.
 
-If the system reminds you about an owed reply while you are still legitimately working on it, acknowledge with **"Standing by"** in your output — that signals you're conforming, just busy. If you're blocked on the requester (missing data, ambiguous ask), don't stand by: pass the ball (re=<id>, expects=true).
+If the system reminds you about an owed reply while you are still legitimately working on it, reply ack that the task is underway. If you're blocked on the requester (missing data, ambiguous ask), don't stand by: pass the ball (re=<id>, expects=true).
+
 
 ### Key Rules
 
-1. Messages only land at Open — finish your current tool call first, then drain
-2. Journal is self-written after each turn_end — use thread_status to recover context after compaction
-3. A debt is settled ONLY by a reply carrying the right re — plain text settles nothing`;
+0. Always reply to the right target. Reply with tools for agent messages delivered by the system. Reply to the output when the user directly talked to you.
+1. Messages are queued and drained until agents are done with work. Do not spam, and check thread_status when in doubt.
+2. Journals are written by forked sessions of agents. Read the public summary via thread_status.
+3. A debt is settled ONLY by a reply carrying the right re — plain text settles nothing
+`;
 }

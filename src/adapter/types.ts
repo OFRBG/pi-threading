@@ -2,8 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { StateFile, Mail, ThreadSummary } from "../core/types";
 
 export type ThreadingFlagKey<TParam extends string> = `thread-storage-${TParam}`;
-export type AdapterOptionKey<TFlag = string> =
-  TFlag extends ThreadingFlagKey<infer B> ? B : never;
+export type AdapterOptionKey<TFlag = string> = TFlag extends ThreadingFlagKey<infer B> ? B : never;
 
 export type AdapterFlags<B extends string = string> = Record<ThreadingFlagKey<B>, string | boolean>;
 

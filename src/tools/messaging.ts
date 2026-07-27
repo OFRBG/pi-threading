@@ -5,7 +5,7 @@ import { mintId } from "../core/ids";
 import { deadlineFromSeconds, nowIso } from "../core/time";
 import type { Inbox } from "../inbox";
 import { err } from "./shared";
-import { ThreadingTool } from "./index";
+import { threadingTools } from "./index";
 
 /** Shared by thread_send(wait=true) and thread_wait — arm a barrier that
  *  wakes this thread (passively, at next Open) once its envelope ids
@@ -32,10 +32,7 @@ async function armBarrier(
 
 export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox) {
   pi.registerTool({
-    name: ThreadingTool.Send,
-    label: "Thread Send",
-    description:
-      'Send a message to other thread(s). `to` accepts a thread id, a comma-separated list, `*` (all known threads), or `role:<role>` — see thread_list. Set expects=true when you need a reply (a "request" — tracked as an obligation until the reply lands). Set re=<id> to reply to a message you received (this discharges the debt). Both together = a reply that asks a follow-up. Neither = a plain note. To your parent with expects=true and urgency="high" = an escalation. A future-dated send to your OWN id (deliverAfterSeconds) is a scheduled self-wake.',
+    ...threadingTools.send,
     parameters: Type.Object({
       to: Type.String({
         description: 'Target: thread id, "a,b,c", "*", or "role:<role>".',
@@ -155,7 +152,11 @@ export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inb
         s =>
           `Sent to ${s.to}. id=${s.id} (${s.delivered}${deliverAfter ? `, holds until ${deliverAfter}` : ""}).`,
       );
-      if (targetWarning) lines.push(targetWarning);
+
+      if (targetWarning) {
+        lines.push(targetWarning);
+      }
+
       if (missing.length) {
         lines.push(
           `(note: ${missing.join(", ")} ${missing.length === 1 ? "has" : "have"} never been seen in this workspace — the message is queued durably and delivers if a thread with that id starts. If this was a typo, check thread_list.)`,
@@ -186,10 +187,7 @@ export function registerMessagingTools(pi: ExtensionAPI, store: ThreadStore, inb
   });
 
   pi.registerTool({
-    name: ThreadingTool.Wait,
-    label: "Thread Wait",
-    description:
-      "Wait for replies to outstanding requests (envelope ids from thread_send results / thread_status). When all (or any) of them receive a reply, you get a wake-up message — optionally with your own `message` payload injected alongside it. Non-blocking: end your turn after calling this.",
+    ...threadingTools.wait,
     parameters: Type.Object({
       ids: Type.Array(Type.String(), {
         description: "The envelope ids to wait on (from thread_send results / thread_status)",

@@ -1,10 +1,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createStore as createStore } from "./state";
+import { createStore } from "./state";
 import { createInbox } from "./inbox";
 import { registerLifecycle } from "./lifecycle/lifecycle";
 import { registerTools } from "./tools/index";
 import { registerCommands } from "./commands/commands";
-import { createAdapter as createAdapter } from "./adapter/registry";
+import { createAdapter } from "./adapter/registry";
 import type { ThreadingContext, ThreadingState } from "./context";
 
 export default function (pi: ExtensionAPI) {

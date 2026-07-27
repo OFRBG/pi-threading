@@ -57,7 +57,9 @@ export function createStore(
     },
 
     async persist() {
-      if (!store.threadId) return; // init() hasn't resolved an identity yet
+      if (!store.threadId) {
+        return;
+      } // init() hasn't resolved an identity yet
       const payload: StateFile = {
         id: store.threadId,
         pid: process.pid,
@@ -141,7 +143,9 @@ export function createStore(
         // Deliberate resting states survive a clean exit (replies arrive in
         // the durable inbox); only interrupted work reads as "stopped".
         const preserved = new Set(["done", "on-hold"]);
-        if (!preserved.has(store.state)) store.state = "stopped";
+        if (!preserved.has(store.state)) {
+          store.state = "stopped";
+        }
         store.status = "stopped";
         await store.persist();
       }
@@ -163,14 +167,16 @@ export function createStore(
 
     forkJournal(sessionFile: string) {
       const m = pi.getFlag("thread-journal-model");
-      forkJournalEntry(store, sessionFile, typeof m === "string" && m ? m : undefined);
+      void forkJournalEntry(store, sessionFile, typeof m === "string" && m ? m : undefined);
     },
 
     startHeartbeat(onTick?: () => void | Promise<void>) {
       // session_start can fire more than once in a process lifetime (e.g. a
       // session reload) — dispose the previous interval or it leaks and
       // double-fires every deadline check.
-      if (heartbeat) clearInterval(heartbeat);
+      if (heartbeat) {
+        clearInterval(heartbeat);
+      }
       heartbeat = setInterval(() => {
         void (async () => {
           await store.persist();
@@ -180,7 +186,9 @@ export function createStore(
     },
 
     stopHeartbeat() {
-      if (heartbeat) clearInterval(heartbeat);
+      if (heartbeat) {
+        clearInterval(heartbeat);
+      }
       heartbeat = null;
     },
 
@@ -190,7 +198,9 @@ export function createStore(
     },
 
     stopWatcher() {
-      if (stopWatching) stopWatching();
+      if (stopWatching) {
+        stopWatching();
+      }
       stopWatching = null;
     },
   };

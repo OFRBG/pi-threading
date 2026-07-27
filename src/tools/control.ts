@@ -3,17 +3,14 @@ import { Type } from "typebox";
 import type { ThreadStore } from "../core/types";
 import { resumeThread, suspendThread } from "../core/thread-ops";
 import type { Inbox } from "../inbox";
-import { ThreadingTool } from "./index";
+import { threadingTools } from "./index";
 
 /** Self-control: pausing (On Hold) and resuming. Client-local (Layer 2) —
  *  not protocol surface (§14/A.5). Scheduled wakes are ordinary sends with
  *  deliverAfterSeconds (§12.2), not a control tool. */
 export function registerControlTools(pi: ExtensionAPI, store: ThreadStore, inbox: Inbox) {
   pi.registerTool({
-    name: ThreadingTool.Suspend,
-    label: "Thread Suspend",
-    description:
-      "Mark this thread On Hold. Cooperative — does not stop the process, just records suspended state for a human/harness to act on. Inbox messages queue until resume.",
+    ...threadingTools.suspend,
     parameters: Type.Object({
       reason: Type.Optional(Type.String()),
     }),
@@ -32,9 +29,7 @@ export function registerControlTools(pi: ExtensionAPI, store: ThreadStore, inbox
   });
 
   pi.registerTool({
-    name: ThreadingTool.Resume,
-    label: "Thread Resume",
-    description: "Resume this thread from On Hold back to Open.",
+    ...threadingTools.resume,
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, ctx) {
       if (!(await resumeThread(store, () => inbox.drain(ctx), ctx))) {

@@ -5,7 +5,9 @@ import type { ThreadingContext } from "../context";
 /** Where a thread settles between turns: On Hold must survive the turn
  *  boundary instead of being stomped to open/done (§11.1). */
 export function restingState(store: ThreadStore, whenFree: ThreadState): ThreadState {
-  if (store.state === "on-hold") return "on-hold";
+  if (store.state === "on-hold") {
+    return "on-hold";
+  }
   return whenFree;
 }
 

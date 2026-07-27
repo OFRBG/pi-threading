@@ -1,6 +1,6 @@
 import type { ExtensionAPI, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import type { Injection } from "../inbox";
-import { ThreadingTool } from "../tools/index";
+import { threadingToolNames } from "../tools/index";
 import type { ThreadingHookHandler as Handler } from "./shared";
 
 function hasThreadId(pi: ExtensionAPI): boolean {
@@ -16,8 +16,7 @@ export const sessionStart: Handler<SessionStartEvent> = async (
   state.active = hasThreadId(pi);
 
   if (!state.active) {
-    const threadTools: string[] = Object.values(ThreadingTool);
-    pi.setActiveTools(pi.getActiveTools().filter(name => !threadTools.includes(name)));
+    pi.setActiveTools(pi.getActiveTools().filter(name => !threadingToolNames.includes(name)));
     return;
   }
 

@@ -78,7 +78,6 @@ export const CLIENT_CAPABILITIES = [
   "deliverAfter", // scheduled self-wakes honored
   "expiresAt", // stale mail discarded at drain (Rev 10)
   "journal", // writes an observable journal stream (§8.3)
-  "canary", // speaks the "Standing by" protocol (§9.4)
 ] as const;
 
 export interface StateFile {
@@ -112,12 +111,11 @@ export interface ThreadSummary {
   parent: string | null;
   role: string | null;
   lastSeen: string;
-  /** Coordination load, so observers can see who is waiting on what without
-   *  reading each thread's full state: sent-side debts... */
+  /** The count of replies by other threads that this thread is waiting on */
   obligations: number;
-  /** ...received-side debts... */
+  /** The count of replies this thread owes other */
   owed: number;
-  /** ...and armed reply barriers. */
+  /** The count of barriers this thread is waiting on */
   barriers: number;
 }
 

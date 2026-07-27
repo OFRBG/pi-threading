@@ -122,7 +122,7 @@ All actual I/O is delegated to a `StorageAdapter` (`src/adapter/types.ts`) — a
   inbox.tmp/               enqueue staging (same filesystem as inbox/)
 ```
 
-Each thread only ever writes its own `state.json`; other threads only ever *create* files in its `inbox/` — so no cross-process file locking is needed anywhere. Mail filenames are the id's ULID tail (`mintMailId` → `<from>/<ulid>`, `src/core/ids.ts`), so a sorted `readdir` **is** FIFO order, and a retried send with the same id overwrites its own file — enqueue idempotence for free.
+Each thread only ever writes its own `state.json`; other threads only ever _create_ files in its `inbox/` — so no cross-process file locking is needed anywhere. Mail filenames are the id's ULID tail (`mintMailId` → `<from>/<ulid>`, `src/core/ids.ts`), so a sorted `readdir` **is** FIFO order, and a retried send with the same id overwrites its own file — enqueue idempotence for free.
 
 `sendMail` writes into `inbox.tmp/`, then `fs.renameSync`s into `inbox/` — atomic on the same filesystem, so a reader never observes a partial envelope. `receiveMail` does a sorted `readdir`, skips anything whose `deliverAfter` is still in the future, and — **before** returning each envelope as claimed — renames it into `inbox/processed/`; if the caller throws after that, the message is already moved and won't be redelivered (favors "never deliver twice" over "never lose one", per the spec's §7.7 drain gate).
 
@@ -145,15 +145,15 @@ Each thread only ever writes its own `state.json`; other threads only ever *crea
 
 Two separate ledgers, both durable in `StateFile`:
 
-- **`obligations`** (sender side): "I sent an `expects` envelope to X and am waiting on a reply." Recorded in `sendEnvelope` when `opts.expects` is set; cleared when a reply with matching `re` is *delivered* to this thread.
-- **`owed`** (receiver side): "Someone sent me an `expects` envelope and I owe them a reply." Recorded in `deliver()` when an inbound envelope has `expects` set; cleared when this thread *sends* a reply whose `re` matches.
+- **`obligations`** (sender side): "I sent an `expects` envelope to X and am waiting on a reply." Recorded in `sendEnvelope` when `opts.expects` is set; cleared when a reply with matching `re` is _delivered_ to this thread.
+- **`owed`** (receiver side): "Someone sent me an `expects` envelope and I owe them a reply." Recorded in `deliver()` when an inbound envelope has `expects` set; cleared when this thread _sends_ a reply whose `re` matches.
 
 Both discharge paths are gated on sender identity — **only a reply from the thread the debt was actually recorded against may clear it.** A `re` that merely numerically collides with someone else's obligation/owed entry (typo, stale copy-paste, malicious neighbor) leaves the ledger untouched and renders as a plain, undischarging message instead (a v0.3.1/v0.3.2 fix — Erratum 6):
 
-| Implementation | Ledger | Gate |
-| --- | --- | --- |
-| `src/inbox.ts` `deliver()` | `obligations` (sender side, on receiving a reply) | `!obMatch \|\| obMatch.to === msg.from` before filtering `obligations` and resolving barriers |
-| `src/inbox.ts` `sendEnvelope()` | `owed` (receiver side, on sending a reply) | `owedMatch && owedMatch.from === to` before filtering `owed` |
+| Implementation                  | Ledger                                            | Gate                                                                                          |
+| ------------------------------- | ------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `src/inbox.ts` `deliver()`      | `obligations` (sender side, on receiving a reply) | `!obMatch \|\| obMatch.to === msg.from` before filtering `obligations` and resolving barriers |
+| `src/inbox.ts` `sendEnvelope()` | `owed` (receiver side, on sending a reply)        | `owedMatch && owedMatch.from === to` before filtering `owed`                                  |
 
 `thread_send`'s own soft warning (`src/tools/messaging.ts`) — surfaced to the model when a `re` doesn't match any owed entry, or matches one owed to a different thread than the stated target — is a **UX nicety layered on top**, not the actual protection: it never blocks the send. The real invariant lives in the gates above.
 
@@ -167,17 +167,17 @@ Every `expects` send carries a deadline: explicit `deadlineSeconds`, or `DEFAULT
 
 ## Silent-debtor nudge and the "Standing by" canary
 
-`turn_end` (`src/lifecycle.ts`) checks: did this turn call a tool? If not, and `store.owed.length > 0`, the thread just ended a turn with unaddressed owed replies without touching `thread_send` — the classic channel-confusion failure where the model "answers" in plain text that only the human sees. The nudge is gated by `owedNudgePending` (queues at most one reminder per consecutive silent-and-owed stretch) and re-armed at `agent_end` (so a persistently silent thread across multiple runs still gets one fresh nudge per run, not exactly one for its entire life). The reminder text is built entirely from `store.owed` — it can only ever name a real thread/envelope id actually owed, never a guessed one — and escalates its wording once `owedSilentStreak >= 2`. It solicits the **"Standing by"** canary (spec §9.4): an acknowledged hold is conforming behavior, distinct from silence; and it points at ball-passing (§9.5, `re=<id>, expects=true`) when the block is on the requester's side, not the debtor's.
+`turn_end` (`src/lifecycle.ts`) checks: did this turn call a tool? If not, and `store.owed.length > 0`, the thread just ended a turn with unaddressed owed replies without touching `thread_send` — the classic channel-confusion failure where the model "answers" in plain text that only the human sees. The nudge is gated by `owedNudgePending` (queues at most one reminder per consecutive silent-and-owed stretch) and re-armed at `agent_end` (so a persistently silent thread across multiple runs still gets one fresh nudge per run, not exactly one for its entire life). The reminder text is built entirely from `store.owed` — it can only ever name a real thread/envelope id actually owed, never a guessed one — and escalates its wording once `owedSilentStreak >= 2`.
 
 ## The heartbeat and §7.7 declare-and-shrink injection gate
 
 The last hop — from a drained mailbox into this session's own conversation via `pi.sendUserMessage` — is gated (`canInject()` in `src/inbox.ts`), because pi's extension API gives no native cross-process delivery primitive and the naive approach races two different pi behaviors:
 
 - While pi is mid-run, an injected message just joins pi's own steering/follow-up queue (safe — consumed at turn boundaries and once more after `agent_end` handlers settle).
-- While pi is *idle*, each injection starts a **new agent run** after an async preflight; two of those racing means the loser is dropped by pi with `"Agent is already processing"`.
-- During auto-compaction the agent *looks* idle, so an unguarded injection starts a run that races the compaction's own context rewrite (pi's TUI holds user input during compaction for exactly this reason; extensions get no such guard for free).
+- While pi is _idle_, each injection starts a **new agent run** after an async preflight; two of those racing means the loser is dropped by pi with `"Agent is already processing"`.
+- During auto-compaction the agent _looks_ idle, so an unguarded injection starts a run that races the compaction's own context rewrite (pi's TUI holds user input during compaction for exactly this reason; extensions get no such guard for free).
 
-So `canInject()` returns `false` (and every drain call is a no-op — envelopes stay durably claimed-but-undelivered on disk, or simply undrained) while: (a) `compactingSince` is set and less than `COMPACTION_HOLD_MAX_MS` (180s) old — set by `session_before_compact`, cleared by `session_compact` (compaction failures emit no end event, hence the timeout fallback rather than waiting forever); or (b) `inFlightSince` is set and less than `INJECTION_GRACE_MS` (3s) old — set the instant an idle-time injection fires, cleared by `turn_start` (or the 3s fallback if `turn_start` never lands). Each drain that *does* proceed coalesces every pending envelope's `Injection` into exactly **one** `pi.sendUserMessage` call (`inject()`), steering (`deliverAs: "steer"`) if any part is `urgency: "high"`, else `deliverAs: "followUp"`. Retries for gated messages come from the watcher, `turn_end`, and the heartbeat — a hold delays delivery, never loses it.
+So `canInject()` returns `false` (and every drain call is a no-op — envelopes stay durably claimed-but-undelivered on disk, or simply undrained) while: (a) `compactingSince` is set and less than `COMPACTION_HOLD_MAX_MS` (180s) old — set by `session_before_compact`, cleared by `session_compact` (compaction failures emit no end event, hence the timeout fallback rather than waiting forever); or (b) `inFlightSince` is set and less than `INJECTION_GRACE_MS` (3s) old — set the instant an idle-time injection fires, cleared by `turn_start` (or the 3s fallback if `turn_start` never lands). Each drain that _does_ proceed coalesces every pending envelope's `Injection` into exactly **one** `pi.sendUserMessage` call (`inject()`), steering (`deliverAs: "steer"`) if any part is `urgency: "high"`, else `deliverAs: "followUp"`. Retries for gated messages come from the watcher, `turn_end`, and the heartbeat — a hold delays delivery, never loses it.
 
 ---
 
@@ -217,15 +217,15 @@ Journal generation throttling is client-private policy: the protocol only sees a
 
 Registered in three groups by `src/tools/index.ts` — five protocol tools (spec §14) plus two client-local on-hold controls:
 
-| Tool | File | What it does |
-| --- | --- | --- |
-| `thread_send` | `messaging.ts` | Send to one id / comma list / `*` / `role:<role>`; `expects`, `re`, `urgency`, `deliverAfterSeconds`, `deadlineSeconds`, and an optional `wait` that arms a barrier inline |
-| `thread_wait` | `messaging.ts` | Arm a standalone barrier over a set of envelope ids, with an optional `mode`, `deadlineSeconds`, and resolution `message` payload |
-| `thread_status` | `introspection.ts` | This thread's own id/role/state/status/barriers/obligations/owed + latest journal — the recovery path after a compaction |
-| `thread_list` | `introspection.ts` | Every known thread's summary (state/status/role/parent/load counts/lastSeen) |
-| `thread_journal` | `introspection.ts` | Read any thread's journal (including your own), with optional `tail`/`lookbackMinutes` filtering |
-| `thread_suspend` | `control.ts` | Enter On Hold (client-local, not protocol surface — §14/A.5); inbox queues until resume |
-| `thread_resume` | `control.ts` | Leave On Hold back to Open, draining the queued inbox |
+| Tool             | File               | What it does                                                                                                                                                               |
+| ---------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `thread_send`    | `messaging.ts`     | Send to one id / comma list / `*` / `role:<role>`; `expects`, `re`, `urgency`, `deliverAfterSeconds`, `deadlineSeconds`, and an optional `wait` that arms a barrier inline |
+| `thread_wait`    | `messaging.ts`     | Arm a standalone barrier over a set of envelope ids, with an optional `mode`, `deadlineSeconds`, and resolution `message` payload                                          |
+| `thread_status`  | `introspection.ts` | This thread's own id/role/state/status/barriers/obligations/owed + latest journal — the recovery path after a compaction                                                   |
+| `thread_list`    | `introspection.ts` | Every known thread's summary (state/status/role/parent/load counts/lastSeen)                                                                                               |
+| `thread_journal` | `introspection.ts` | Read any thread's journal (including your own), with optional `tail`/`lookbackMinutes` filtering                                                                           |
+| `thread_suspend` | `control.ts`       | Enter On Hold (client-local, not protocol surface — §14/A.5); inbox queues until resume                                                                                    |
+| `thread_resume`  | `control.ts`       | Leave On Hold back to Open, draining the queued inbox                                                                                                                      |
 
 `before_agent_start` (`lifecycle.ts`) injects `threadModelPrompt(store)` (`core/system-prompt.ts`) — the "Thread Communication Model" block explaining these tools, the pattern→call map, and the "Standing by" canary — appended to pi's own system prompt, only while the opt-in gate is active.
 
@@ -233,7 +233,7 @@ Registered in three groups by `src/tools/index.ts` — five protocol tools (spec
 
 ## The three external actors
 
-External actors speak the *same* `.thread/` local-fs store (Appendix B) and interoperate purely through it — atomic renames make claims mutually exclusive regardless of which actor wins the race.
+External actors speak the _same_ `.thread/` local-fs store (Appendix B) and interoperate purely through it — atomic renames make claims mutually exclusive regardless of which actor wins the race.
 
 - **`bin/thread-cli.mjs`** — zero-dependency CLI. `list`/`status`/`send`/`inbox`/`tail`/`watch`/`delete` read and write the same files the extension does. A human operator using it is a full **C1** protocol citizen (spec §2.2) without running pi at all. Operator sends default to `urgency: "high"` (a human steering a thread wants it seen at the next opening).
 

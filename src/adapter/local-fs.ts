@@ -33,7 +33,7 @@ function mailFileName(id: string): string {
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
 export const options = {
-  'base-dir': {
+  "base-dir": {
     type: "string",
     description:
       "(Storage: local) Base directory for local fs storage. Default: current working directory.",
@@ -41,7 +41,9 @@ export const options = {
   },
 } satisfies Record<string, PiFlagParam>;
 
-export function createAdapter({"base-dir": baseDir}: AdapterOptions<typeof options>): StorageAdapter & JournalAdapter {
+export function createAdapter({
+  "base-dir": baseDir,
+}: AdapterOptions<typeof options>): StorageAdapter & JournalAdapter {
   let root = "";
   const lastPruned = new Map<string, number>();
 
@@ -69,7 +71,9 @@ export function createAdapter({"base-dir": baseDir}: AdapterOptions<typeof optio
 
     async loadState(threadId: string): Promise<StateFile | undefined> {
       const f = statePath(threadId);
-      if (!fs.existsSync(f)) return undefined;
+      if (!fs.existsSync(f)) {
+        return undefined;
+      }
       try {
         return JSON.parse(fs.readFileSync(f, "utf8")) as StateFile;
       } catch (err) {
@@ -93,13 +97,17 @@ export function createAdapter({"base-dir": baseDir}: AdapterOptions<typeof optio
 
     async readJournal(threadId: string): Promise<string | undefined> {
       const f = journalPath(threadId);
-      if (!fs.existsSync(f)) return undefined;
+      if (!fs.existsSync(f)) {
+        return undefined;
+      }
       const content = fs.readFileSync(f, "utf8").trim();
       return content || undefined;
     },
 
     async listThreads(): Promise<ThreadSummary[]> {
-      if (!fs.existsSync(root)) return [];
+      if (!fs.existsSync(root)) {
+        return [];
+      }
       const ids = fs
         .readdirSync(root, { withFileTypes: true })
         .filter(d => d.isDirectory())
@@ -107,7 +115,9 @@ export function createAdapter({"base-dir": baseDir}: AdapterOptions<typeof optio
       const out: ThreadSummary[] = [];
       for (const id of ids) {
         const f = statePath(id);
-        if (!fs.existsSync(f)) continue;
+        if (!fs.existsSync(f)) {
+          continue;
+        }
         try {
           const s: StateFile = JSON.parse(fs.readFileSync(f, "utf8"));
           out.push(toSummary(s));
@@ -169,7 +179,9 @@ export function createAdapter({"base-dir": baseDir}: AdapterOptions<typeof optio
         }
         // Not due yet (§6 deliverAfter): stays queued; a later drain
         // (heartbeat, boot) picks it up once the instant passes.
-        if (msg.deliverAfter && new Date(msg.deliverAfter).getTime() > now) continue;
+        if (msg.deliverAfter && new Date(msg.deliverAfter).getTime() > now) {
+          continue;
+        }
         // Expired (Rev 10 §6 expiresAt): never delivered — claimed into
         // processed/ as audit trail without being returned.
         if (msg.expiresAt && new Date(msg.expiresAt).getTime() <= now) {

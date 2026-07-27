@@ -61,7 +61,6 @@ type Notify = { text: string; level?: string };
 // `details` shape is genuinely per-tool (mirrors the SDK's own TDetails =
 // unknown default) — one documented `any` here beats ad-hoc casts at every
 // call site below.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ToolResult = { content: { type: string; text: string }[]; details: any };
 type AnyTool = {
   execute: (
@@ -213,7 +212,9 @@ function seedEnvelope(
 
 function inboxFileCount(h: Harness, id: string): number {
   const dir = join(threadDirFor(h.dir, id), "inbox");
-  if (!existsSync(dir)) return 0;
+  if (!existsSync(dir)) {
+    return 0;
+  }
   return readdirSync(dir).filter(f => f.endsWith(".json")).length;
 }
 
@@ -941,7 +942,12 @@ describe("inbox: receive (correlation, §9)", () => {
   it("a reply+request discharges the pending wait AND records a new owed reply", async () => {
     const h = makeHarness(tmpDir);
     const [a] = await h.inbox.sendMany(["alice"], "do it", { expects: true });
-    const counter = seedEnvelope(h, "t1", { from: "alice", body: "which env?", re: a.id, expects: true });
+    const counter = seedEnvelope(h, "t1", {
+      from: "alice",
+      body: "which env?",
+      re: a.id,
+      expects: true,
+    });
     await h.inbox.drain(h.ctx);
     // Their counter-request discharged our obligation...
     assert.strictEqual(h.store.obligations.length, 0);
@@ -1340,7 +1346,7 @@ describe("lifecycle: silent-debtor nudge (§9.4)", () => {
     h.store.owed.push({ id, from, summary: "?", receivedAt: new Date().toISOString() });
   }
 
-  it("fires once on the first silent turn with an owed reply outstanding, soliciting the canary", async () => {
+  it("fires once on the first silent turn with an owed reply outstanding", async () => {
     const { h, ctx } = await activeHarness();
     owe(h);
     await h.fire("turn_start", ctx);
@@ -1348,7 +1354,7 @@ describe("lifecycle: silent-debtor nudge (§9.4)", () => {
     assert.strictEqual(h.sentMessages.length, 1);
     assert.strictEqual(h.sentMessages[0].customType, "thread-owed-reminder");
     assert.match(h.sentMessages[0].content, /boss \(re #boss\/q1\)/);
-    assert.match(h.sentMessages[0].content, /"Standing by"/);
+    assert.match(h.sentMessages[0].content, /Acknowledge and reply/);
     assert.match(h.sentMessages[0].content, /Pass the ball/);
   });
 
@@ -1486,12 +1492,7 @@ function baseState(id: string, overrides: Partial<StateFile> = {}): StateFile {
   };
 }
 
-function wireEnvelope(
-  from: string,
-  to: string,
-  body: string,
-  extra: Partial<Mail> = {},
-): Mail {
+function wireEnvelope(from: string, to: string, body: string, extra: Partial<Mail> = {}): Mail {
   return {
     id: mintMailId(from),
     from,

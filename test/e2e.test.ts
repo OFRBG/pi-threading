@@ -81,7 +81,9 @@ function runPi(
 
 function readState(dir: string, threadId: string) {
   const f = join(dir, ".thread", "threads", threadId, "state.json");
-  if (!existsSync(f)) return null;
+  if (!existsSync(f)) {
+    return null;
+  }
   return JSON.parse(readFileSync(f, "utf8"));
 }
 
@@ -92,7 +94,9 @@ function readJournal(dir: string, threadId: string): string {
 
 function inboxFiles(dir: string, threadId: string, sub: "" | "processed" = ""): string[] {
   const d = join(dir, ".thread", "threads", threadId, "inbox", sub);
-  if (!existsSync(d)) return [];
+  if (!existsSync(d)) {
+    return [];
+  }
   return readdirSync(d).filter(f => f.endsWith(".json"));
 }
 
