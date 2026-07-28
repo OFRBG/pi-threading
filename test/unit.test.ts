@@ -39,6 +39,12 @@ import { registerCommands } from "../src/commands/commands";
 import type { ThreadingContext, ThreadingState } from "../src/context";
 import { journalSignature, shouldJournal, JOURNAL_MIN_INTERVAL_MS } from "../src/journal";
 import { createAdapter } from "../src/adapter/local-fs";
+import { createAdapterFromClient } from "../src/adapter/redis";
+import RedisMock from "ioredis-mock";
+import type { Redis as RedisClient } from "ioredis";
+import { createAdapter as createHttpAdapter } from "../src/adapter/http";
+import { startServer } from "../src/adapter/http-server";
+import type { Server as HttpServer } from "node:http";
 import type { StorageAdapter } from "../src/adapter/types";
 import type { StateFile, Mail, ThreadSummary } from "../src/core/types";
 import { STALE_MS, PROCESSED_TTL_MS, CLIENT_CAPABILITIES, toSummary } from "../src/core/types";
@@ -1979,5 +1985,314 @@ describe("state: watcher idempotency", () => {
     assert.strictEqual(active, 0);
     store.stopWatcher();
     assert.strictEqual(active, 0);
+  });
+});
+
+/** Fresh ioredis-mock instance per test — no live Redis server, no network.
+ *  ioredis-mock implements EVAL (via the `fengari` Lua VM), sorted sets,
+ *  hashes, TTL and pub/sub well enough to exercise `redis.ts`'s Lua scripts
+ *  and wake-signal channel exactly as they'd run against a real server.
+ *  ioredis-mock instances constructed with the same (default) connection
+ *  options share one global in-memory store, so every fresh client is
+ *  flushed before use — otherwise state would leak across tests exactly as
+ *  it would across two real clients pointed at the same live server. */
+async function freshRedisClient(): Promise<RedisClient> {
+  const client = new RedisMock() as unknown as RedisClient;
+  await client.flushall();
+  return client;
+}
+
+describe("adapter: RedisAdapter (network-shared binding)", () => {
+  it("saveState/loadState round-trips through a single-key JSON value", async () => {
+    const adapter = createAdapterFromClient(await freshRedisClient());
+    await adapter.configure();
+    await adapter.saveState("a", baseState("a"));
+    const loaded = await adapter.loadState("a");
+    assert.strictEqual(loaded?.id, "a");
+  });
+
+  it("loadState returns undefined for an unknown thread", async () => {
+    const adapter = createAdapterFromClient(await freshRedisClient());
+    await adapter.configure();
+    assert.strictEqual(await adapter.loadState("ghost"), undefined);
+  });
+
+  it("threadExists reflects whether the state key is present", async () => {
+    const adapter = createAdapterFromClient(await freshRedisClient());
+    await adapter.configure();
+    assert.strictEqual(await adapter.threadExists("a"), false);
+    await adapter.saveState("a", baseState("a"));
+    assert.strictEqual(await adapter.threadExists("a"), true);
+  });
+
+  it("sendMail + receiveMail delivers everything exactly once, in FIFO ulid order", async () => {
+    const adapter = createAdapterFromClient(await freshRedisClient());
+    await adapter.configure();
+    await adapter.sendMail(wireEnvelope("alice", "bob", "first"));
+    await adapter.sendMail(wireEnvelope("alice", "bob", "second"));
+    const claimed = await adapter.receiveMail("bob");
+    assert.deepStrictEqual(
+      claimed.map(m => m.body),
+      ["first", "second"],
+    );
+    assert.deepStrictEqual(await adapter.receiveMail("bob"), []);
+  });
+
+  it("mail sent to a thread that never started is durably queued and drained on first receiveMail", async () => {
+    // The hard e2e invariant, exercised against the Redis binding directly:
+    // a message written before the target thread ever exists must survive
+    // and be delivered whole on that thread's first drain.
+    const client = await freshRedisClient();
+    const adapter = createAdapterFromClient(client);
+    await adapter.configure();
+    await adapter.sendMail(wireEnvelope("alice", "ghost-thread", "welcome"));
+    assert.strictEqual(await adapter.threadExists("ghost-thread"), false);
+    const claimed = await adapter.receiveMail("ghost-thread");
+    assert.strictEqual(claimed.length, 1);
+    assert.strictEqual(claimed[0].body, "welcome");
+  });
+
+  it("a retry with the same id overwrites its own entry — enqueue idempotence (§7.6)", async () => {
+    const adapter = createAdapterFromClient(await freshRedisClient());
+    await adapter.configure();
+    const msg = wireEnvelope("alice", "bob", "retry me");
+    await adapter.sendMail(msg);
+    await adapter.sendMail(msg);
+    const claimed = await adapter.receiveMail("bob");
+    assert.strictEqual(claimed.length, 1, "no duplicate delivery");
+  });
+
+  it("receiveMail holds deliverAfter envelopes until due, then delivers them (§6)", async () => {
+    const adapter = createAdapterFromClient(await freshRedisClient());
+    await adapter.configure();
+    await adapter.sendMail(
+      wireEnvelope("alice", "bob", "later", {
+        deliverAfter: new Date(Date.now() + 150).toISOString(),
+      }),
+    );
+    assert.deepStrictEqual(await adapter.receiveMail("bob"), [], "not due yet");
+    await new Promise(r => setTimeout(r, 200));
+    const claimed = await adapter.receiveMail("bob");
+    assert.strictEqual(claimed.length, 1);
+    assert.strictEqual(claimed[0].body, "later");
+  });
+
+  it("receiveMail claims but never returns expired mail (Rev 10 §6 expiresAt)", async () => {
+    const adapter = createAdapterFromClient(await freshRedisClient());
+    await adapter.configure();
+    await adapter.sendMail(
+      wireEnvelope("alice", "bob", "stale", {
+        expiresAt: new Date(Date.now() - 1000).toISOString(),
+      }),
+    );
+    const claimed = await adapter.receiveMail("bob");
+    assert.strictEqual(claimed.length, 0, "expired mail is discarded, not delivered");
+    assert.deepStrictEqual(await adapter.receiveMail("bob"), [], "and not redelivered either");
+  });
+
+  it("concurrent receiveMail calls never double-deliver the same envelope", async () => {
+    // Simulates two racing drain callers (e.g. the heartbeat and the
+    // watcher firing back-to-back) against the same thread's inbox.
+    const adapter = createAdapterFromClient(await freshRedisClient());
+    await adapter.configure();
+    for (let i = 0; i < 10; i++) {
+      await adapter.sendMail(wireEnvelope("alice", "bob", `msg-${i}`));
+    }
+    const [a, b] = await Promise.all([adapter.receiveMail("bob"), adapter.receiveMail("bob")]);
+    assert.strictEqual(a.length + b.length, 10);
+    const bodies = [...a, ...b].map(m => m.body).sort();
+    const expected = Array.from({ length: 10 }, (_, i) => `msg-${i}`).sort();
+    assert.deepStrictEqual(bodies, expected);
+  });
+
+  it("listThreads reports a thread stale past STALE_MS as stopped", async () => {
+    const adapter = createAdapterFromClient(await freshRedisClient());
+    await adapter.configure();
+    await adapter.saveState(
+      "ghost",
+      baseState("ghost", { lastSeen: new Date(Date.now() - STALE_MS - 1000).toISOString() }),
+    );
+    const threads = await adapter.listThreads();
+    assert.strictEqual(threads[0]?.status, "stopped");
+  });
+
+  it("appendJournal/readJournal round-trip an append-only stream", async () => {
+    const adapter = createAdapterFromClient(await freshRedisClient());
+    await adapter.configure();
+    assert.strictEqual(await adapter.readJournal("t1"), undefined);
+    await adapter.appendJournal("t1", "Working on: auth module\n");
+    await adapter.appendJournal("t1", "Done: wrote tests\n");
+    const content = await adapter.readJournal("t1");
+    assert.match(content ?? "", /Working on: auth module/);
+    assert.match(content ?? "", /Done: wrote tests/);
+  });
+
+  it("watchMail wakes on a live pub/sub signal when mail is sent to the watched thread", async () => {
+    const client = await freshRedisClient();
+    const adapter = createAdapterFromClient(client);
+    await adapter.configure();
+    let fired = false;
+    const dispose = adapter.watchMail("fresh", () => {
+      fired = true;
+    });
+    try {
+      await adapter.sendMail(wireEnvelope("other", "fresh", "hi"));
+      for (let i = 0; i < 40 && !fired; i++) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      assert.strictEqual(fired, true);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("watchMail's disposer stops delivering wake callbacks", async () => {
+    const client = await freshRedisClient();
+    const adapter = createAdapterFromClient(client);
+    await adapter.configure();
+    let fireCount = 0;
+    const dispose = adapter.watchMail("fresh2", () => {
+      fireCount++;
+    });
+    dispose();
+    await adapter.sendMail(wireEnvelope("other", "fresh2", "hi"));
+    await new Promise(r => setTimeout(r, 100));
+    assert.strictEqual(fireCount, 0);
+  });
+});
+
+describe("adapter: http (reference server, entirely in-process)", () => {
+  // The reference server (src/adapter/http-server.ts) is started here on an
+  // ephemeral port (`port: 0`) for every test in this block, and torn down
+  // afterward — no externally-running server is ever required, mirroring
+  // how `createFakeAdapter()` above exercises core logic without touching a
+  // filesystem at all.
+  let server: HttpServer;
+  let client: ReturnType<typeof createHttpAdapter>;
+
+  beforeEach(async () => {
+    const started = await startServer(0);
+    server = started.server;
+    client = createHttpAdapter({ "base-url": started.url });
+    await client.configure();
+  });
+
+  afterEach(() => {
+    server.close();
+  });
+
+  it("saveState/loadState round-trip; loadState is undefined for an unknown thread", async () => {
+    assert.strictEqual(await client.loadState("nope"), undefined);
+    const state = baseState("alice");
+    await client.saveState("alice", state);
+    assert.deepStrictEqual(await client.loadState("alice"), state);
+  });
+
+  it("threadExists / listThreads reflect saved state", async () => {
+    assert.strictEqual(await client.threadExists("alice"), false);
+    await client.saveState("alice", baseState("alice"));
+    assert.strictEqual(await client.threadExists("alice"), true);
+    const summaries = await client.listThreads();
+    assert.strictEqual(summaries.length, 1);
+    assert.strictEqual(summaries[0].id, "alice");
+  });
+
+  it("durable queue: mail sent before a thread ever starts is delivered on its first receiveMail", async () => {
+    const mail = wireEnvelope("boss", "alice", "welcome aboard");
+    await client.sendMail(mail);
+    // "alice" has never called configure/saveState on the server — the mail
+    // must still be sitting there durably (the e2e suite's send-before-start
+    // scenario).
+    const claimed = await client.receiveMail("alice");
+    assert.strictEqual(claimed.length, 1);
+    assert.strictEqual(claimed[0].id, mail.id);
+    assert.strictEqual(claimed[0].body, "welcome aboard");
+  });
+
+  it("deliver-once: a claimed envelope is never returned by a second receiveMail", async () => {
+    const mail = wireEnvelope("boss", "alice", "only once");
+    await client.sendMail(mail);
+    const first = await client.receiveMail("alice");
+    assert.strictEqual(first.length, 1);
+    const second = await client.receiveMail("alice");
+    assert.strictEqual(second.length, 0);
+  });
+
+  it("a retried sendMail with the same envelope id does not double-enqueue", async () => {
+    const mail = wireEnvelope("boss", "alice", "retry me");
+    await client.sendMail(mail);
+    await client.sendMail(mail); // same id — idempotent PUT retry
+    const claimed = await client.receiveMail("alice");
+    assert.strictEqual(claimed.length, 1);
+  });
+
+  it("FIFO by ULID: receiveMail returns envelopes in send order regardless of arrival order", async () => {
+    const a = wireEnvelope("boss", "alice", "first");
+    await new Promise(r => setTimeout(r, 2));
+    const b = wireEnvelope("boss", "alice", "second");
+    // Enqueue out of ULID order to prove the server sorts, not just echoes
+    // insertion order.
+    await client.sendMail(b);
+    await client.sendMail(a);
+    const claimed = await client.receiveMail("alice");
+    assert.deepStrictEqual(
+      claimed.map(m => m.body),
+      ["first", "second"],
+    );
+  });
+
+  it("a deliverAfter envelope stays queued until due", async () => {
+    const future = wireEnvelope("boss", "alice", "not yet", {
+      deliverAfter: new Date(Date.now() + 60_000).toISOString(),
+    });
+    await client.sendMail(future);
+    assert.strictEqual((await client.receiveMail("alice")).length, 0);
+  });
+
+  it("an expired envelope is claimed into the audit set but never returned", async () => {
+    const expired = wireEnvelope("boss", "alice", "too late", {
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    await client.sendMail(expired);
+    assert.strictEqual((await client.receiveMail("alice")).length, 0);
+  });
+
+  it("watchMail fires on live delivery — long-poll wakes the callback", async () => {
+    let fired = 0;
+    const unsubscribe = client.watchMail("alice", () => {
+      fired++;
+    });
+    try {
+      // Give the long-poll GET a moment to actually be in flight before
+      // sending, so this exercises the "wake an in-flight wait" path, not
+      // just the "mail already due" fast path.
+      await new Promise(r => setTimeout(r, 50));
+      await client.sendMail(wireEnvelope("boss", "alice", "wake up"));
+      await new Promise(r => setTimeout(r, 200));
+      assert.ok(fired >= 1, "watch callback must fire on new mail");
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("watchMail's unsubscribe stops further callbacks", async () => {
+    let fired = 0;
+    const unsubscribe = client.watchMail("bob", () => {
+      fired++;
+    });
+    await new Promise(r => setTimeout(r, 50));
+    unsubscribe();
+    await client.sendMail(wireEnvelope("boss", "bob", "too late"));
+    await new Promise(r => setTimeout(r, 200));
+    assert.strictEqual(fired, 0, "unsubscribed watch must not fire");
+  });
+
+  it("appendJournal/readJournal round-trip; readJournal is undefined for an unknown thread", async () => {
+    assert.strictEqual(await client.readJournal!("alice"), undefined);
+    await client.appendJournal!("alice", "entry one\n");
+    await client.appendJournal!("alice", "entry two\n");
+    const content = await client.readJournal!("alice");
+    assert.match(content!, /entry one/);
+    assert.match(content!, /entry two/);
   });
 });

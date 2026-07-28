@@ -31,6 +31,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerFlag("thread-storage", {
     type: "string",
     description: 'Storage backend: "local" (default)',
+    default: "local",
   });
 
   const state: ThreadingState = {

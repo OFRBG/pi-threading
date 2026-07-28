@@ -2,8 +2,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { StateFile, Mail, ThreadSummary } from "../core/types";
 import { PROCESSED_TTL_MS, toSummary } from "../core/types";
-import { ulid } from "../core/ids";
 import type { StorageAdapter, JournalAdapter, PiFlagParam, AdapterOptions } from "./types";
+import { isMailDue, isMailExpired, safeMailKey } from "./shared";
 
 function pruneProcessed(dir: string) {
   let files: string[];
@@ -24,10 +24,11 @@ function pruneProcessed(dir: string) {
   }
 }
 
+// Filename = the id's ULID tail (`safeMailKey`): unique per sender by
+// construction, and a retry with the same id overwrites its own file —
+// enqueue idempotence (§7.6) for free.
 function mailFileName(id: string): string {
-  const tail = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
-  const safe = tail.replace(/[^A-Za-z0-9._-]/g, "_");
-  return `${safe || ulid()}.json`;
+  return `${safeMailKey(id)}.json`;
 }
 
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
@@ -137,9 +138,6 @@ export function createAdapter({
       const staging = stagingDir(mail.to);
       fs.mkdirSync(dir, { recursive: true });
       fs.mkdirSync(staging, { recursive: true });
-      // Filename = the id's ULID tail: unique per sender by construction,
-      // and a retry with the same id overwrites its own file — enqueue
-      // idempotence (§7.6) for free.
       const fname = mailFileName(mail.id);
       const tmp = path.join(staging, fname);
       fs.writeFileSync(tmp, JSON.stringify(mail, null, 2));
@@ -179,12 +177,12 @@ export function createAdapter({
         }
         // Not due yet (§6 deliverAfter): stays queued; a later drain
         // (heartbeat, boot) picks it up once the instant passes.
-        if (msg.deliverAfter && new Date(msg.deliverAfter).getTime() > now) {
+        if (!isMailDue(msg, now)) {
           continue;
         }
         // Expired (Rev 10 §6 expiresAt): never delivered — claimed into
         // processed/ as audit trail without being returned.
-        if (msg.expiresAt && new Date(msg.expiresAt).getTime() <= now) {
+        if (isMailExpired(msg, now)) {
           try {
             fs.renameSync(full, path.join(processedDir, f));
           } catch {
