@@ -165,9 +165,9 @@ export function createStore(
       return store.adapter.readJournal?.(threadId);
     },
 
-    forkJournal(sessionFile: string) {
+    forkJournal(sessionFile: string, ctx: ExtensionContext) {
       const m = pi.getFlag("thread-journal-model");
-      void forkJournalEntry(store, sessionFile, typeof m === "string" && m ? m : undefined);
+      void forkJournalEntry(store, sessionFile, ctx, typeof m === "string" && m ? m : undefined);
     },
 
     startHeartbeat(onTick?: () => void | Promise<void>) {

@@ -1,8 +1,14 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  SessionManager,
+  DefaultResourceLoader,
+  SettingsManager,
+  createAgentSession,
+  getAgentDir,
+} from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawn } from "node:child_process";
 import type { ThreadStore } from "./core/types";
 
 /** Everything journal: the fork prompt, entry parsing, duplicate detection,
@@ -177,135 +183,129 @@ export function shouldJournal(
   return write;
 }
 
-/** How to re-invoke pi from inside a running pi process. `spawn("pi")`
- *  breaks on Windows — npm installs pi as a `pi.cmd` shim that spawn() can't
- *  execute (ENOENT) — and is fragile under version managers. Re-running
- *  exactly what started this process needs no PATH lookup at all:
- *  node-launched installs (npm, volta — including their Windows shims, which
- *  resolve to `node.exe <entry.js>` by the time this code runs) re-invoke
- *  `execPath entryScript`, standalone pi binaries re-invoke `execPath`
- *  directly. */
-function piSelfCommand(
-  args: string[],
-  execPath: string = process.execPath,
-  entryScript: string | undefined = process.argv[1],
-): { cmd: string; args: string[] } {
-  const exe = (execPath.split(/[\\/]/).pop() ?? "").toLowerCase();
-
-  if (exe.startsWith("node")) {
-    if (entryScript) {
-      return { cmd: execPath, args: [entryScript, ...args] };
-    }
-
-    return { cmd: "pi", args }; // no identifiable entry — PATH as a last resort
+/** Resolve the `thread-journal-model` flag (if set) to a concrete model, else
+ *  fall back to the session's current model. Parity with the old subprocess
+ *  fork, which inherited the forked session's model when no override was set —
+ *  a model that resolves on this machine by construction. */
+function resolveJournalModel(ctx: ExtensionContext, flag?: string): ExtensionContext["model"] {
+  if (!flag) {
+    return ctx.model;
   }
-
-  return { cmd: execPath, args }; // pi is a standalone executable
+  const found = ctx.modelRegistry
+    .getAll()
+    .find(m => m.id === flag || `${m.provider}/${m.id}` === flag);
+  if (!found) {
+    console.error(`[thread] journal model "${flag}" not found — using the session model instead.`);
+    return ctx.model;
+  }
+  return found;
 }
 
-/** Spawn args for the journal fork.
+/** Run one headless completion over a throwaway fork of the session,
+ *  in-process — no subprocess, so no executable discovery.
  *
- *  `--no-extensions` is load-bearing: when pi-threading is installed via
- *  extension discovery, a fork without it loads the extension too — and
- *  having no --thread-id, it mints a fresh identity, writes a ghost
- *  .thread/threads/thread-<uuid>/ into the shared workspace, and at its own
- *  turn_end forks yet another journal pi, chaining forever. The fork's only
- *  job is to summarize the session it was forked from; it must never become
- *  a thread.
- *
- *  No `--model` unless one is explicitly configured: the fork then inherits
- *  the forked session's own model, which resolves on any machine by
- *  construction. A hardcoded cheap model looks free until the extension runs
- *  on a machine whose provider can't serve it — then every fork dies before
- *  printing and the journal silently never exists. */
-function journalForkArgs(
+ *  `SessionManager.forkFrom` copies the full history into a temp session dir
+ *  (removed immediately after), so the completion never touches the live
+ *  session tree. `noExtensions` is the in-process equivalent of the old
+ *  `--no-extensions`: it stops the fork from re-loading pi-threading, which
+ *  would otherwise mint a ghost thread and recursively fork its own journal.
+ *  `noTools: "all"` leaves the model with nothing but the conversation — a
+ *  summarizer, not an agent. */
+async function runJournalCompletion(
   sessionFile: string,
-  sessionDir: string,
   prompt: string,
-  model?: string,
-): string[] {
-  return [
-    "--fork",
-    sessionFile,
-    "--session-dir",
-    sessionDir,
-    "--no-extensions",
-    ...(model ? ["--model", model] : []),
-    "--thinking",
-    "off",
-    "--print",
-    prompt,
-  ];
+  ctx: ExtensionContext,
+  model: ExtensionContext["model"],
+): Promise<string> {
+  const tmpSes = fs.mkdtempSync(path.join(os.tmpdir(), "pi-journal-"));
+  try {
+    const agentDir = getAgentDir();
+    const settingsManager = SettingsManager.create(ctx.cwd, agentDir);
+    const resourceLoader = new DefaultResourceLoader({
+      cwd: ctx.cwd,
+      agentDir,
+      settingsManager,
+      noExtensions: true,
+      noSkills: true,
+      noPromptTemplates: true,
+      noContextFiles: true,
+    });
+    await resourceLoader.reload();
+
+    const sessionManager = SessionManager.forkFrom(sessionFile, ctx.cwd, tmpSes);
+
+    const { session } = await createAgentSession({
+      cwd: ctx.cwd,
+      sessionManager,
+      settingsManager,
+      resourceLoader,
+      modelRegistry: ctx.modelRegistry,
+      model,
+      thinkingLevel: "off",
+      noTools: "all",
+    });
+
+    try {
+      await session.prompt(prompt);
+      return session.getLastAssistantText()?.trim() ?? "";
+    } finally {
+      session.dispose();
+    }
+  } finally {
+    fs.rmSync(tmpSes, { recursive: true, force: true });
+  }
 }
 
-/** Fork the session into a throwaway run that writes one journal entry.
- *  Fire-and-forget: runs in the background after turn_end/agent_end, the
- *  main thread never pauses on it. */
+/** Fork the session into a throwaway in-process run that writes one journal
+ *  entry. Fire-and-forget: kicked off after turn_end/agent_end, the main
+ *  thread never awaits it — so all failures are caught and logged here rather
+ *  than surfacing as an unhandled rejection in the host. */
 export async function forkJournalEntry(
   store: ThreadStore,
   sessionFile: string,
-  model?: string,
+  ctx: ExtensionContext,
+  modelFlag?: string,
 ): Promise<void> {
   if (!store.adapter.appendJournal) {
     return;
   }
 
-  // Read the prior entry up front so the fork can continue the narrative
-  // rather than summarize the session cold. Best-effort: a read failure just
-  // means the fork gets the base prompt (close-time dup detection still uses
-  // its own fresh read).
-  const previousEntry = lastJournalEntry(await store.adapter.readJournal?.(store.threadId));
+  try {
+    // Read the prior entry up front so the fork can continue the narrative
+    // rather than summarize the session cold.
+    const previousEntry = lastJournalEntry(await store.adapter.readJournal?.(store.threadId));
+    const model = resolveJournalModel(ctx, modelFlag);
 
-  let out = "";
-  let errOut = "";
-  const tmpSes = fs.mkdtempSync(path.join(os.tmpdir(), "pi-journal-"));
+    const entry = await runJournalCompletion(
+      sessionFile,
+      buildJournalPrompt(previousEntry),
+      ctx,
+      model,
+    );
 
-  const launch = piSelfCommand(
-    journalForkArgs(sessionFile, tmpSes, buildJournalPrompt(previousEntry), model),
-  );
+    if (!entry) {
+      // An empty completion must not fail silently — this is exactly how a
+      // misconfigured journal model reads as "journal.md just never appears".
+      console.error("[thread] journal fork produced no entry (empty completion).");
+      return;
+    }
 
-  const proc = spawn(launch.cmd, launch.args, { stdio: ["ignore", "pipe", "pipe"] });
+    // The fork judged the turn had nothing new to record and asked to skip —
+    // a deliberate no-op, distinct from the empty-output error above.
+    if (isSkip(entry)) {
+      return;
+    }
 
-  proc.on("error", err => {
-    console.error("[thread] journal fork failed to spawn:", err);
-    fs.rmSync(tmpSes, { recursive: true, force: true });
-  });
-  proc.stdout!.on("data", (d: Buffer) => {
-    out += d.toString();
-  });
-  proc.stderr!.on("data", (d: Buffer) => {
-    errOut += d.toString();
-  });
+    // Re-read at write time (not the up-front read): a concurrent fork may have
+    // appended since, and dedup must compare against the freshest last entry.
+    const existing = await store.adapter.readJournal?.(store.threadId);
+    if (isDuplicateOfLastEntry(existing, entry)) {
+      return;
+    }
 
-  proc.on("close", code => {
-    void (async () => {
-      fs.rmSync(tmpSes, { recursive: true, force: true });
-      const entry = out.trim();
-
-      if (!entry) {
-        // A fork that never produces an entry must not fail silently — this
-        // is exactly how a misconfigured journal model reads as "journal.md
-        // just never appears".
-        console.error(
-          `[thread] journal fork produced no entry (exit ${code})${errOut.trim() ? `: ${errOut.trim().slice(0, 300)}` : ""}`,
-        );
-        return;
-      }
-
-      // The fork judged the turn had nothing new to record and asked to skip
-      // — a deliberate no-op, distinct from the empty-output error above.
-      if (isSkip(entry)) {
-        return;
-      }
-
-      const existing = await store.adapter.readJournal?.(store.threadId);
-
-      if (isDuplicateOfLastEntry(existing, entry)) {
-        return;
-      }
-
-      const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
-      await store.adapter.appendJournal?.(store.threadId, `\n<!-- ${ts} -->\n${entry}\n`);
-    })();
-  });
+    const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
+    await store.adapter.appendJournal?.(store.threadId, `\n<!-- ${ts} -->\n${entry}\n`);
+  } catch (err) {
+    console.error("[thread] journal fork failed:", err instanceof Error ? err.message : err);
+  }
 }

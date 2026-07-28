@@ -25,7 +25,7 @@ export const agentEnd: ThreadingHookHandler<AgentEndEvent> = async (
     const sf = ctx.sessionManager.getSessionFile();
 
     if (sf) {
-      store.forkJournal(sf);
+      store.forkJournal(sf, ctx);
     }
   }
 

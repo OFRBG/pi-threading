@@ -148,7 +148,7 @@ export interface ThreadStore extends ThreadData {
   /** Undefined on backends without the JournalAdapter extension. */
   readJournal: (threadId: string) => Promise<string | undefined>;
   threadExists: (threadId: string) => Promise<boolean>;
-  forkJournal: (sessionFile: string) => void;
+  forkJournal: (sessionFile: string, ctx: ExtensionContext) => void;
   startHeartbeat: (onTick?: () => void | Promise<void>) => void;
   stopHeartbeat: () => void;
   startWatcher: (drain: (ctx: ExtensionContext) => void, ctx: ExtensionContext) => void;
