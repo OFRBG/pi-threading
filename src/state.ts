@@ -22,15 +22,21 @@ const KNOWN_STATES: readonly ThreadState[] = [
 
 export function createStore(
   pi: ExtensionAPI,
-  adapter: ThreadAdapter,
+  buildAdapter: () => ThreadAdapter,
   _: ThreadingState,
 ): ThreadStore {
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   let stopWatching: (() => void) | null = null;
+  let resolvedAdapter: ThreadAdapter | undefined;
 
   const store: ThreadStore = {
     // --- mutable data ---
-    adapter,
+
+    // Memoize
+    get adapter(): ThreadAdapter {
+      return (resolvedAdapter ??= buildAdapter());
+    },
+
     threadId: "",
     parent: null,
     role: null,

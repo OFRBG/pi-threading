@@ -45,7 +45,8 @@ import type { Redis as RedisClient } from "ioredis";
 import { createAdapter as createHttpAdapter } from "../src/adapter/http";
 import { startServer } from "../src/adapter/http-server";
 import type { Server as HttpServer } from "node:http";
-import type { StorageAdapter } from "../src/adapter/types";
+import { registerStorageFlags, resolveAdapter } from "../src/adapter/registry";
+import type { StorageAdapter, ThreadAdapter, PiFlagParam } from "../src/adapter/types";
 import type { StateFile, Mail, ThreadSummary } from "../src/core/types";
 import { STALE_MS, PROCESSED_TTL_MS, CLIENT_CAPABILITIES, toSummary } from "../src/core/types";
 import { ulid, mintMailId } from "../src/core/ids";
@@ -103,7 +104,7 @@ function makeHarness(dir: string, id = "t1") {
     inFlightSince: null,
     compactingSince: null,
   };
-  const store = createStore(stubPi, createAdapter({ "base-dir": dir }), state);
+  const store = createStore(stubPi, () => createAdapter({ "base-dir": dir }), state);
   // No internal `await` in LocalFsAdapter.configure — this synchronously
   // sets its root before the call returns, same reasoning as persist()
   // below, so the harness doesn't need to become async just for this.
@@ -299,7 +300,7 @@ function makeLifecycleHarness(dir: string) {
     inFlightSince: null,
     compactingSince: null,
   };
-  const store = createStore(stubPi, createAdapter({ "base-dir": dir }), state);
+  const store = createStore(stubPi, () => createAdapter({ "base-dir": dir }), state);
   const inbox = createInbox(stubPi, store, state);
   const threading: ThreadingContext = {
     pi: stubPi,
@@ -1706,13 +1707,13 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
     } as unknown as ExtensionCommandContext;
 
     const senderState = freshState();
-    const sender = createStore(stubPi, fake, senderState);
+    const sender = createStore(stubPi, () => fake, senderState);
     sender.threadId = "sender";
     await sender.persist();
     const senderInbox = createInbox(stubPi, sender, senderState);
 
     const receiverState = freshState();
-    const receiver = createStore(stubPi, fake, receiverState);
+    const receiver = createStore(stubPi, () => fake, receiverState);
     receiver.threadId = "receiver";
     await receiver.persist();
     const receiverInbox = createInbox(stubPi, receiver, receiverState);
@@ -1728,7 +1729,7 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
   it("transition persists through adapter.saveState, not raw fs", async () => {
     const fake = createFakeAdapter();
     const stubPi = stubPiWith([]);
-    const store = createStore(stubPi, fake, freshState());
+    const store = createStore(stubPi, () => fake, freshState());
     store.threadId = "solo";
     await store.transition("open");
     const loaded = await fake.loadState("solo");
@@ -1738,7 +1739,7 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
   it("readJournal degrades to undefined on a backend without the JournalAdapter extension", async () => {
     const fake = createFakeAdapter();
     const stubPi = stubPiWith([]);
-    const store = createStore(stubPi, fake, freshState());
+    const store = createStore(stubPi, () => fake, freshState());
     store.threadId = "solo";
     assert.strictEqual(await store.readJournal("solo"), undefined);
   });
@@ -1754,7 +1755,7 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
       registerCommand: () => {},
     } as unknown as ExtensionAPI;
     const state = freshState();
-    const store = createStore(stubPi, fake, state);
+    const store = createStore(stubPi, () => fake, state);
     store.threadId = "solo";
     await store.persist();
     const inbox = createInbox(stubPi, store, state);
@@ -1904,7 +1905,7 @@ describe("state: restore rules (§11.2)", () => {
       compactingSince: null,
     });
 
-    const storeA = createStore(stubPi, createAdapter({ "base-dir": tmpDir }), freshState());
+    const storeA = createStore(stubPi, () => createAdapter({ "base-dir": tmpDir }), freshState());
     await storeA.init(mkCtx());
     assert.strictEqual(storeA.state, "idle");
 
@@ -1912,7 +1913,7 @@ describe("state: restore rules (§11.2)", () => {
       ...stubPi,
       getFlag: (name: string) => (name === "thread-id" ? "b" : undefined),
     } as unknown as ExtensionAPI;
-    const storeB = createStore(stubPiB, createAdapter({ "base-dir": tmpDir }), freshState());
+    const storeB = createStore(stubPiB, () => createAdapter({ "base-dir": tmpDir }), freshState());
     await storeB.init(mkCtx());
     assert.strictEqual(storeB.state, "open");
   });
@@ -1938,7 +1939,7 @@ describe("state: restore rules (§11.2)", () => {
       getFlag: (name: string) => (name === "thread-id" ? "a" : undefined),
       appendEntry: () => {},
     } as unknown as ExtensionAPI;
-    const store = createStore(stubPi, createAdapter({ "base-dir": tmpDir }), {
+    const store = createStore(stubPi, () => createAdapter({ "base-dir": tmpDir }), {
       active: true,
       toolUsedThisTurn: false,
       inFlightSince: null,
@@ -1970,7 +1971,7 @@ describe("state: watcher idempotency", () => {
       registerTool: () => {},
       registerCommand: () => {},
     } as unknown as ExtensionAPI;
-    const store = createStore(stubPi, counting, {
+    const store = createStore(stubPi, () => counting, {
       active: true,
       toolUsedThisTurn: false,
       inFlightSince: null,
@@ -2294,5 +2295,142 @@ describe("adapter: http (reference server, entirely in-process)", () => {
     const content = await client.readJournal!("alice");
     assert.match(content!, /entry one/);
     assert.match(content!, /entry two/);
+  });
+});
+
+describe("adapter registry: multi-backend flag registration + resolution", () => {
+  // registerAdapter()'s registerFlag calls used to happen inside the
+  // *selected* backend's own build() — but pi validates `--thread-storage-*`
+  // CLI args against the registered flag set before the extension's init can
+  // read `--thread-storage` to know which backend was even selected. That
+  // ordering bug meant only "local"'s flags (the default) ever got
+  // registered, so `--thread-storage redis --thread-storage-connection-string
+  // …` failed with "Unknown option" — every other backend's connection flag
+  // was never registered at all.
+  function makeRegistryStubPi(flags: Record<string, string | boolean | undefined>) {
+    const registered: Record<string, PiFlagParam> = {};
+    const pi = {
+      registerFlag: (name: string, param: PiFlagParam) => {
+        registered[name] = param;
+      },
+      getFlag: (name: string) => flags[name],
+    } as unknown as ExtensionAPI;
+    return { pi, registered };
+  }
+
+  it("registers every backend's connection flags upfront, regardless of which backend is selected", () => {
+    const { pi, registered } = makeRegistryStubPi({ "thread-storage": "redis" });
+    registerStorageFlags(pi);
+    // "local" is not selected here, but its flag must still be registered —
+    // otherwise `--thread-storage-base-dir` would be rejected as unknown on
+    // any run that happens to pick "local" (the default), and likewise for
+    // every other backend on every other selection.
+    assert.ok("thread-storage-base-dir" in registered, "local's base-dir flag");
+    assert.ok(
+      "thread-storage-connection-string" in registered,
+      "redis/mongo's connection-string flag",
+    );
+    assert.ok("thread-storage-database" in registered, "mongo's database flag");
+    assert.ok("thread-storage-base-url" in registered, "http's base-url flag");
+  });
+
+  it("a flag name shared by two backends with differing defaults is registered without either backend's default leaking to the other", () => {
+    const { pi, registered } = makeRegistryStubPi({});
+    registerStorageFlags(pi);
+    // redis and mongo both declare "connection-string" with different
+    // defaults (redis://... vs mongodb://...) — the merged registration must
+    // drop the default entirely rather than silently picking one backend's.
+    assert.strictEqual(registered["thread-storage-connection-string"].default, undefined);
+  });
+
+  it("resolveAdapter() builds the backend named by --thread-storage", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-thread-registry-"));
+    const { pi } = makeRegistryStubPi({
+      "thread-storage": "local",
+      "thread-storage-base-dir": dir,
+    });
+    registerStorageFlags(pi);
+    const adapter = resolveAdapter(pi);
+    await adapter.configure();
+    await adapter.saveState("t1", baseState("t1"));
+    const loaded = await adapter.loadState("t1");
+    assert.strictEqual(loaded?.id, "t1");
+  });
+
+  it("throws a clear error for an unknown --thread-storage value", () => {
+    const { pi } = makeRegistryStubPi({ "thread-storage": "carrier-pigeon" });
+    registerStorageFlags(pi);
+    assert.throws(() => resolveAdapter(pi), /Unknown --thread-storage "carrier-pigeon"/);
+  });
+});
+
+describe("state: adapter resolution is deferred to store.init(), not construction", () => {
+  // Regression coverage for the timing bug this replaced: pi.getFlag values
+  // aren't populated until AFTER the extension's synchronous top-level init
+  // returns, so building the adapter eagerly at createStore() construction
+  // time would always read `--thread-storage` as undefined. createStore
+  // instead takes a *thunk*; store.adapter resolves (and memoizes) it lazily,
+  // matching how threadId/role/parent are only ever read inside init() too.
+  function makeStubPi(flags: Record<string, string | boolean | undefined>): ExtensionAPI {
+    return {
+      registerFlag: () => {},
+      getFlag: (name: string) => flags[name],
+    } as unknown as ExtensionAPI;
+  }
+
+  it("does not call the adapter builder until store.adapter is actually accessed", () => {
+    let calls = 0;
+    const pi = makeStubPi({});
+    createStore(
+      pi,
+      () => {
+        calls++;
+        return {} as ThreadAdapter;
+      },
+      {} as ThreadingState,
+    );
+    assert.strictEqual(calls, 0, "builder must not run just from createStore()");
+  });
+
+  it("resolves the adapter exactly once even across repeated access (memoized)", () => {
+    let calls = 0;
+    const pi = makeStubPi({});
+    const store = createStore(
+      pi,
+      () => {
+        calls++;
+        return {} as ThreadAdapter;
+      },
+      {} as ThreadingState,
+    );
+    void store.adapter;
+    void store.adapter;
+    void store.adapter;
+    assert.strictEqual(calls, 1);
+  });
+
+  it("end-to-end: store.init() resolves --thread-storage after flags are populated, and JournalAdapter methods pass through untouched", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-thread-registry-e2e-"));
+    const pi = makeStubPi({
+      "thread-id": "t1",
+      "thread-storage": "local",
+      "thread-storage-base-dir": dir,
+    });
+    registerStorageFlags(pi);
+    const store = createStore(pi, () => resolveAdapter(pi), {} as ThreadingState);
+    await store.init({
+      sessionManager: { getSessionFile: () => undefined },
+      ui: { setStatus: () => {} },
+    } as unknown as ExtensionContext);
+    // journal.ts and introspection.ts gate on *presence*
+    // (`if (!store.adapter.appendJournal) return;`), not just optional
+    // chaining — a hand-built forwarding wrapper could pass every other check
+    // here while still silently dropping these two. Since store.adapter is
+    // now the real backend object itself (no synthetic wrapper in between),
+    // there's nothing to keep in sync with it.
+    assert.strictEqual(typeof store.adapter.appendJournal, "function");
+    assert.strictEqual(typeof store.adapter.readJournal, "function");
+    await store.adapter.appendJournal!("t1", "hello journal");
+    assert.match((await store.adapter.readJournal!("t1"))!, /hello journal/);
   });
 });

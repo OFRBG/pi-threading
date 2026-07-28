@@ -4,7 +4,7 @@ import { createInbox } from "./inbox";
 import { registerLifecycle } from "./lifecycle/lifecycle";
 import { registerTools } from "./tools/index";
 import { registerCommands } from "./commands/commands";
-import { createAdapter } from "./adapter/registry";
+import { registerStorageFlags, resolveAdapter } from "./adapter/registry";
 import type { ThreadingContext, ThreadingState } from "./context";
 
 export default function (pi: ExtensionAPI) {
@@ -34,6 +34,9 @@ export default function (pi: ExtensionAPI) {
     default: "local",
   });
 
+  // Register all flogs
+  registerStorageFlags(pi);
+
   const state: ThreadingState = {
     active: undefined,
     toolUsedThisTurn: false,
@@ -41,8 +44,7 @@ export default function (pi: ExtensionAPI) {
     compactingSince: null,
   };
 
-  const adapter = createAdapter(pi, state);
-  const store = createStore(pi, adapter, state);
+  const store = createStore(pi, () => resolveAdapter(pi), state);
   const inbox = createInbox(pi, store, state);
 
   const threading: ThreadingContext = {

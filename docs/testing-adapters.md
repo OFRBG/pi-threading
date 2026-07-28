@@ -8,12 +8,12 @@ real server.
 
 ## At a glance
 
-| Backend  | `--thread-storage` | Tests live in                     | Offline test mechanism                          |
-| -------- | ------------------ | --------------------------------- | ----------------------------------------------- |
-| local-fs | `local` (default)  | `test/unit.test.ts`               | real `fs` in a temp `base-dir`                  |
-| redis    | `redis`            | `test/unit.test.ts`               | `ioredis-mock` (in-memory), injected via a seam |
-| mongo    | `mongo`            | `test/mongo-adapter.test.ts`      | `mongodb-memory-server` (spawns a local `mongod`) |
-| http     | `http`             | `test/unit.test.ts`               | reference server started in-process, ephemeral port |
+| Backend  | `--thread-storage` | Tests live in                | Offline test mechanism                              |
+| -------- | ------------------ | ---------------------------- | --------------------------------------------------- |
+| local-fs | `local` (default)  | `test/unit.test.ts`          | real `fs` in a temp `base-dir`                      |
+| redis    | `redis`            | `test/unit.test.ts`          | `ioredis-mock` (in-memory), injected via a seam     |
+| mongo    | `mongo`            | `test/mongo-adapter.test.ts` | `mongodb-memory-server` (spawns a local `mongod`)   |
+| http     | `http`             | `test/unit.test.ts`          | reference server started in-process, ephemeral port |
 
 ## Run the tests
 
@@ -40,7 +40,7 @@ Every backend is covered for the same invariants: state round-trip, `listThreads
 - **redis** — uses `ioredis-mock`, injected through the `createAdapterFromClient()`
   seam, so the real Lua claim scripts run with zero network. No `REDIS_URL` needed.
 - **mongo** — `mongodb-memory-server` downloads a `mongod` binary on **first run**
-  (needs network once; cached afterwards). It's a *standalone* server, so the tests
+  (needs network once; cached afterwards). It's a _standalone_ server, so the tests
   exercise the **polling** `watchMail` path — the change-stream path only runs
   against a replica set (see below).
 - **http** — the reference server (`src/adapter/http-server.ts`) is started with
