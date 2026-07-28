@@ -239,7 +239,6 @@ async function runJournalCompletion(
       sessionManager,
       settingsManager,
       resourceLoader,
-      modelRegistry: ctx.modelRegistry,
       model,
       thinkingLevel: "off",
       noTools: "all",
