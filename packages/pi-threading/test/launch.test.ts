@@ -159,6 +159,17 @@ describe("core/launch", () => {
       const resolved = renderThread(config.threads[0], config, dir);
       assert.deepEqual(resolved.prompts, ["Unknown: ${nope}"]);
     });
+
+    it("treats a prompt piece that names an existing directory as a literal string, not a read target", () => {
+      mkdirSync(join(dir, "briefs"), { recursive: true });
+      const config: TeamConfig = {
+        threads: [{ id: "a-dev-1", systemPrompt: ["briefs"] }],
+      };
+      // Must not throw (EISDIR) — "briefs" resolves to a real directory
+      // relative to `dir`, but isn't a file, so it's kept as literal text.
+      const resolved = renderThread(config.threads[0], config, dir);
+      assert.deepEqual(resolved.prompts, ["briefs"]);
+    });
   });
 
   describe("buildChildArgv", () => {
@@ -411,6 +422,24 @@ describe("core/launch", () => {
         fakeDeps({ onSpawnBackground: r => spawned.push(r) }),
       );
       assert.deepEqual(spawned[0].prompts, ["Investigate the mobile login timeout."]);
+    });
+
+    it("doesn't crash when a one-word prompt happens to name a real directory in cwd", async () => {
+      mkdirSync(join(dir, "src"), { recursive: true });
+      const cwdBefore = process.cwd();
+      process.chdir(dir);
+      try {
+        const spawned: ResolvedThread[] = [];
+        const outcome = await spawnThread(
+          fakeStore("coordinator"),
+          { id: "a-dev-1", prompt: "src" },
+          fakeDeps({ onSpawnBackground: r => spawned.push(r) }),
+        );
+        assert.equal(outcome.ok, true);
+        assert.deepEqual(spawned[0].prompts, ["src"]);
+      } finally {
+        process.chdir(cwdBefore);
+      }
     });
 
     it("falls back to background when tmux mode is requested but unavailable", async () => {

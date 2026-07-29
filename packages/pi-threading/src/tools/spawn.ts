@@ -113,15 +113,20 @@ export function registerSpawnTools(pi: ExtensionAPI, store: ThreadStore, inbox: 
       ),
     }),
     async execute(_id, params) {
-      const outcome = await spawnThread(store, {
-        id: params.id,
-        role: params.role,
-        parent: params.parent,
-        model: params.model,
-        provider: params.provider,
-        prompt: params.prompt,
-        mode: params.mode as LaunchMode | undefined,
-      });
+      let outcome;
+      try {
+        outcome = await spawnThread(store, {
+          id: params.id,
+          role: params.role,
+          parent: params.parent,
+          model: params.model,
+          provider: params.provider,
+          prompt: params.prompt,
+          mode: params.mode as LaunchMode | undefined,
+        });
+      } catch (e) {
+        return err(`${params.id}: ${e instanceof Error ? e.message : String(e)}`);
+      }
 
       if (!outcome.ok) {
         return err(`${outcome.id}: ${outcome.message}`);

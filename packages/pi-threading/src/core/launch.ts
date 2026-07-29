@@ -111,6 +111,20 @@ function substitute(text: string, values: Record<string, string>): string {
   );
 }
 
+/** True when `candidate` exists and is a regular file — not a directory.
+ *  `renderThread`'s file-or-literal check needs this rather than a bare
+ *  `existsSync`: a `systemPrompt` piece that happens to name a real
+ *  directory (e.g. a one-word ad hoc prompt like "src" or "docs") would
+ *  otherwise pass the existence check and then blow up `readFileSync` with
+ *  an uncaught `EISDIR`. */
+function isExistingFile(candidate: string): boolean {
+  try {
+    return fs.statSync(candidate).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /** Merge `defaults` under a thread's own fields, compute its teammates
  *  (explicit override, else every other thread in the config sharing this
  *  thread's resolved parent), and render its system-prompt pieces: each
@@ -144,7 +158,7 @@ export function renderThread(
 
   const prompts = (thread.systemPrompt ?? []).map(piece => {
     const candidate = path.resolve(configDir, piece);
-    const content = fs.existsSync(candidate) ? fs.readFileSync(candidate, "utf8") : piece;
+    const content = isExistingFile(candidate) ? fs.readFileSync(candidate, "utf8") : piece;
     return substitute(content, values).trim();
   });
 

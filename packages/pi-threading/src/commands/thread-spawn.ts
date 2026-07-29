@@ -41,17 +41,20 @@ export const threadSpawn: CommandDefinition = {
       return;
     }
 
-    const outcome = await spawnThread(store, {
-      id,
-      role: flags.role,
-      parent: flags.parent,
-      model: flags.model,
-      provider: flags.provider,
-      journalModel: flags["journal-model"],
-      mode: flags.mode as LaunchMode | undefined,
-      prompt: prompt || undefined,
-    });
-
-    ctx.ui.notify(`${outcome.id}: ${outcome.message}`, outcome.ok ? "info" : "warning");
+    try {
+      const outcome = await spawnThread(store, {
+        id,
+        role: flags.role,
+        parent: flags.parent,
+        model: flags.model,
+        provider: flags.provider,
+        journalModel: flags["journal-model"],
+        mode: flags.mode as LaunchMode | undefined,
+        prompt: prompt || undefined,
+      });
+      ctx.ui.notify(`${outcome.id}: ${outcome.message}`, outcome.ok ? "info" : "warning");
+    } catch (e) {
+      ctx.ui.notify(`${id}: ${e instanceof Error ? e.message : String(e)}`, "error");
+    }
   },
 };
