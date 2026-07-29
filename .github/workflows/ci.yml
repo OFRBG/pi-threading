@@ -19,5 +19,6 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter pi-threading exec tsc --noEmit
+      - run: pnpm --filter ./packages/pi-top exec tsc --noEmit
       - run: pnpm run lint
       - run: pnpm run test:unit

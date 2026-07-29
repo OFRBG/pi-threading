@@ -1,0 +1,43 @@
+{
+  "name": "@pi-threading/top",
+  "version": "0.1.0",
+  "description": "htop-style TUI dashboard for pi-threading multi-agent systems — live thread monitoring, obligations, and message flow. Supports local-fs, Redis, MongoDB, and HTTP backends.",
+  "keywords": [
+    "pi-threading",
+    "tui",
+    "dashboard",
+    "multi-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OFRBG/pi-threading.git",
+    "directory": "packages/pi-top"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "type": "module",
+  "bin": {
+    "pi-top": "./bin/pi-top.mjs"
+  },
+  "dependencies": {
+    "blessed": "^0.1.81"
+  },
+  "optionalDependencies": {
+    "ioredis": "*",
+    "mongodb": "*"
+  },
+  "devDependencies": {
+    "@types/blessed": "^0.1.27"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx watch bin/pi-top.mjs",
+    "lint": "oxlint bin src",
+    "lint:fix": "oxlint bin src --fix"
+  }
+}

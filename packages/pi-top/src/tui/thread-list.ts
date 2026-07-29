@@ -2,7 +2,7 @@
 
 import blessed from "blessed";
 import type { Widgets } from "blessed";
-import type { ThreadSummary, ThreadState } from "../types";
+import type { ThreadSummary } from "../types";
 import { STATE_COLORS, STATE_DOTS, STALE_MS } from "../types";
 
 export interface ThreadListCallbacks {
@@ -97,9 +97,7 @@ export class ThreadList {
     const stateLabel = t.state.padEnd(8);
     const relTime = this.relativeTime(t.lastSeen);
 
-    const stale =
-      t.status === "running" &&
-      Date.now() - new Date(t.lastSeen).getTime() > STALE_MS;
+    const stale = t.status === "running" && Date.now() - new Date(t.lastSeen).getTime() > STALE_MS;
 
     const statusMark = stale ? " ⚠" : "";
 
@@ -164,14 +162,24 @@ export class ThreadList {
   }
 
   private relativeTime(iso: string): string {
-    if (!iso) return "-";
+    if (!iso) {
+      return "-";
+    }
     const ms = Date.now() - new Date(iso).getTime();
-    if (Number.isNaN(ms)) return "-";
-    if (ms < 0) return "0s";
+    if (Number.isNaN(ms)) {
+      return "-";
+    }
+    if (ms < 0) {
+      return "0s";
+    }
     const s = Math.floor(ms / 1000);
-    if (s < 60) return `${s}s`;
+    if (s < 60) {
+      return `${s}s`;
+    }
     const m = Math.floor(s / 60);
-    if (m < 60) return `${m}m`;
+    if (m < 60) {
+      return `${m}m`;
+    }
     const h = Math.floor(m / 60);
     return `${h}h`;
   }

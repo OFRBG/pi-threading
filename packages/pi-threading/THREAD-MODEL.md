@@ -40,7 +40,7 @@ test/
   e2e.test.ts              real pi processes, real (cheap) model calls
 .github/workflows/
   ci.yml                 typecheck + lint + unit, on push/PR (free)
-  release.yml             on v* tags: same free checks, then publish (paid CI minutes only)
+  release.yml             on <folder>@<version> tags: same free checks, then publish that one package (paid CI minutes only)
 ```
 
 **Why `pi-threading-cli`'s `bin/thread-cli.mjs` duplicates ledger logic instead of importing `src/`:** it is a deliberately zero-dependency, single-file Node script — no `npm install`, no TypeScript build step, so it can be dropped onto any machine and just run. It now lives in its own package, `packages/pi-threading-cli/`, published independently of the extension — a further consequence of that zero-dependency design, since it never needed the extension's dependencies (`@earendil-works/pi-coding-agent`, `typebox`, TS build tooling) in the first place. It cannot `import` from the extension's `src/`; it reimplements the pieces of the Appendix B binding and the §9 ledger discharge rule it needs, directly against `fs`, with comments pointing back at the `src/` files it mirrors. This is a conscious duplication tradeoff, not an oversight — see the Known Limitations entry on `thread-cli.mjs` for the corollary (it only ever sees the `local` backend).
@@ -266,7 +266,7 @@ Implemented as a pi coding-agent extension. pi's `ExtensionAPI` provides no nati
 
 **CI** (`.github/workflows/ci.yml`) runs on every push to `main` and every PR: `tsc --noEmit`, lint, `test:unit` — all free, no model spend.
 
-**Release** (`.github/workflows/release.yml`) triggers on `v*` tags (or manual dispatch): re-runs the same free checks, verifies the tag matches both packages' `package.json` `version` fields, then publishes each of `packages/pi-threading` and `packages/pi-threading-cli` twice — unscoped (`pi-threading`, `pi-threading-cli`) to npmjs via OIDC trusted publishing (no stored token; requires npm ≥ 11.5.1 and, for each package, a one-time npmjs.com Trusted Publisher setup pointing at this workflow), and `@ofrbg/*`-scoped (patched in at publish time via `npm pkg set name=...`) to the GitHub npm registry using the built-in `GITHUB_TOKEN`. Each package's checked-in `name` is unscoped — the `@ofrbg` scope only exists as the GitHub-registry mirror's name, applied in CI, never committed.
+**Release** (`.github/workflows/release.yml`) triggers on a per-package tag `<folder>@<version>` (e.g. `pi-top@0.1.0`) or manual dispatch with a `package` input: re-runs the same free checks, verifies the tag's version matches that one package's own `package.json`, then publishes it twice — under its own checked-in name to npmjs via OIDC trusted publishing (no stored token; requires npm ≥ 11.5.1 and, for each package, a one-time npmjs.com Trusted Publisher setup pointing at this workflow), and `@ofrbg/<folder>`-scoped (patched in at publish time via `npm pkg set name=...`) to the GitHub npm registry using the built-in `GITHUB_TOKEN`. Package identity on npmjs varies by package: `pi-threading` stays unscoped (it's the established `pi install npm:pi-threading` target); `pi-threading-cli` and `pi-top` publish under the `@pi-threading` org scope, as `@pi-threading/cli` and `@pi-threading/top` — independent of the `@ofrbg` GitHub-registry mirror scope, which is always derived from the folder name and only ever applied in CI, never committed.
 
 ---
 

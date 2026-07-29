@@ -1,27 +1,39 @@
-# Publish on every v* tag: each of `packages/pi-threading` and
-# `packages/pi-threading-cli` gets published unscoped to npmjs (primary —
-# anonymous installs) and `@ofrbg/*`-scoped to the GitHub npm registry
-# (mirror). Only the free suites run here (unit + MCP + typecheck + lint) —
-# the e2e suites need a model API key and real spend, so they stay
-# local/manual.
+# Publish on a per-package tag `<folder>@<version>` (e.g. `pi-threading@0.8.0`,
+# `pi-threading-cli@0.8.0`, `pi-top@0.1.0`) — `<folder>` names the directory
+# under `packages/`, not necessarily the published npm name (pi-threading-cli
+# and pi-top publish scoped, as `@pi-threading/cli` / `@pi-threading/top`;
+# pi-threading itself stays unscoped — see each package.json's own `name`).
+# Each tag publishes exactly the one named package, to npmjs (primary —
+# anonymous installs) under its own checked-in name, and to the GitHub npm
+# registry under `@ofrbg/<folder>` (mirror; GitHub Packages requires the
+# scope to match the repo owner, independent of the npmjs name/scope).
+# `workflow_dispatch` takes a `package` input for a manual run instead of a
+# tag. Only the free suites run here (unit + typecheck + lint) — the e2e
+# suites need a model API key and real spend, so they stay local/manual.
 #
 # The npmjs publish uses trusted publishing (OIDC) — no token secret, no
 # OTP, works with 2FA-for-writes enabled. One-time setup on npmjs.com, PER
 # PACKAGE: package settings → Trusted Publisher → GitHub Actions → owner
 # OFRBG, repo pi-threading, workflow release.yml. Each package must exist on
 # npmjs first (initial version published manually) before its Trusted
-# Publisher can be configured — `pi-threading-cli` needs this one-time
-# manual bootstrap the first time this workflow runs for it. Requires npm >=
-# 11.5.1, hence the npm upgrade step. The GitHub publish uses the built-in
-# GITHUB_TOKEN; GH-registry consumers need a read:packages PAT:
+# Publisher can be configured — pi-threading-cli and pi-top both need this
+# one-time manual bootstrap the first time this workflow runs for them
+# (scoped packages additionally need the `pi-threading` npm org to exist
+# first). Requires npm >= 11.5.1, hence the npm upgrade step. The GitHub
+# publish uses the built-in GITHUB_TOKEN; GH-registry consumers need a
+# read:packages PAT:
 #   @ofrbg:registry=https://npm.pkg.github.com
 #   //npm.pkg.github.com/:_authToken=<token>
 name: release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["*@*"]
   workflow_dispatch:
+    inputs:
+      package:
+        description: "Package folder under packages/ to publish (e.g. pi-top)"
+        required: true
 
 permissions:
   contents: read
@@ -31,9 +43,6 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        package: [pi-threading, pi-threading-cli]
     steps:
       - uses: actions/checkout@v4
 
@@ -45,34 +54,54 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - run: pnpm --filter pi-threading exec tsc --noEmit
+      - name: Resolve package name/version
+        id: pkg
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+            name="${tag%@*}"
+            version="${tag##*@}"
+          else
+            name="${{ inputs.package }}"
+            version="$(node -p "require('./packages/$name/package.json').version")"
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Refuse to publish a folder that doesn't exist, or a tag whose
+      # version disagrees with that folder's own package.json.
+      - name: Verify package and version
+        run: |
+          dir="packages/${{ steps.pkg.outputs.name }}"
+          test -d "$dir" || { echo "no such package: $dir" >&2; exit 1; }
+          pkg_version="$(node -p "require('./$dir/package.json').version")"
+          if [ "$pkg_version" != "${{ steps.pkg.outputs.version }}" ]; then
+            echo "$dir/package.json is $pkg_version but requested version is ${{ steps.pkg.outputs.version }}" >&2
+            exit 1
+          fi
+
       - run: pnpm run lint
       - run: pnpm run test:unit
 
-      # Refuse to publish a tag that disagrees with this package's version.
-      - name: Check tag matches package version
-        if: github.ref_type == 'tag'
-        working-directory: packages/${{ matrix.package }}
+      - name: Typecheck (TypeScript packages only)
         run: |
-          pkg="$(node -p "require('./package.json').version")"
-          tag="${GITHUB_REF_NAME#v}"
-          if [ "$pkg" != "$tag" ]; then
-            echo "packages/${{ matrix.package }}/package.json is $pkg but tag is $tag" >&2
-            exit 1
+          dir="packages/${{ steps.pkg.outputs.name }}"
+          if [ -f "$dir/tsconfig.json" ]; then
+            pnpm --filter "./$dir" exec tsc --noEmit
           fi
 
       # Trusted publishing: npm mints its own credential from the runner's
       # OIDC identity — nothing to store, nothing for EOTP to block.
-      - name: Publish ${{ matrix.package }} to npmjs (OIDC)
-        working-directory: packages/${{ matrix.package }}
+      - name: Publish to npmjs (OIDC)
+        working-directory: packages/${{ steps.pkg.outputs.name }}
         run: |
           npm install -g npm@latest
           npm publish --registry https://registry.npmjs.org --access public
 
-      - name: Publish @ofrbg/${{ matrix.package }} to the GitHub registry
-        working-directory: packages/${{ matrix.package }}
+      - name: Publish @ofrbg/${{ steps.pkg.outputs.name }} to the GitHub registry
+        working-directory: packages/${{ steps.pkg.outputs.name }}
         run: |
-          npm pkg set name=@ofrbg/${{ matrix.package }}
+          npm pkg set name=@ofrbg/${{ steps.pkg.outputs.name }}
           echo "//npm.pkg.github.com/:_authToken=\${NODE_AUTH_TOKEN}" > .npmrc
           npm publish --registry https://npm.pkg.github.com
         env:

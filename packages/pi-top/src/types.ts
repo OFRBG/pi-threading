@@ -1,15 +1,10 @@
-// Types for pi-top — mirrors the relevant shapes from pi-threading's StateFile
-// so pi-top can read .thread/threads/<id>/state.json without a dependency on
-// the pi-threading extension package.
+/**
+ * pi-top types — mirrors pi-threading's StateFile/ThreadSummary shapes
+ * without a hard dependency, so pi-top can be a standalone package that
+ * reads the same JSON files on disk.
+ */
 
-export type ThreadState =
-  | "idle"
-  | "thinking"
-  | "working"
-  | "open"
-  | "on-hold"
-  | "stopped"
-  | "done";
+export type ThreadState = "idle" | "thinking" | "working" | "open" | "on-hold" | "stopped" | "done";
 
 export interface Obligation {
   id: string;
@@ -37,6 +32,7 @@ export interface Barrier {
   message?: string;
 }
 
+/** On-disk representation — mirrors pi-threading's StateFile. */
 export interface StateFile {
   id: string;
   pid: number;
@@ -57,6 +53,7 @@ export interface StateFile {
   wake?: string;
 }
 
+/** Derived summary for the thread list view. */
 export interface ThreadSummary {
   id: string;
   state: ThreadState;
@@ -69,23 +66,35 @@ export interface ThreadSummary {
   barriers: number;
 }
 
+/** Full detail for the detail panel. */
 export interface ThreadDetail {
   summary: ThreadSummary;
-  raw: StateFile;
+  pid: number;
+  cwd: string;
+  holdReason: string | null;
+  obligations: Obligation[];
+  owed: OwedReply[];
+  barriers: Barrier[];
+  startedAt: string;
   journal?: string;
 }
 
-// State display helpers
+// --- pi-threading compat (no import) ---
+
+export const STALE_MS = 60_000;
+
+/** Display color for each thread state. */
 export const STATE_COLORS: Record<ThreadState, string> = {
-  idle: "gray",
+  idle: "bright-black",
   thinking: "cyan",
   working: "yellow",
   open: "green",
   "on-hold": "red",
   stopped: "bright-black",
-  done: "gray",
+  done: "bright-black",
 };
 
+/** Display label for each thread state (padded). */
 export const STATE_LABELS: Record<ThreadState, string> = {
   idle: "idle    ",
   thinking: "think   ",
@@ -96,6 +105,7 @@ export const STATE_LABELS: Record<ThreadState, string> = {
   done: "done    ",
 };
 
+/** Unicode dot symbol for each thread state. */
 export const STATE_DOTS: Record<ThreadState, string> = {
   idle: "○",
   thinking: "◐",
@@ -106,4 +116,45 @@ export const STATE_DOTS: Record<ThreadState, string> = {
   done: "○",
 };
 
-export const STALE_MS = 60_000;
+export function toSummary(s: StateFile): ThreadSummary {
+  const stale = Date.now() - new Date(s.lastSeen).getTime() > STALE_MS;
+  return {
+    id: s.id,
+    state: s.state,
+    status: stale ? "stopped" : s.status,
+    parent: s.parent,
+    role: s.role ?? null,
+    lastSeen: s.lastSeen,
+    obligations: s.obligations?.length ?? 0,
+    owed: s.owed?.length ?? 0,
+    barriers: s.barriers?.length ?? 0,
+  };
+}
+
+/** Human-readable relative time string. */
+export function relTime(iso: string | null): string {
+  if (!iso) {
+    return "-";
+  }
+  const ms = Date.now() - Date.parse(iso);
+  if (Number.isNaN(ms)) {
+    return "-";
+  }
+  if (ms < 0) {
+    return "0s ago";
+  }
+  const s = Math.floor(ms / 1000);
+  if (s < 60) {
+    return `${s}s ago`;
+  }
+  const m = Math.floor(s / 60);
+  if (m < 60) {
+    return `${m}m ago`;
+  }
+  const h = Math.floor(m / 60);
+  if (h < 24) {
+    return `${h}h ago`;
+  }
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
+}

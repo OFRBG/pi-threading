@@ -1,6 +1,6 @@
 {
-  "name": "pi-threading-cli",
-  "version": "0.7.2",
+  "name": "@pi-threading/cli",
+  "version": "0.8.0",
   "description": "Zero-dependency CLI to monitor and steer a pi-threading multi-agent thread system without running pi",
   "keywords": [
     "pi-threading",
@@ -11,6 +11,9 @@
     "type": "git",
     "url": "git+https://github.com/OFRBG/pi-threading.git",
     "directory": "packages/pi-threading-cli"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "bin"

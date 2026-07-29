@@ -180,23 +180,23 @@ test suite.
 
 ## Human monitoring & steering
 
-[`pi-threading-cli`](https://github.com/OFRBG/pi-threading/tree/main/packages/pi-threading-cli) — a separate, zero-dependency npm package published from this repo — lets a human act on the thread system without running pi. Anyone can interact with the message system — via `npx pi-threading-cli` (no install needed) or `node packages/pi-threading-cli/bin/thread-cli.mjs` from inside this repo.
+[`pi-threading-cli`](https://github.com/OFRBG/pi-threading/tree/main/packages/pi-threading-cli) — a separate, zero-dependency npm package published from this repo — lets a human act on the thread system without running pi. Anyone can interact with the message system — via `npx @pi-threading/cli` (no install needed) or `node packages/pi-threading-cli/bin/thread-cli.mjs` from inside this repo.
 
 ```bash
-npx pi-threading-cli list                      # table of all threads incl. coordination counts
-npx pi-threading-cli status link               # one thread's full coordination state:
+npx @pi-threading/cli list                      # table of all threads incl. coordination counts
+npx @pi-threading/cli status link               # one thread's full coordination state:
                                            #   obligations, owed replies, barriers,
                                            #   pending inbox, last journal entry
-npx pi-threading-cli status link --json        # same, as machine-readable JSON
-npx pi-threading-cli watch                     # live coordination board
-npx pi-threading-cli tail link                 # follow one thread's state/journal/messages
+npx @pi-threading/cli status link --json        # same, as machine-readable JSON
+npx @pi-threading/cli watch                     # live coordination board
+npx @pi-threading/cli tail link                 # follow one thread's state/journal/messages
                                            #   (incl. +/- diffs of obligations/barriers)
-npx pi-threading-cli inbox link                # pending + recent messages
-npx pi-threading-cli send link "status?" --expects       # ask, tracked — thread owes you a reply
-npx pi-threading-cli send link "looks good" --re link/01ABC…  # reply, settles the debt
-npx pi-threading-cli send '*' "standup in 5"             # broadcast note
-npx pi-threading-cli delete link                         # remove a thread (refuses if it looks live)
-npx pi-threading-cli delete --stale --yes                # prune every stopped/stale thread
+npx @pi-threading/cli inbox link                # pending + recent messages
+npx @pi-threading/cli send link "status?" --expects       # ask, tracked — thread owes you a reply
+npx @pi-threading/cli send link "looks good" --re link/01ABC…  # reply, settles the debt
+npx @pi-threading/cli send '*' "standup in 5"             # broadcast note
+npx @pi-threading/cli delete link                         # remove a thread (refuses if it looks live)
+npx @pi-threading/cli delete --stale --yes                # prune every stopped/stale thread
 ```
 
 ## State machine
