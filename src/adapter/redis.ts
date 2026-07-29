@@ -14,7 +14,6 @@
 // which mirrors exactly what real Redis requires (a subscribed connection
 // cannot issue other commands).
 import type { Redis as RedisClient } from "ioredis";
-import RedisCtor from "ioredis";
 import type { StateFile, Mail, ThreadSummary } from "../core/types";
 import { PROCESSED_TTL_MS, toSummary } from "../core/types";
 import type { StorageAdapter, JournalAdapter, PiFlagParam, AdapterOptions } from "./types";
@@ -394,19 +393,54 @@ export function createAdapterFromClient(client: RedisClient): StorageAdapter & J
   };
 }
 
+/** Production entry point: builds a `StorageAdapter & JournalAdapter` that
+ *  looks and behaves exactly like `createAdapterFromClient`'s object, but
+ *  defers ever touching the real `ioredis` package until `configure()` runs.
+ *
+ *  This has to stay a *synchronous* function returning a plain object, not
+ *  `async` — `resolveAdapter()`/`store.adapter` are a synchronous,
+ *  memoized-on-first-access pair (see registry.ts, state.ts), and `ioredis`
+ *  is only actually needed when `--thread-storage redis` is selected. This
+ *  module, though, is imported unconditionally by registry.ts (to read
+ *  `options` for flag registration) regardless of which backend ends up
+ *  selected — a top-level `import RedisCtor from "ioredis"` would make that
+ *  import eager. Under Bun, eagerly loading `ioredis`'s large, cyclic
+ *  dependency graph triggers "Maximum call stack size exceeded" in Bun's
+ *  module resolver, even when the client is never constructed. Routing the
+ *  import through a dynamic `import()` inside `configure()` — the one method
+ *  every caller already awaits before touching anything else on this object
+ *  — means the package is only ever loaded once a real Redis backend is
+ *  actually in use. */
 export function createAdapter({
   "connection-string": connectionString,
 }: AdapterOptions<typeof options>): StorageAdapter & JournalAdapter {
-  const client = new RedisCtor(connectionString, {
-    // Defer the actual TCP connect until `configure()` calls a command
-    // (ioredis connects lazily on first command when `lazyConnect: true`),
-    // mirroring local-fs's `configure()` doing its own setup (mkdir) rather
-    // than connecting eagerly at construction time.
-    lazyConnect: true,
-    // Never buffer commands forever waiting on a connection that will
-    // never come — a fleet-mode misconfiguration should surface as errors,
-    // not silent, endless queueing.
-    maxRetriesPerRequest: 3,
-  });
-  return createAdapterFromClient(client);
+  let inner: (StorageAdapter & JournalAdapter) | undefined;
+
+  return {
+    async configure() {
+      const { default: RedisCtor } = await import("ioredis");
+      const client = new RedisCtor(connectionString, {
+        // Defer the actual TCP connect until a command is issued (ioredis
+        // connects lazily on first command when `lazyConnect: true`),
+        // mirroring local-fs's `configure()` doing its own setup (mkdir)
+        // rather than connecting eagerly at construction time.
+        lazyConnect: true,
+        // Never buffer commands forever waiting on a connection that will
+        // never come — a fleet-mode misconfiguration should surface as
+        // errors, not silent, endless queueing.
+        maxRetriesPerRequest: 3,
+      });
+      inner = createAdapterFromClient(client);
+      await inner.configure();
+    },
+    loadState: threadId => inner!.loadState(threadId),
+    saveState: (threadId, state) => inner!.saveState(threadId, state),
+    listThreads: () => inner!.listThreads(),
+    threadExists: threadId => inner!.threadExists(threadId),
+    sendMail: mail => inner!.sendMail(mail),
+    receiveMail: threadId => inner!.receiveMail(threadId),
+    watchMail: (threadId, cb) => inner!.watchMail(threadId, cb),
+    appendJournal: (threadId, entry) => inner!.appendJournal(threadId, entry),
+    readJournal: threadId => inner!.readJournal(threadId),
+  };
 }

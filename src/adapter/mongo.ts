@@ -1,5 +1,4 @@
-import { MongoClient } from "mongodb";
-import type { Collection, Db } from "mongodb";
+import type { MongoClient, Collection, Db } from "mongodb";
 import type { StateFile, Mail, ThreadSummary } from "../core/types";
 import { PROCESSED_TTL_MS, toSummary } from "../core/types";
 import type { StorageAdapter, JournalAdapter, PiFlagParam, AdapterOptions } from "./types";
@@ -95,7 +94,15 @@ export function createAdapter({
 
   return {
     async configure() {
-      client = new MongoClient(connectionString);
+      // Dynamically imported rather than required at module top-level:
+      // `mongodb` is only actually needed when `--thread-storage mongo` is
+      // selected, and eagerly loading it (this module is imported
+      // unconditionally by registry.ts to read `options` for flag
+      // registration) crashes under Bun — its dependency graph triggers
+      // "Maximum call stack size exceeded" in Bun's module resolver even
+      // when the module is never used.
+      const { MongoClient: MongoClientCtor } = await import("mongodb");
+      client = new MongoClientCtor(connectionString);
       await client.connect();
       db = client.db(database);
       mail = db.collection<MailDoc>("mail");
