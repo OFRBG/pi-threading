@@ -24,6 +24,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import type {
   ExtensionAPI,
@@ -1458,6 +1459,12 @@ describe("commands: slash commands", () => {
     assert.strictEqual(h.store.state, "open");
   });
 
+  it("/thread-spawn with no id shows usage and doesn't attempt to spawn anything", async () => {
+    const h = makeHarness(tmpDir);
+    await callCommand(h, "thread-spawn");
+    assert.match(h.notifications[0].text, /Usage: \/thread-spawn/);
+  });
+
   it("/thread-send rejects sending to self", async () => {
     const h = makeHarness(tmpDir);
     await callCommand(h, "thread-send", "t1 hello");
@@ -1768,7 +1775,12 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
 });
 
 describe("bin/thread-cli.mjs: external C1 actor", () => {
-  const cli = join(import.meta.dirname, "..", "bin", "thread-cli.mjs");
+  // Resolved via the workspace package rather than a relative path — the
+  // CLI moved to its own `pi-threading-cli` package (a `workspace:*`
+  // devDependency here) so it can evolve/publish independently while these
+  // interop tests keep verifying its writes against this package's own
+  // drain logic.
+  const cli = fileURLToPath(import.meta.resolve("pi-threading-cli/bin/thread-cli.mjs"));
   const runCli = (dir: string, ...cliArgs: string[]) =>
     execFileSync(process.execPath, [cli, ...cliArgs, "--dir", dir], { encoding: "utf8" });
 

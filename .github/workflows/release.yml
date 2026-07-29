@@ -1,15 +1,19 @@
-# Publish on every v* tag: `pi-threading` to npmjs (primary — anonymous
-# installs) and `@ofrbg/pi-threading` to the GitHub npm registry (mirror).
-# Only the free suites run here (unit + MCP + typecheck + lint) — the e2e
-# suites need a model API key and real spend, so they stay local/manual.
+# Publish on every v* tag: each of `packages/pi-threading` and
+# `packages/pi-threading-cli` gets published unscoped to npmjs (primary —
+# anonymous installs) and `@ofrbg/*`-scoped to the GitHub npm registry
+# (mirror). Only the free suites run here (unit + MCP + typecheck + lint) —
+# the e2e suites need a model API key and real spend, so they stay
+# local/manual.
 #
 # The npmjs publish uses trusted publishing (OIDC) — no token secret, no
-# OTP, works with 2FA-for-writes enabled. One-time setup on npmjs.com:
-# package settings → Trusted Publisher → GitHub Actions → owner OFRBG,
-# repo pi-threading, workflow release.yml. The package must exist first
-# (initial version published manually). Requires npm >= 11.5.1, hence the
-# npm upgrade step. The GitHub publish uses the built-in GITHUB_TOKEN;
-# GH-registry consumers need a read:packages PAT:
+# OTP, works with 2FA-for-writes enabled. One-time setup on npmjs.com, PER
+# PACKAGE: package settings → Trusted Publisher → GitHub Actions → owner
+# OFRBG, repo pi-threading, workflow release.yml. Each package must exist on
+# npmjs first (initial version published manually) before its Trusted
+# Publisher can be configured — `pi-threading-cli` needs this one-time
+# manual bootstrap the first time this workflow runs for it. Requires npm >=
+# 11.5.1, hence the npm upgrade step. The GitHub publish uses the built-in
+# GITHUB_TOKEN; GH-registry consumers need a read:packages PAT:
 #   @ofrbg:registry=https://npm.pkg.github.com
 #   //npm.pkg.github.com/:_authToken=<token>
 name: release
@@ -27,40 +31,48 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package: [pi-threading, pi-threading-cli]
     steps:
       - uses: actions/checkout@v4
 
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: pnpm
 
-      - run: npm install
+      - run: pnpm install --frozen-lockfile
 
-      - run: npx tsc --noEmit
-      - run: npm run lint
-      - run: npm run test:unit
+      - run: pnpm --filter pi-threading exec tsc --noEmit
+      - run: pnpm run lint
+      - run: pnpm run test:unit
 
-      # Refuse to publish a tag that disagrees with package.json.
+      # Refuse to publish a tag that disagrees with this package's version.
       - name: Check tag matches package version
         if: github.ref_type == 'tag'
+        working-directory: packages/${{ matrix.package }}
         run: |
           pkg="$(node -p "require('./package.json').version")"
           tag="${GITHUB_REF_NAME#v}"
           if [ "$pkg" != "$tag" ]; then
-            echo "package.json is $pkg but tag is $tag" >&2
+            echo "packages/${{ matrix.package }}/package.json is $pkg but tag is $tag" >&2
             exit 1
           fi
 
       # Trusted publishing: npm mints its own credential from the runner's
       # OIDC identity — nothing to store, nothing for EOTP to block.
-      - name: Publish pi-threading to npmjs (OIDC)
+      - name: Publish ${{ matrix.package }} to npmjs (OIDC)
+        working-directory: packages/${{ matrix.package }}
         run: |
           npm install -g npm@latest
           npm publish --registry https://registry.npmjs.org --access public
 
-      - name: Publish @ofrbg/pi-threading to the GitHub registry
+      - name: Publish @ofrbg/${{ matrix.package }} to the GitHub registry
+        working-directory: packages/${{ matrix.package }}
         run: |
-          npm pkg set name=@ofrbg/pi-threading
+          npm pkg set name=@ofrbg/${{ matrix.package }}
           echo "//npm.pkg.github.com/:_authToken=\${NODE_AUTH_TOKEN}" > .npmrc
           npm publish --registry https://npm.pkg.github.com
         env:

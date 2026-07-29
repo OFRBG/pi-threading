@@ -1,0 +1,28 @@
+{
+  "name": "pi-threading-cli",
+  "version": "0.7.2",
+  "description": "Zero-dependency CLI to monitor and steer a pi-threading multi-agent thread system without running pi",
+  "keywords": [
+    "pi-threading",
+    "cli",
+    "multi-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OFRBG/pi-threading.git",
+    "directory": "packages/pi-threading-cli"
+  },
+  "files": [
+    "bin"
+  ],
+  "type": "module",
+  "bin": {
+    "pi-threading-cli": "./bin/thread-cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/cli.test.mjs",
+    "test:unit": "node --test test/cli.test.mjs",
+    "lint": "oxlint bin test",
+    "lint:fix": "oxlint bin test --fix"
+  }
+}

@@ -4,5 +4,4 @@ node_modules/
 .pi/
 .thread/
 live-workspace/
-package-lock.json
 PROTOCOL-FORMALISM.md

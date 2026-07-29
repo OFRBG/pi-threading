@@ -65,6 +65,9 @@ For thread system messages, never reply by writing output text: use the threadin
 | Check what another thread is doing (without messaging it) | thread_journal(id) |
 | Pause yourself gracefully | thread_suspend(reason) — inbox queues until resume |
 | Wake up after being On Hold | thread_resume |
+| Delegate one task to a fresh subagent-like thread | thread_spawn(id, prompt) — no config file needed; parent defaults to you |
+| Delegate to a fresh team instead of doing it all yourself | thread_launch(config) — spins up threads from a JSON config (default ".thread/team.json") |
+| Stop thread(s) you (or a human) launched | thread_shutdown(to, force=true for SIGKILL) — cannot target yourself |
 
 
 ### Anti-patterns and Errors

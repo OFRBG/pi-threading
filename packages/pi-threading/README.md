@@ -51,13 +51,75 @@ I recommend using tmux to manage teams.
 
 ### Slash commands
 
-| Command                   | Purpose                                    |
-| ------------------------- | ------------------------------------------ |
-| `thread-status`           | Show state and latest journal entry        |
-| `thread-list`             | List all known threads                     |
-| `thread-send <to> <body>` | Send a high-urgency note to another thread |
-| `thread-suspend`          | Mark On Hold                               |
-| `thread-resume`           | Resume from On Hold                        |
+| Command                          | Purpose                                                          |
+| -------------------------------- | ---------------------------------------------------------------- |
+| `thread-status`                  | Show state and latest journal entry                              |
+| `thread-list`                    | List all known threads                                           |
+| `thread-send <to> <body>`        | Send a high-urgency note to another thread                       |
+| `thread-suspend`                 | Mark On Hold                                                     |
+| `thread-resume`                  | Resume from On Hold                                              |
+| `thread-launch [config]`         | Spin up a team of threads from a JSON config                     |
+| `thread-shutdown <to> [--force]` | Signal thread(s) to stop (SIGTERM, or SIGKILL with `--force`)    |
+| `thread-spawn <id> [prompt...]`  | Spin up a single thread ad hoc, no config file — like a subagent |
+
+### Launching a team from a config
+
+`/thread-launch` reads a JSON file (default `.thread/team.json`) listing the
+threads to spin up — id, role, parent, model, and system-prompt pieces — and
+launches each one as its own `pi` process, reusing this thread's own launch
+flags (extension, storage backend, etc.) so the config only needs to specify
+what differs per thread.
+
+```json
+{
+  "mode": "tmux",
+  "session": "teams",
+  "defaults": {
+    "provider": "openrouter",
+    "model": "minimax/minimax-m3",
+    "journalModel": "google/gemini-2.5-flash-lite"
+  },
+  "threads": [
+    {
+      "id": "a-lead",
+      "role": "lead",
+      "parent": "hq",
+      "systemPrompt": ["briefs/lead.md", "Roster: you lead ${teammates}."]
+    },
+    {
+      "id": "a-dev-1",
+      "role": "a-support",
+      "parent": "a-lead",
+      "model": "deepseek/deepseek-v4-pro",
+      "systemPrompt": ["briefs/dev.md", "Teammates: ${teammates}."]
+    }
+  ]
+}
+```
+
+- `mode`: `"tmux"` (default; falls back to `"background"` automatically if
+  `tmux` isn't installed) or `"background"` (plain detached processes,
+  logged to `.thread/threads/<id>/launch.log`).
+- `defaults` are merged under each thread's own fields.
+- `systemPrompt` entries are file paths (resolved relative to the config
+  file) when they exist on disk, otherwise literal strings — either way
+  they're rendered through `${id}`, `${role}`, `${parent}`, and `${teammates}`
+  (auto-derived from sibling threads sharing the same `parent`, or an
+  explicit `"teammates": [...]` override) before becoming
+  `--append-system-prompt` flags.
+
+### Spawning a single thread ad hoc
+
+`/thread-spawn <id> [--role r] [--model m] [--parent p] [--mode tmux|background] [prompt...]`
+spins up one thread without a config file — the trailing words become its
+system prompt (the task brief). `--parent` defaults to you, so the new
+thread escalates back to you when it's stuck, same as a subagent. Skips if
+`id` already exists. The agent itself can do the same via the `thread_spawn`
+tool.
+
+```bash
+/thread-spawn researcher Look into why the login flow times out on mobile.
+```
 
 ## Flags
 
@@ -118,23 +180,23 @@ test suite.
 
 ## Human monitoring & steering
 
-`bin/thread-cli.mjs` lets a human act on the thread system without running pi. Anyone can interact with the message system — via `npx pi-threading` (no install needed) or `node bin/thread-cli.mjs` from inside this repo.
+[`pi-threading-cli`](https://github.com/OFRBG/pi-threading/tree/main/packages/pi-threading-cli) — a separate, zero-dependency npm package published from this repo — lets a human act on the thread system without running pi. Anyone can interact with the message system — via `npx pi-threading-cli` (no install needed) or `node packages/pi-threading-cli/bin/thread-cli.mjs` from inside this repo.
 
 ```bash
-npx pi-threading list                      # table of all threads incl. coordination counts
-npx pi-threading status link               # one thread's full coordination state:
+npx pi-threading-cli list                      # table of all threads incl. coordination counts
+npx pi-threading-cli status link               # one thread's full coordination state:
                                            #   obligations, owed replies, barriers,
                                            #   pending inbox, last journal entry
-npx pi-threading status link --json        # same, as machine-readable JSON
-npx pi-threading watch                     # live coordination board
-npx pi-threading tail link                 # follow one thread's state/journal/messages
+npx pi-threading-cli status link --json        # same, as machine-readable JSON
+npx pi-threading-cli watch                     # live coordination board
+npx pi-threading-cli tail link                 # follow one thread's state/journal/messages
                                            #   (incl. +/- diffs of obligations/barriers)
-npx pi-threading inbox link                # pending + recent messages
-npx pi-threading send link "status?" --expects       # ask, tracked — thread owes you a reply
-npx pi-threading send link "looks good" --re link/01ABC…  # reply, settles the debt
-npx pi-threading send '*' "standup in 5"             # broadcast note
-npx pi-threading delete link                         # remove a thread (refuses if it looks live)
-npx pi-threading delete --stale --yes                # prune every stopped/stale thread
+npx pi-threading-cli inbox link                # pending + recent messages
+npx pi-threading-cli send link "status?" --expects       # ask, tracked — thread owes you a reply
+npx pi-threading-cli send link "looks good" --re link/01ABC…  # reply, settles the debt
+npx pi-threading-cli send '*' "standup in 5"             # broadcast note
+npx pi-threading-cli delete link                         # remove a thread (refuses if it looks live)
+npx pi-threading-cli delete --stale --yes                # prune every stopped/stale thread
 ```
 
 ## State machine

@@ -1,0 +1,54 @@
+{
+  "name": "pi-threading",
+  "version": "0.7.2",
+  "description": "Cross-thread communication extension for pi coding agent — independent threads that coordinate work, share state, and converse without losing context",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "threads",
+    "multi-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OFRBG/pi-threading.git"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "bin",
+    "examples",
+    "THREAD-MODEL.md"
+  ],
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "dependencies": {
+    "ioredis": "^5.11.1",
+    "mongodb": "^7.5.0"
+  },
+  "scripts": {
+    "test": "pnpm run test:unit && pnpm run test:e2e",
+    "test:unit": "node --import tsx --test test/unit.test.ts test/mongo-adapter.test.ts test/launch.test.ts",
+    "test:e2e": "node --import tsx --test test/e2e.test.ts",
+    "http-server": "node --import tsx bin/thread-http-server.mjs",
+    "live": "bash live.sh",
+    "lint": "oxlint src test index.ts",
+    "lint:fix": "oxlint src test index.ts --fix"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.3",
+    "ioredis-mock": "^8.13.1",
+    "mongodb-memory-server": "^11.2.0",
+    "pi-threading-cli": "workspace:*"
+  },
+  "volta": {
+    "node": "26.4.0"
+  }
+}

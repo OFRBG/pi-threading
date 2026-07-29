@@ -43,7 +43,7 @@ test/
   release.yml             on v* tags: same free checks, then publish (paid CI minutes only)
 ```
 
-**Why `bin/thread-cli.mjs` duplicates ledger logic instead of importing `src/`:** it is a deliberately zero-dependency, single-file Node script — no `npm install`, no TypeScript build step, so it can be dropped onto any machine and just run. That means it cannot `import` from `src/` (which pulls in `@earendil-works/pi-coding-agent`, `typebox`, TS build tooling); it reimplements the pieces of the Appendix B binding and the §9 ledger discharge rule it needs, directly against `fs`, with comments pointing back at the `src/` files it mirrors. This is a conscious duplication tradeoff, not an oversight — see the Known Limitations entry on `thread-cli.mjs` for the corollary (it only ever sees the `local` backend).
+**Why `pi-threading-cli`'s `bin/thread-cli.mjs` duplicates ledger logic instead of importing `src/`:** it is a deliberately zero-dependency, single-file Node script — no `npm install`, no TypeScript build step, so it can be dropped onto any machine and just run. It now lives in its own package, `packages/pi-threading-cli/`, published independently of the extension — a further consequence of that zero-dependency design, since it never needed the extension's dependencies (`@earendil-works/pi-coding-agent`, `typebox`, TS build tooling) in the first place. It cannot `import` from the extension's `src/`; it reimplements the pieces of the Appendix B binding and the §9 ledger discharge rule it needs, directly against `fs`, with comments pointing back at the `src/` files it mirrors. This is a conscious duplication tradeoff, not an oversight — see the Known Limitations entry on `thread-cli.mjs` for the corollary (it only ever sees the `local` backend).
 
 ---
 
@@ -235,7 +235,7 @@ Registered in three groups by `src/tools/index.ts` — five protocol tools (spec
 
 External actors speak the _same_ `.thread/` local-fs store (Appendix B) and interoperate purely through it — atomic renames make claims mutually exclusive regardless of which actor wins the race.
 
-- **`bin/thread-cli.mjs`** — zero-dependency CLI. `list`/`status`/`send`/`inbox`/`tail`/`watch`/`delete` read and write the same files the extension does. A human operator using it is a full **C1** protocol citizen (spec §2.2) without running pi at all. Operator sends default to `urgency: "high"` (a human steering a thread wants it seen at the next opening).
+- **`pi-threading-cli`'s `bin/thread-cli.mjs`** — zero-dependency CLI, published as its own `packages/pi-threading-cli` package. `list`/`status`/`send`/`inbox`/`tail`/`watch`/`delete` read and write the same files the extension does. A human operator using it is a full **C1** protocol citizen (spec §2.2) without running pi at all. Operator sends default to `urgency: "high"` (a human steering a thread wants it seen at the next opening).
 
 ---
 
@@ -253,7 +253,7 @@ Implemented as a pi coding-agent extension. pi's `ExtensionAPI` provides no nati
 
 **Broadcast**: `thread_send` accepts `to` as a single id, a comma list, `*` (all known threads except self), or `role:<role>` (threads started with `--thread-role`). Fan-out sends mint a distinct envelope id per target, so replies stay individually correlatable.
 
-**Human as peer**: `bin/thread-cli.mjs` writes the same envelope format into any thread's inbox (`send`, with `--expects`/`--re`/`--urgency`/`--deliver-after`, including `*` broadcast) and reads the same state files (`list`, `watch`, `tail`, `inbox`) — a human is a full C1 protocol citizen (spec §2.2) without running pi. It's a standalone, zero-dependency script that speaks the Appendix B file layout directly (it doesn't import `src/`), so it only sees threads running against the `local` storage backend.
+**Human as peer**: `pi-threading-cli`'s `bin/thread-cli.mjs` writes the same envelope format into any thread's inbox (`send`, with `--expects`/`--re`/`--urgency`/`--deliver-after`, including `*` broadcast) and reads the same state files (`list`, `watch`, `tail`, `inbox`) — a human is a full C1 protocol citizen (spec §2.2) without running pi. It's a standalone, zero-dependency script that speaks the Appendix B file layout directly (it doesn't import `src/`), so it only sees threads running against the `local` storage backend.
 
 ---
 
@@ -266,7 +266,7 @@ Implemented as a pi coding-agent extension. pi's `ExtensionAPI` provides no nati
 
 **CI** (`.github/workflows/ci.yml`) runs on every push to `main` and every PR: `tsc --noEmit`, lint, `test:unit` — all free, no model spend.
 
-**Release** (`.github/workflows/release.yml`) triggers on `v*` tags (or manual dispatch): re-runs the same free checks, verifies the tag matches `package.json`'s `version`, then publishes twice — `pi-threading` (unscoped) to npmjs via OIDC trusted publishing (no stored token; requires npm ≥ 11.5.1 and one-time npmjs.com Trusted Publisher setup pointing at this workflow), and `@ofrbg/pi-threading` (scope patched in at publish time via `npm pkg set name=...`) to the GitHub npm registry using the built-in `GITHUB_TOKEN`. `package.json`'s checked-in `name` is the unscoped `pi-threading` — the `@ofrbg` scope only exists as the GitHub-registry mirror's name, applied in CI, never committed.
+**Release** (`.github/workflows/release.yml`) triggers on `v*` tags (or manual dispatch): re-runs the same free checks, verifies the tag matches both packages' `package.json` `version` fields, then publishes each of `packages/pi-threading` and `packages/pi-threading-cli` twice — unscoped (`pi-threading`, `pi-threading-cli`) to npmjs via OIDC trusted publishing (no stored token; requires npm ≥ 11.5.1 and, for each package, a one-time npmjs.com Trusted Publisher setup pointing at this workflow), and `@ofrbg/*`-scoped (patched in at publish time via `npm pkg set name=...`) to the GitHub npm registry using the built-in `GITHUB_TOKEN`. Each package's checked-in `name` is unscoped — the `@ofrbg` scope only exists as the GitHub-registry mirror's name, applied in CI, never committed.
 
 ---
 
@@ -276,7 +276,7 @@ Verified by reading the implementation, not exhaustively tested. Listed so they'
 
 - **Meeting exclusivity is advisory.** There is no lock: a busy peer says "busy" and the requester retries later. Two threads that request a meeting with each other simultaneously will each see the other's request at their next opening and sort it out conversationally — nothing deadlocks, but nothing enforces a rendezvous either.
 - **No automated test coverage yet for**: the CLI `delete` command and the CLI's live loops (`watch`/`tail`). The CLI's `status`/`list`/`send`/`inbox` are covered in `test/unit.test.ts`, including the full CLI↔extension interop loop.
-- **`bin/thread-cli.mjs` only ever sees the `local` storage backend** — it speaks the file binding directly and doesn't go through `StorageAdapter`, so threads on any future non-local backend would be invisible to it. A consequence of its zero-dependency design; flagged, not resolved.
+- **`pi-threading-cli`'s `bin/thread-cli.mjs` only ever sees the `local` storage backend** — it speaks the file binding directly and doesn't go through `StorageAdapter`, so threads on any future non-local backend would be invisible to it. A consequence of its zero-dependency design; flagged, not resolved.
 - **The §7.7 residual loss window**: an envelope claimed by a process that crashes inside the single drain-and-inject tick is moved to `processed/` but never seen by the model. This is the protocol's one declared loss window (spec §7.7, Erratum 5) — inspectable in `processed/`, upgradeable later via peek/ack in Layer 0.
 
 **History**: this document used to carry the protocol definition (eight message types, reply/sync locks, subscriptions, scheduled wakes) plus a long fix log. The protocol moved to PROTOCOL-FORMALISM.md, went through a formal review across Revs 1–8 (five errata found and fixed along the way — misdirected-reply discharge, lock deadlock recovery, heartbeat coalescing, deadline generalization, the drain window), and the Rev-8 migration then deleted locks, types, subscriptions, and the wake machinery outright. The spec's Appendix A records what changed; git history holds the rest. Erratum 6 (v0.3.1/v0.3.2) closed a follow-on gap in the same family: the misdirected-reply discharge fix (Erratum 1) had only ever been applied to the `owed` ledger's send-side check; the symmetric `obligations` ledger check in `deliver()`, and the two standalone `bin/` scripts' own copies of both checks, needed the same gate applied by hand.

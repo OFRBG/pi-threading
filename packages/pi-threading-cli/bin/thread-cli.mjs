@@ -113,7 +113,9 @@ function readJsonSafe(file) {
     const raw = fs.readFileSync(file, "utf8");
     return JSON.parse(raw);
   } catch (err) {
-    if (err.code === "ENOENT") return undefined;
+    if (err.code === "ENOENT") {
+      return undefined;
+    }
     warn(`could not parse ${file}: ${err.message}`);
     return null;
   }
@@ -125,7 +127,9 @@ function listThreadIds(dir) {
   try {
     entries = fs.readdirSync(base, { withFileTypes: true });
   } catch (err) {
-    if (err.code === "ENOENT") return [];
+    if (err.code === "ENOENT") {
+      return [];
+    }
     throw err;
   }
   return entries
@@ -137,8 +141,12 @@ function listThreadIds(dir) {
 function loadThreadState(dir, id) {
   const stateFile = path.join(threadsDir(dir), id, "state.json");
   const state = readJsonSafe(stateFile);
-  if (state === undefined) return null;
-  if (state === null) return null;
+  if (state === undefined) {
+    return null;
+  }
+  if (state === null) {
+    return null;
+  }
   return state;
 }
 
@@ -153,37 +161,57 @@ function countInboxPending(dir, id) {
 
 function effectiveStatus(state) {
   const stale = state.lastSeen && Date.now() - Date.parse(state.lastSeen) > STALE_MS;
-  if (stale && state.status !== "stopped") return "stopped*";
+  if (stale && state.status !== "stopped") {
+    return "stopped*";
+  }
   return state.status || "unknown";
 }
 
 function relTime(iso) {
-  if (!iso) return "-";
+  if (!iso) {
+    return "-";
+  }
   const ms = Date.now() - Date.parse(iso);
-  if (Number.isNaN(ms)) return "-";
-  if (ms < 0) return "0s ago";
+  if (Number.isNaN(ms)) {
+    return "-";
+  }
+  if (ms < 0) {
+    return "0s ago";
+  }
   const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s ago`;
+  if (s < 60) {
+    return `${s}s ago`;
+  }
   const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
+  if (m < 60) {
+    return `${m}m ago`;
+  }
   const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
+  if (h < 24) {
+    return `${h}h ago`;
+  }
   const d = Math.floor(h / 24);
   return `${d}d ago`;
 }
 
 /** For deadlines/deliverAfter: "in 30s" while pending, "5m overdue" once passed. */
 function dueIn(iso) {
-  if (!iso) return "-";
+  if (!iso) {
+    return "-";
+  }
   const ms = Date.parse(iso) - Date.now();
-  if (Number.isNaN(ms)) return "-";
+  if (Number.isNaN(ms)) {
+    return "-";
+  }
   const s = Math.floor(Math.abs(ms) / 1000);
   const span = s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : `${Math.floor(s / 3600)}h`;
   return ms >= 0 ? `in ${span}` : `${span} overdue`;
 }
 
 function truncate(str, n) {
-  if (!str) return "";
+  if (!str) {
+    return "";
+  }
   return str.length > n ? str.slice(0, n) : str;
 }
 
@@ -300,8 +328,12 @@ function cmdStatus(args) {
 
   const section = (title, items, render) => {
     lines.push("", `${title} (${items.length}):`);
-    if (items.length === 0) lines.push("  (none)");
-    for (const it of items) lines.push("  " + render(it));
+    if (items.length === 0) {
+      lines.push("  (none)");
+    }
+    for (const it of items) {
+      lines.push("  " + render(it));
+    }
   };
   section(
     "Obligations (replies owed TO this thread)",
@@ -330,7 +362,9 @@ function cmdStatus(args) {
     const last = entries[entries.length - 1];
     if (last) {
       lines.push("", "Last journal entry:");
-      for (const l of last.trim().split("\n")) lines.push("  " + l);
+      for (const l of last.trim().split("\n")) {
+        lines.push("  " + l);
+      }
     }
   } catch {
     // no journal yet
@@ -454,7 +488,9 @@ function readInboxMessages(inboxDir) {
   const msgs = [];
   for (const f of files) {
     const m = readJsonSafe(path.join(inboxDir, f));
-    if (m && typeof m === "object") msgs.push({ file: f, ...m });
+    if (m && typeof m === "object") {
+      msgs.push({ file: f, ...m });
+    }
   }
   msgs.sort((a, b) => a.file.localeCompare(b.file));
   return msgs;
@@ -484,13 +520,21 @@ function cmdInbox(args) {
   const processed = readInboxMessages(path.join(threadDir, "inbox", "processed"));
 
   process.stdout.write(`Pending (${pending.length}):\n`);
-  if (pending.length === 0) process.stdout.write("  (none)\n");
-  for (const m of pending) process.stdout.write("  " + formatMsgLine(m, null) + "\n");
+  if (pending.length === 0) {
+    process.stdout.write("  (none)\n");
+  }
+  for (const m of pending) {
+    process.stdout.write("  " + formatMsgLine(m, null) + "\n");
+  }
 
   const recent = processed.slice(-10).reverse();
   process.stdout.write(`\nRecent processed (${recent.length} of ${processed.length}):\n`);
-  if (recent.length === 0) process.stdout.write("  (none)\n");
-  for (const m of recent) process.stdout.write("  " + formatMsgLine(m, 80) + "\n");
+  if (recent.length === 0) {
+    process.stdout.write("  (none)\n");
+  }
+  for (const m of recent) {
+    process.stdout.write("  " + formatMsgLine(m, 80) + "\n");
+  }
   return 0;
 }
 
@@ -547,7 +591,9 @@ async function cmdTail(args) {
             ...[...n].filter(x => !p.has(x)).map(x => `+${x}`),
             ...[...p].filter(x => !n.has(x)).map(x => `-${x}`),
           ];
-          if (changes.length) process.stdout.write(`${label}: ${changes.join(" ")}\n`);
+          if (changes.length) {
+            process.stdout.write(`${label}: ${changes.join(" ")}\n`);
+          }
         };
         diffIds("obligations", lastState.obligations, state.obligations, o => o.id);
         diffIds("owed", lastState.owed, state.owed, o => o.id);
@@ -578,11 +624,17 @@ async function cmdTail(args) {
       }
       const seen = sub === "inbox" ? seenInbox : seenProcessed;
       for (const f of files) {
-        if (seen.has(f)) continue;
+        if (seen.has(f)) {
+          continue;
+        }
         seen.add(f);
-        if (seen.size === files.length && lastJournalLen === -1) continue;
+        if (seen.size === files.length && lastJournalLen === -1) {
+          continue;
+        }
         const m = readJsonSafe(path.join(dirPath, f));
-        if (m) process.stdout.write(`${sub}: ` + formatMsgLine(m, 80) + "\n");
+        if (m) {
+          process.stdout.write(`${sub}: ` + formatMsgLine(m, 80) + "\n");
+        }
       }
     }
 
@@ -613,8 +665,12 @@ async function cmdWatch(args) {
     const barriers = [];
     const queued = [];
     for (const r of rows) {
-      for (const o of r.raw.owed ?? []) owed.push({ owner: r.id, ...o });
-      for (const b of r.raw.barriers ?? []) barriers.push({ owner: r.id, ...b });
+      for (const o of r.raw.owed ?? []) {
+        owed.push({ owner: r.id, ...o });
+      }
+      for (const b of r.raw.barriers ?? []) {
+        barriers.push({ owner: r.id, ...b });
+      }
       if (r.inbox > 0) {
         for (const m of readInboxMessages(path.join(threadsDir(args.dir), r.id, "inbox"))) {
           queued.push(m);
@@ -669,7 +725,9 @@ function cmdDelete(args) {
   } else {
     const known = new Set(rows.map(r => r.id));
     targets = ids.filter(id => {
-      if (known.has(id)) return true;
+      if (known.has(id)) {
+        return true;
+      }
       warn(`skipping "${id}": no such thread`);
       return false;
     });

@@ -12,7 +12,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "${1:-$PWD}" && pwd)"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 EXT="$REPO_DIR/src/index.ts"
-CLI="$REPO_DIR/bin/thread-cli.mjs"
+CLI="$REPO_DIR/../pi-threading-cli/bin/thread-cli.mjs"
 BRIEFS="$REPO_DIR/examples/briefs"
 SESSION="teams"
 

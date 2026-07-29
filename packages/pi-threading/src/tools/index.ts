@@ -2,6 +2,7 @@ import type { ThreadingContext } from "../context";
 import { registerIntrospectionTools } from "./introspection";
 import { registerMessagingTools } from "./messaging";
 import { registerControlTools } from "./control";
+import { registerSpawnTools } from "./spawn";
 
 /** The static half of a tool: identity and copy. Spread into the
  *  `pi.registerTool` call alongside its `parameters` and `execute`. */
@@ -56,6 +57,24 @@ export const threadingTools = {
     label: "Thread Resume",
     description: "Resume this thread from On Hold back to Open.",
   },
+  launch: {
+    name: "thread_launch",
+    label: "Thread Launch",
+    description:
+      'Spin up a team of threads from a JSON config (default ".thread/team.json"): each entry becomes its own pi process with its own id/role/parent/model/system-prompt. Use this to delegate work to a fresh team rather than doing it all yourself. Skips this thread\'s own id and any id that already exists.',
+  },
+  spawn: {
+    name: "thread_spawn",
+    label: "Thread Spawn",
+    description:
+      "Spin up a single new thread ad hoc — no config file needed, like spawning a subagent. Its parent defaults to you, so it escalates back to you when stuck. Optionally set role/model/provider and a system-prompt piece (the task brief). Skips if the id already exists.",
+  },
+  shutdown: {
+    name: "thread_shutdown",
+    label: "Thread Shutdown",
+    description:
+      'Signal thread(s) to stop. `to` accepts a thread id, comma list, "*", or "role:<role>" — see thread_list. Sends SIGTERM by default (graceful — the target still runs its own shutdown hook); set force=true for SIGKILL. Cannot target yourself.',
+  },
 } satisfies Record<string, ThreadingToolDef>;
 
 /** All threading tool names — used to filter the active tool set when a
@@ -66,4 +85,5 @@ export function registerTools({ pi, store, inbox }: ThreadingContext) {
   registerIntrospectionTools(pi, store);
   registerMessagingTools(pi, store, inbox);
   registerControlTools(pi, store, inbox);
+  registerSpawnTools(pi, store, inbox);
 }

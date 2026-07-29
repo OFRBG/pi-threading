@@ -6,6 +6,9 @@ import { threadList } from "./thread-list";
 import { threadSend } from "./thread-send";
 import { threadSuspend } from "./thread-suspend";
 import { threadResume } from "./thread-resume";
+import { threadLaunch } from "./thread-launch";
+import { threadShutdown } from "./thread-shutdown";
+import { threadSpawn } from "./thread-spawn";
 
 const commands: CommandDefinition[] = [
   threadStatus,
@@ -13,6 +16,9 @@ const commands: CommandDefinition[] = [
   threadSend,
   threadSuspend,
   threadResume,
+  threadLaunch,
+  threadShutdown,
+  threadSpawn,
 ];
 
 const requireActiveThread = (

@@ -1,3 +1,4 @@
 node_modules/
 live-workspace/
 *.tgz
+pnpm-lock.yaml

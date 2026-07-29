@@ -17,9 +17,12 @@ real server.
 
 ## Run the tests
 
+Run these from `packages/pi-threading/` (or via `pnpm --filter pi-threading run <script>`
+from the repo root):
+
 ```bash
-# Everything (both test files — this is what CI runs)
-npm run test:unit
+# Everything (all test files — this is what CI runs)
+pnpm run test:unit
 
 # One backend only (exact describe-name prefixes)
 node --import tsx --test --test-name-pattern="adapter: LocalFsAdapter" test/unit.test.ts
@@ -51,7 +54,8 @@ Every backend is covered for the same invariants: state round-trip, `listThreads
 
 Offline tests prove the logic; these prove wiring, auth reach, and networked
 `watchMail`. Point `pi` at the backend with `--thread-storage <name>` plus its
-connection flag.
+connection flag. Run these from `packages/pi-threading/` — `./src/index.ts`
+and `npm run http-server` below are relative to that directory.
 
 ### redis
 
@@ -102,11 +106,11 @@ curl -s -X POST localhost:7777/threads/t1/inbox/claim   # → {"claimed":[…]}
 
 ## Full quality gate
 
-What CI checks, in order:
+What CI checks, in order (from the repo root, across both workspace packages):
 
 ```bash
-npx tsc --noEmit        # types (strict)
-npm run lint            # oxlint
-npm run format:check    # prettier
-npm run test:unit       # all adapters, offline
+pnpm --filter pi-threading exec tsc --noEmit   # types (strict)
+pnpm run lint            # oxlint, both packages
+pnpm run format:check    # prettier, whole repo
+pnpm run test:unit       # all adapters, offline, both packages
 ```
