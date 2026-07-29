@@ -42,6 +42,9 @@ importers:
       '@pi-threading/cli':
         specifier: workspace:*
         version: link:../pi-threading-cli
+      '@types/ioredis-mock':
+        specifier: ^8.2.7
+        version: 8.2.7(ioredis@5.11.1)
       ioredis-mock:
         specifier: ^8.13.1
         version: 8.13.1(@types/ioredis-mock@8.2.7(ioredis@5.11.1))(ioredis@5.11.1)
