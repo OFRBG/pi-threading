@@ -66,7 +66,55 @@ I recommend using tmux to manage teams.
 - `--thread-role <role>` — role label, targetable via `thread_send to="role:<role>"`
 - `--thread-journal <turn|done|off>` — journal cadence (default `turn`; each entry is one forked model call, rate-limited to one entry per ~2 minutes of same-task tool turns, plus a wrap-up entry when a run ends with unjournaled work; structural changes — new obligations, barriers — always journal immediately)
 - `--thread-journal-model <model>` — model for the journal fork (e.g. `deepseek/deepseek-chat` to keep entries cheap). Default: the thread's own model. A pinned model must resolve on the machine the thread runs on, or journaling fails (loudly, on stderr)
-- `--thread-storage <local|restate>` — storage backend (default `local`, the filesystem; see [Running with the Restate adapter](#running-with-the-restate-adapter))
+- `--thread-storage <local|redis|mongo|http>` — storage backend (default `local`, the filesystem; see [Storage backends](#storage-backends))
+
+## Storage backends
+
+By default, threads coordinate through `.thread/` on the local filesystem — fine
+for one machine. To coordinate across hosts, point every thread at the same
+Redis or MongoDB instance instead; every thread must use the same
+`--thread-storage-*` values to see each other.
+
+### Redis
+
+```bash
+# each terminal, same connection string
+pi --thread-id coordinator \
+   --thread-storage redis \
+   --thread-storage-connection-string redis://localhost:6379
+
+pi --thread-id worker-a \
+   --thread-storage redis \
+   --thread-storage-connection-string redis://localhost:6379
+```
+
+- `--thread-storage-connection-string <url>` — default `redis://localhost:6379`
+
+### MongoDB
+
+```bash
+pi --thread-id coordinator \
+   --thread-storage mongo \
+   --thread-storage-connection-string mongodb://localhost:27017 \
+   --thread-storage-database pi-threading
+
+pi --thread-id worker-a \
+   --thread-storage mongo \
+   --thread-storage-connection-string mongodb://localhost:27017 \
+   --thread-storage-database pi-threading
+```
+
+- `--thread-storage-connection-string <url>` — default `mongodb://localhost:27017`
+- `--thread-storage-database <name>` — default `pi-threading`
+
+> Running under Bun: the `mongo` backend currently fails to load due to an
+> upstream Bun/`bson` incompatibility ([oven-sh/bun#32501](https://github.com/oven-sh/bun/issues/32501),
+> fixed but not yet in a stable Bun release as of this writing). `redis` and
+> `local` are unaffected.
+
+See [docs/testing-adapters.md](docs/testing-adapters.md) for running each
+backend against a real server (including Docker one-liners) and the offline
+test suite.
 
 ## Human monitoring & steering
 
