@@ -3,6 +3,7 @@
   "private": true,
   "description": "Workspace root for pi-threading (the extension) and pi-threading-cli (the standalone human-operator CLI)",
   "type": "module",
+  "packageManager": "pnpm@10.5.2",
   "scripts": {
     "test": "pnpm run test:unit && pnpm run test:e2e",
     "test:unit": "pnpm -r run test:unit",
