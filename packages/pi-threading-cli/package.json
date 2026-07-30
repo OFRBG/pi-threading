@@ -20,7 +20,7 @@
   ],
   "type": "module",
   "bin": {
-    "pi-threading-cli": "./bin/thread-cli.mjs"
+    "pi-threading-cli": "bin/thread-cli.mjs"
   },
   "scripts": {
     "test": "node --test test/cli.test.mjs",

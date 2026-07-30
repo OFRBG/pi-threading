@@ -22,7 +22,7 @@
   ],
   "type": "module",
   "bin": {
-    "pi-top": "./bin/pi-top.mjs"
+    "pi-top": "bin/pi-top.mjs"
   },
   "dependencies": {
     "blessed": "^0.1.81"
