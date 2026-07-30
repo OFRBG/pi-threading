@@ -21,16 +21,28 @@ interface JournalDoc {
   content: string;
 }
 
+/** See store-redis.ts's `requireOptionalDep` — same reasoning (require()
+ *  over a dynamic import() to avoid Bun's ESM-interop recursion), same
+ *  optional-dependency framing, duplicated rather than shared since each
+ *  call site's message differs and there are only two of them. */
+function requireOptionalDep<T>(pkg: string): T {
+  try {
+    return createRequire(import.meta.url)(pkg) as T;
+  } catch (e) {
+    throw new Error(
+      `Could not load "${pkg}" (needed for --storage mongo). ` +
+        `It's an optional dependency of pi-top — install it directly: "npm install ${pkg}" ` +
+        `(or "bun add ${pkg}") wherever pi-top itself is installed. ` +
+        `Original error: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+}
+
 export async function createMongoStore(
   connectionString: string,
   database: string,
 ): Promise<ThreadStoreBackend> {
-  // require(), not a dynamic import() — see store-redis.ts for why (CJS
-  // packages loaded via import() get an ESM-interop wrapper that's known to
-  // recurse under Bun for ioredis; applied here too for consistency/safety).
-  const { MongoClient } = createRequire(import.meta.url)("mongodb") as {
-    MongoClient: typeof MongoClientType;
-  };
+  const { MongoClient } = requireOptionalDep<{ MongoClient: typeof MongoClientType }>("mongodb");
   const client = new MongoClient(connectionString);
   await client.connect();
   const db = client.db(database);

@@ -1,9 +1,8 @@
-import { createRequire } from "node:module";
 import type { MongoClient, Collection, Db } from "mongodb";
 import type { StateFile, Mail, ThreadSummary } from "../core/types";
 import { PROCESSED_TTL_MS, toSummary } from "../core/types";
 import type { StorageAdapter, JournalAdapter, PiFlagParam, AdapterOptions } from "./types";
-import { isMailDue, isMailExpired, mailIdTail } from "./shared";
+import { isMailDue, isMailExpired, mailIdTail, requireDep } from "./shared";
 
 // The MongoDB binding — same StorageAdapter/JournalAdapter contract as the
 // Appendix B local-fs binding (`./local-fs.ts`), but addressed per-document
@@ -101,14 +100,12 @@ export function createAdapter({
       // registry.ts to read `options` for flag registration) crashes
       // under Bun — its dependency graph triggers "Maximum call stack
       // size exceeded" in Bun's module resolver even when the module is
-      // never used. `createRequire` rather than a dynamic `import()`
-      // for the same reason as redis.ts: `import()` of a CJS package
-      // forces Bun to synthesize an ESM-interop namespace wrapper, and
-      // that wrapper is where an analogous recursion has been observed
-      // for `ioredis`'s `export =` shape — `require()` bypasses it.
-      const { MongoClient: MongoClientCtor } = createRequire(import.meta.url)("mongodb") as {
-        MongoClient: typeof MongoClient;
-      };
+      // never used. `requireDep` (`./shared.ts`) rather than a dynamic
+      // `import()` for the same reason as redis.ts.
+      const { MongoClient: MongoClientCtor } = requireDep<{ MongoClient: typeof MongoClient }>(
+        "mongodb",
+        import.meta.url,
+      );
       client = new MongoClientCtor(connectionString);
       await client.connect();
       db = client.db(database);

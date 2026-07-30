@@ -13,12 +13,11 @@
 // access, and (3) `duplicate()` for a clean dedicated pub/sub connection,
 // which mirrors exactly what real Redis requires (a subscribed connection
 // cannot issue other commands).
-import { createRequire } from "node:module";
 import type { Redis as RedisClient } from "ioredis";
 import type { StateFile, Mail, ThreadSummary } from "../core/types";
 import { PROCESSED_TTL_MS, toSummary } from "../core/types";
 import type { StorageAdapter, JournalAdapter, PiFlagParam, AdapterOptions } from "./types";
-import { safeMailKey } from "./shared";
+import { requireDep, safeMailKey } from "./shared";
 
 export const options = {
   "connection-string": {
@@ -396,7 +395,9 @@ export function createAdapterFromClient(client: RedisClient): StorageAdapter & J
 
 /** Production entry point: builds a `StorageAdapter & JournalAdapter` that
  *  looks and behaves exactly like `createAdapterFromClient`'s object, but
- *  defers ever touching the real `ioredis` package until `configure()` runs.
+ *  defers ever touching the real `ioredis` package until `configure()` runs
+ *  (via `requireDep`, `./shared.ts` — see its docstring for why `require()`
+ *  rather than a dynamic `import()`).
  *
  *  This has to stay a *synchronous* function returning a plain object, not
  *  `async` — `resolveAdapter()`/`store.adapter` are a synchronous,
@@ -410,20 +411,7 @@ export function createAdapterFromClient(client: RedisClient): StorageAdapter & J
  *  module resolver, even when the client is never constructed. Deferring
  *  the load to `configure()` — the one method every caller already awaits
  *  before touching anything else on this object — avoids that for callers
- *  who never select the redis backend.
- *
- *  It's still not enough on its own, though: even once the redis backend
- *  *is* actually selected and `configure()` runs, loading `ioredis` via a
- *  dynamic `import()` crashes under Bun with the exact same "Maximum call
- *  stack size exceeded" — this time inside a `get`/`get` loop alternating
- *  between Bun's synthetic module namespace and ioredis's own CJS export
- *  shape. Dynamic `import()` of a CJS package forces Bun to synthesize an
- *  ESM-interop namespace wrapper around it; that wrapper's `.default`
- *  getter is where the recursion happens. `createRequire(...)("ioredis")`
- *  returns the raw CJS `module.exports` directly — which for ioredis (an
- *  `export =` package) *is* the class itself — bypassing that interop
- *  layer entirely. Same laziness (still inside `configure()`), different
- *  loading mechanism. */
+ *  who never select the redis backend. */
 export function createAdapter({
   "connection-string": connectionString,
 }: AdapterOptions<typeof options>): StorageAdapter & JournalAdapter {
@@ -431,7 +419,7 @@ export function createAdapter({
 
   return {
     async configure() {
-      const RedisCtor = createRequire(import.meta.url)("ioredis") as typeof RedisClient;
+      const RedisCtor = requireDep<typeof RedisClient>("ioredis", import.meta.url);
       const client = new RedisCtor(connectionString, {
         // Defer the actual TCP connect until a command is issued (ioredis
         // connects lazily on first command when `lazyConnect: true`),

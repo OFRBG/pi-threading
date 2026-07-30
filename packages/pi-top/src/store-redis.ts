@@ -27,14 +27,34 @@ function keyJournal(id: string): string {
   return `thread:${id}:journal`;
 }
 
+/** Load an optional network-backend dependency via `require()`, not a
+ *  dynamic `import()` — both ioredis and mongodb are CJS `export =`
+ *  packages, and loading one via `import()` forces an ESM-interop
+ *  namespace wrapper whose `.default` getter is known to recurse
+ *  infinitely under Bun ("Maximum call stack size exceeded"). `require()`
+ *  bypasses that wrapper entirely (see pi-threading's src/adapter/redis.ts
+ *  for the same fix against the same crash).
+ *
+ *  `ioredis`/`mongodb` are `optionalDependencies` here (pi-top works
+ *  without either if you only ever use the local-fs backend) — if one
+ *  didn't get installed, rethrow with an actionable message instead of a
+ *  bare module-resolution stack trace the moment `--storage redis`/`mongo`
+ *  is actually selected. */
+function requireOptionalDep<T>(pkg: string): T {
+  try {
+    return createRequire(import.meta.url)(pkg) as T;
+  } catch (e) {
+    throw new Error(
+      `Could not load "${pkg}" (needed for --storage ${pkg === "ioredis" ? "redis" : "mongo"}). ` +
+        `It's an optional dependency of pi-top — install it directly: "npm install ${pkg}" ` +
+        `(or "bun add ${pkg}") wherever pi-top itself is installed. ` +
+        `Original error: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+}
+
 export async function createRedisStore(connectionString: string): Promise<ThreadStoreBackend> {
-  // require(), not a dynamic import() — ioredis is a CJS `export =` package,
-  // and importing it via `import()` forces an ESM-interop namespace wrapper
-  // whose `.default` getter is known to recurse infinitely under Bun
-  // ("Maximum call stack size exceeded"). require() returns the raw CJS
-  // export directly, bypassing that wrapper (see pi-threading's
-  // src/adapter/redis.ts for the same fix against the same crash).
-  const Redis = createRequire(import.meta.url)("ioredis") as typeof RedisClient;
+  const Redis = requireOptionalDep<typeof RedisClient>("ioredis");
 
   // Connection health, surfaced via getStatus() instead of raw console
   // writes: once Blessed owns the terminal, anything written straight to
