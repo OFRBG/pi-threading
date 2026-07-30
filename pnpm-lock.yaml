@@ -39,9 +39,6 @@ importers:
       '@earendil-works/pi-coding-agent':
         specifier: ^0.80.3
         version: 0.80.10(ws@8.21.1)(zod@4.4.3)
-      '@pi-threading/cli':
-        specifier: workspace:*
-        version: link:../pi-threading-cli
       '@types/ioredis-mock':
         specifier: ^8.2.7
         version: 8.2.7(ioredis@5.11.1)

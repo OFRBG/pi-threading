@@ -1,6 +1,6 @@
 {
   "name": "pi-threading",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Cross-thread communication extension for pi coding agent — independent threads that coordinate work, share state, and converse without losing context",
   "keywords": [
     "pi-package",
@@ -46,8 +46,7 @@
     "@earendil-works/pi-coding-agent": "^0.80.3",
     "@types/ioredis-mock": "^8.2.7",
     "ioredis-mock": "^8.13.1",
-    "mongodb-memory-server": "^11.2.0",
-    "@pi-threading/cli": "workspace:*"
+    "mongodb-memory-server": "^11.2.0"
   },
   "volta": {
     "node": "26.4.0"

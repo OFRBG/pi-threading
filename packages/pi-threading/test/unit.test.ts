@@ -24,7 +24,6 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import type {
   ExtensionAPI,
@@ -1785,12 +1784,17 @@ describe("adapter seam: core logic against a fake in-memory adapter", () => {
 });
 
 describe("bin/thread-cli.mjs: external C1 actor", () => {
-  // Resolved via the workspace package rather than a relative path — the
-  // CLI moved to its own `@pi-threading/cli` package (a `workspace:*`
-  // devDependency here) so it can evolve/publish independently while these
-  // interop tests keep verifying its writes against this package's own
-  // drain logic.
-  const cli = fileURLToPath(import.meta.resolve("@pi-threading/cli/bin/thread-cli.mjs"));
+  // Plain relative path, not a package dependency — a `workspace:*`
+  // devDependency on `@pi-threading/cli` here once broke every plain `npm
+  // install` of the published `pi-threading` package (`npm install`
+  // installs devDependencies too when it's not run with `--omit=dev`,
+  // which is exactly what `pi install npm:pi-threading` does; npm has no
+  // idea what the pnpm-only `workspace:` protocol is and fails the whole
+  // install immediately — including `ioredis`/`mongodb`, the *actual*
+  // dependencies, which is how this got noticed). The CLI now lives in its
+  // own package purely by directory convention; this test just needs its
+  // file, not a dependency edge.
+  const cli = join(import.meta.dirname, "..", "..", "pi-threading-cli", "bin", "thread-cli.mjs");
   const runCli = (dir: string, ...cliArgs: string[]) =>
     execFileSync(process.execPath, [cli, ...cliArgs, "--dir", dir], { encoding: "utf8" });
 
