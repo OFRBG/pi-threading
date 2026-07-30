@@ -7,9 +7,9 @@
  *   GET  /threads/:id/journal      → { content: string }
  */
 
-import type { StateFile, ThreadSummary, ThreadDetail } from "./types";
-import { toSummary } from "./types";
-import type { ThreadStoreBackend } from "./store-types";
+import type { StateFile, ThreadSummary, ThreadDetail } from "./types.js";
+import { toSummary } from "./types.js";
+import type { ThreadStoreBackend } from "./store-types.js";
 
 const enc = (id: string) => encodeURIComponent(id);
 

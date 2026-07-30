@@ -8,13 +8,13 @@
  *   http                 — calls a remote thread-store REST API
  */
 
-import { createLocalStore } from "./store-local";
-import { createRedisStore } from "./store-redis";
-import { createMongoStore } from "./store-mongo";
-import { createHttpStore } from "./store-http";
-import type { ThreadStoreBackend } from "./store-types";
+import { createLocalStore } from "./store-local.js";
+import { createRedisStore } from "./store-redis.js";
+import { createMongoStore } from "./store-mongo.js";
+import { createHttpStore } from "./store-http.js";
+import type { ThreadStoreBackend } from "./store-types.js";
 
-export type { ThreadStoreBackend } from "./store-types";
+export type { ThreadStoreBackend } from "./store-types.js";
 
 export interface StoreOptions {
   storage: "local-fs" | "redis" | "mongo" | "http";

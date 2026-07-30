@@ -2,8 +2,8 @@
 
 import blessed from "blessed";
 import type { Widgets } from "blessed";
-import type { ThreadSummary } from "../types";
-import { STATE_COLORS, STATE_DOTS, STALE_MS } from "../types";
+import type { ThreadSummary } from "../types.js";
+import { STATE_COLORS, STATE_DOTS, STALE_MS } from "../types.js";
 
 export interface ThreadListCallbacks {
   onSelect: (id: string) => void;

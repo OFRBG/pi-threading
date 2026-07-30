@@ -2,8 +2,8 @@
 
 import blessed from "blessed";
 import type { Widgets } from "blessed";
-import type { ThreadDetail, ThreadSummary } from "../types";
-import { STATE_COLORS, STATE_DOTS, STALE_MS } from "../types";
+import type { ThreadDetail, ThreadSummary } from "../types.js";
+import { STATE_COLORS, STATE_DOTS, STALE_MS } from "../types.js";
 
 export class DetailPanel {
   private box: Widgets.BoxElement;

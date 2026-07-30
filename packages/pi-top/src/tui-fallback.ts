@@ -3,8 +3,8 @@
  * isn't built yet. ANSI-clearing table, like pi-threading-cli watch.
  */
 
-import type { DataProvider } from "./tui/app";
-import { relTime } from "./types";
+import type { DataProvider } from "./tui/app.js";
+import { relTime } from "./types.js";
 
 /** Spaced column pads. */
 function padCol(str: string, w: number): string {

@@ -9,15 +9,15 @@
  *        ↑ watcher fires on change → refreshes cache → TUI re-renders
  */
 
-import type { ThreadSummary, ThreadDetail } from "./types";
-import { createStore, type StoreOptions } from "./store";
-import type { ThreadStoreBackend } from "./store-types";
-import { createWatcher } from "./watcher";
-import { createApp } from "./tui/app";
-import type { DataProvider } from "./tui/app";
+import type { ThreadSummary, ThreadDetail } from "./types.js";
+import { createStore, type StoreOptions } from "./store.js";
+import type { ThreadStoreBackend } from "./store-types.js";
+import { createWatcher } from "./watcher.js";
+import { createApp } from "./tui/app.js";
+import type { DataProvider } from "./tui/app.js";
 
-export type { ThreadStoreBackend } from "./store-types";
-export type { StoreOptions } from "./store";
+export type { ThreadStoreBackend } from "./store-types.js";
+export type { StoreOptions } from "./store.js";
 
 export async function run(options: StoreOptions): Promise<void> {
   // 1. Create the storage backend.
@@ -64,8 +64,13 @@ export async function run(options: StoreOptions): Promise<void> {
             journalCache.delete(id);
           }
         }
-      } catch (err) {
-        console.error("[pi-top] refresh failed:", err);
+      } catch {
+        // Deliberately not console.error'd: once the TUI is up, this runs
+        // on every poll tick (every 2s — see watcher.ts), and anything
+        // written straight to the terminal while Blessed owns it corrupts
+        // the screen. backend.getStatus() (surfaced in the header, below)
+        // is the visible signal for network backends; local-fs has no
+        // analogous failure mode to report.
       }
     }
 
@@ -79,6 +84,9 @@ export async function run(options: StoreOptions): Promise<void> {
       },
       getJournal(id: string) {
         return journalCache.get(id) ?? null;
+      },
+      getStatus() {
+        return backend.getStatus?.() ?? null;
       },
       onUpdate(cb: () => void) {
         watcher.onUpdate(cb);

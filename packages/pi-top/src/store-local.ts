@@ -8,9 +8,9 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { StateFile, ThreadSummary, ThreadDetail } from "./types";
-import { toSummary } from "./types";
-import type { ThreadStoreBackend } from "./store-types";
+import type { StateFile, ThreadSummary, ThreadDetail } from "./types.js";
+import { toSummary } from "./types.js";
+import type { ThreadStoreBackend } from "./store-types.js";
 
 function statePath(base: string, id: string): string {
   return path.join(base, id, "state.json");

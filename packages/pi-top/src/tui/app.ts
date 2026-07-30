@@ -3,14 +3,17 @@
 
 import blessed from "blessed";
 import type { Widgets } from "blessed";
-import { ThreadList } from "./thread-list";
-import { DetailPanel } from "./detail-panel";
-import type { ThreadSummary, ThreadDetail } from "../types";
+import { ThreadList } from "./thread-list.js";
+import { DetailPanel } from "./detail-panel.js";
+import type { ThreadSummary, ThreadDetail } from "../types.js";
 
 export interface DataProvider {
   getThreads(): ThreadSummary[];
   getThread(id: string): ThreadDetail | null;
   getJournal(id: string): string | null;
+  /** Connection health for network backends — null when the backend has no
+   *  such notion (e.g. local-fs) or doesn't implement it. */
+  getStatus?(): { ok: boolean; message: string } | null;
   onUpdate(cb: () => void): void;
 }
 
@@ -52,6 +55,7 @@ export class App {
       width: "100%",
       height: 1,
       content: " pi-top — Thread Dashboard ",
+      tags: true,
       style: {
         bg: "blue",
         fg: "white",
@@ -164,6 +168,17 @@ export class App {
     const running = threads.filter(t => t.status === "running").length;
     this.footer.setContent(
       ` {bold}${threads.length}{/bold} threads (${running} running)  ↑↓/j/k navigate  Enter inspect  ? help  q quit `,
+    );
+
+    // Connection health (network backends only) — replaces the title
+    // instead of a separate line, so a flaky connection doesn't push
+    // content around; this is the only place backend connection errors
+    // are surfaced, deliberately never console.error'd (see index.ts).
+    const status = this.dataProvider.getStatus?.();
+    this.header.setContent(
+      status && !status.ok
+        ? ` pi-top — {red-fg}{bold}⚠ ${status.message}{/bold}{/red-fg} `
+        : " pi-top — Thread Dashboard ",
     );
 
     this.screen.render();

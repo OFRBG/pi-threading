@@ -18,9 +18,9 @@ process.env.TERM = "xterm";
 
 import { resolve } from "node:path";
 import { readFileSync } from "node:fs";
-import { run } from "../src/index.js";
-import { startFallback } from "../src/tui-fallback.js";
-import { createStore } from "../src/store.js";
+import { run } from "../dist/index.js";
+import { startFallback } from "../dist/tui-fallback.js";
+import { createStore } from "../dist/store.js";
 
 const VERSION = (() => {
   try {

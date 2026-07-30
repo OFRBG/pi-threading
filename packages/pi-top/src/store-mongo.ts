@@ -6,9 +6,11 @@
  *   journal   — one doc per thread (_id = threadId, content: string)
  */
 
-import type { StateFile, ThreadSummary, ThreadDetail } from "./types";
-import { toSummary } from "./types";
-import type { ThreadStoreBackend } from "./store-types";
+import { createRequire } from "node:module";
+import type { MongoClient as MongoClientType } from "mongodb";
+import type { StateFile, ThreadSummary, ThreadDetail } from "./types.js";
+import { toSummary } from "./types.js";
+import type { ThreadStoreBackend } from "./store-types.js";
 
 interface StateDoc extends StateFile {
   _id: string;
@@ -23,7 +25,12 @@ export async function createMongoStore(
   connectionString: string,
   database: string,
 ): Promise<ThreadStoreBackend> {
-  const { MongoClient } = await import("mongodb");
+  // require(), not a dynamic import() — see store-redis.ts for why (CJS
+  // packages loaded via import() get an ESM-interop wrapper that's known to
+  // recurse under Bun for ioredis; applied here too for consistency/safety).
+  const { MongoClient } = createRequire(import.meta.url)("mongodb") as {
+    MongoClient: typeof MongoClientType;
+  };
   const client = new MongoClient(connectionString);
   await client.connect();
   const db = client.db(database);

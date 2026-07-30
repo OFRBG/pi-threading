@@ -11,8 +11,8 @@
  */
 
 import * as fs from "node:fs";
-import { createPollingWatcher } from "./watch-impl";
-import type { ThreadStoreBackend } from "./store-types";
+import { createPollingWatcher } from "./watch-impl.js";
+import type { ThreadStoreBackend } from "./store-types.js";
 
 export interface ThreadWatcher {
   /** Start watching the given backend. */
@@ -133,4 +133,4 @@ export function createWatcher(): ThreadWatcher {
 }
 
 // Re-export for other consumers.
-export { createPollingWatcher } from "./watch-impl";
+export { createPollingWatcher } from "./watch-impl.js";
