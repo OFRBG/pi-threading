@@ -173,6 +173,17 @@ pi --thread-id worker-a \
 > upstream Bun/`bson` incompatibility ([oven-sh/bun#32501](https://github.com/oven-sh/bun/issues/32501),
 > fixed but not yet in a stable Bun release as of this writing). `redis` and
 > `local` are unaffected.
+>
+> Separately, under `pi`'s compiled-Bun-binary distribution specifically
+> (not plain Bun), the extension loader can fail to resolve npm
+> dependencies _by name_ even when correctly installed
+> ([earendil-works/pi#6455](https://github.com/earendil-works/pi/issues/6455),
+> [#5949](https://github.com/earendil-works/pi/issues/5949) — upstream Bun
+> limitations `pi`'s maintainers don't plan to fix). Both `ioredis` and
+> `mongodb` are pre-bundled into `vendor/*.cjs` at publish time
+> (`scripts/bundle-vendor.mjs`) specifically to sidestep this: the redis/
+> mongo adapters load them via a relative path, never by resolving a
+> package name, which works under the same broken loader.
 
 See [docs/testing-adapters.md](docs/testing-adapters.md) for running each
 backend against a real server (including Docker one-liners) and the offline

@@ -2,7 +2,7 @@ import type { MongoClient, Collection, Db } from "mongodb";
 import type { StateFile, Mail, ThreadSummary } from "../core/types";
 import { PROCESSED_TTL_MS, toSummary } from "../core/types";
 import type { StorageAdapter, JournalAdapter, PiFlagParam, AdapterOptions } from "./types";
-import { isMailDue, isMailExpired, mailIdTail, requireDep } from "./shared";
+import { isMailDue, isMailExpired, mailIdTail } from "./shared";
 
 // The MongoDB binding — same StorageAdapter/JournalAdapter contract as the
 // Appendix B local-fs binding (`./local-fs.ts`), but addressed per-document
@@ -94,18 +94,15 @@ export function createAdapter({
 
   return {
     async configure() {
-      // Loaded here rather than at module top-level: `mongodb` is only
-      // actually needed when `--thread-storage mongo` is selected, and
-      // eagerly loading it (this module is imported unconditionally by
-      // registry.ts to read `options` for flag registration) crashes
-      // under Bun — its dependency graph triggers "Maximum call stack
-      // size exceeded" in Bun's module resolver even when the module is
-      // never used. `requireDep` (`./shared.ts`) rather than a dynamic
-      // `import()` for the same reason as redis.ts.
-      const { MongoClient: MongoClientCtor } = requireDep<{ MongoClient: typeof MongoClient }>(
-        "mongodb",
-        import.meta.url,
-      );
+      // Loaded via a relative path to our own bundled vendor/mongodb.cjs,
+      // never by resolving "mongodb" as a package name — see redis.ts's
+      // createAdapter() for the full story (a Bun limitation in `pi`'s
+      // compiled-binary extension loader, confirmed upstream, not fixable
+      // from here except by not asking it to resolve a package by name at
+      // all). Deferred to configure() for the same reason as before: this
+      // module is imported unconditionally by registry.ts regardless of
+      // which backend ends up selected, so a top-level load would be eager.
+      const { MongoClient: MongoClientCtor } = await import("../../vendor/mongodb.cjs");
       client = new MongoClientCtor(connectionString);
       await client.connect();
       db = client.db(database);

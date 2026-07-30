@@ -1,6 +1,6 @@
 {
   "name": "pi-threading",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "Cross-thread communication extension for pi coding agent — independent threads that coordinate work, share state, and converse without losing context",
   "keywords": [
     "pi-package",
@@ -17,6 +17,7 @@
     "src",
     "bin",
     "examples",
+    "vendor",
     "THREAD-MODEL.md"
   ],
   "type": "module",
@@ -29,23 +30,24 @@
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
-  "dependencies": {
-    "ioredis": "^5.11.1",
-    "mongodb": "^7.5.0"
-  },
   "scripts": {
+    "build": "node scripts/bundle-vendor.mjs",
+    "prepublishOnly": "node scripts/bundle-vendor.mjs",
     "test": "pnpm run test:unit && pnpm run test:e2e",
-    "test:unit": "node --import tsx --test test/unit.test.ts test/mongo-adapter.test.ts test/launch.test.ts",
+    "test:unit": "node scripts/bundle-vendor.mjs && node --import tsx --test test/unit.test.ts test/mongo-adapter.test.ts test/launch.test.ts",
     "test:e2e": "node --import tsx --test test/e2e.test.ts",
     "http-server": "node --import tsx bin/thread-http-server.mjs",
     "live": "bash live.sh",
-    "lint": "oxlint src test index.ts",
-    "lint:fix": "oxlint src test index.ts --fix"
+    "lint": "oxlint src test scripts index.ts",
+    "lint:fix": "oxlint src test scripts index.ts --fix"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.3",
     "@types/ioredis-mock": "^8.2.7",
+    "esbuild": "^0.24.0",
+    "ioredis": "^5.11.1",
     "ioredis-mock": "^8.13.1",
+    "mongodb": "^7.5.0",
     "mongodb-memory-server": "^11.2.0"
   },
   "volta": {

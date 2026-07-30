@@ -3,3 +3,4 @@ live-workspace/
 *.tgz
 pnpm-lock.yaml
 dist/
+vendor/

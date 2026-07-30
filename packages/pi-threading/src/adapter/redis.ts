@@ -17,7 +17,7 @@ import type { Redis as RedisClient } from "ioredis";
 import type { StateFile, Mail, ThreadSummary } from "../core/types";
 import { PROCESSED_TTL_MS, toSummary } from "../core/types";
 import type { StorageAdapter, JournalAdapter, PiFlagParam, AdapterOptions } from "./types";
-import { requireDep, safeMailKey } from "./shared";
+import { safeMailKey } from "./shared";
 
 export const options = {
   "connection-string": {
@@ -395,23 +395,30 @@ export function createAdapterFromClient(client: RedisClient): StorageAdapter & J
 
 /** Production entry point: builds a `StorageAdapter & JournalAdapter` that
  *  looks and behaves exactly like `createAdapterFromClient`'s object, but
- *  defers ever touching the real `ioredis` package until `configure()` runs
- *  (via `requireDep`, `./shared.ts` — see its docstring for why `require()`
- *  rather than a dynamic `import()`).
+ *  defers ever touching `ioredis` until `configure()` runs — and even then,
+ *  never resolves it *by package name*. It imports `../../vendor/ioredis.cjs`
+ *  instead: a self-contained bundle produced by `scripts/bundle-vendor.mjs`
+ *  (wired into `prepublishOnly`, so every published tarball ships one) and
+ *  loaded via a plain relative path, not `node_modules` resolution.
  *
- *  This has to stay a *synchronous* function returning a plain object, not
- *  `async` — `resolveAdapter()`/`store.adapter` are a synchronous,
- *  memoized-on-first-access pair (see registry.ts, state.ts), and `ioredis`
- *  is only actually needed when `--thread-storage redis` is selected. This
- *  module, though, is imported unconditionally by registry.ts (to read
- *  `options` for flag registration) regardless of which backend ends up
- *  selected — a top-level `import RedisCtor from "ioredis"` would make that
- *  import eager. Under Bun, eagerly loading `ioredis`'s large, cyclic
- *  dependency graph triggers "Maximum call stack size exceeded" in Bun's
- *  module resolver, even when the client is never constructed. Deferring
- *  the load to `configure()` — the one method every caller already awaits
- *  before touching anything else on this object — avoids that for callers
- *  who never select the redis backend. */
+ *  Why: under `pi`'s compiled-Bun-binary distribution, the extension loader
+ *  fails to resolve npm dependencies *by name* even when correctly
+ *  installed — confirmed upstream (earendil-works/pi#6455, #5949) as a Bun
+ *  limitation with no fix planned there; maintainers' own guidance is that
+ *  extension authors need to work around it. Relative-path resolution to
+ *  files inside the extension's own directory works fine under the same
+ *  loader (this whole module graph — index.ts down to every ./adapter/*.ts —
+ *  already loads that way); bundling turns "resolve ioredis by name" into
+ *  "resolve a file we ship ourselves", sidestepping the bug entirely
+ *  regardless of whether Bun or `pi` ever fix the underlying resolver.
+ *
+ *  Deferring the load to `configure()` also means callers who never select
+ *  the redis backend never touch this bundle at all — `resolveAdapter()`/
+ *  `store.adapter` are a synchronous, memoized-on-first-access pair (see
+ *  registry.ts, state.ts), and this module is imported unconditionally by
+ *  registry.ts (to read `options` for flag registration) regardless of
+ *  which backend ends up selected, so a top-level load here would be eager
+ *  for everyone. */
 export function createAdapter({
   "connection-string": connectionString,
 }: AdapterOptions<typeof options>): StorageAdapter & JournalAdapter {
@@ -419,7 +426,7 @@ export function createAdapter({
 
   return {
     async configure() {
-      const RedisCtor = requireDep<typeof RedisClient>("ioredis", import.meta.url);
+      const { default: RedisCtor } = await import("../../vendor/ioredis.cjs");
       const client = new RedisCtor(connectionString, {
         // Defer the actual TCP connect until a command is issued (ioredis
         // connects lazily on first command when `lazyConnect: true`),
